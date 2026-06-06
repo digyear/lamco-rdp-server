@@ -657,91 +657,13 @@ impl LamcoDisplayHandler {
         info!("Client disconnect signaled to pipeline - frame processing paused");
     }
 
-    /// Rebind the capture pipeline to a new PipeWire node after a session
-    /// re-establishment (the `PerConnection` lifecycle re-creates the compositor
-    /// session, which yields a fresh node). Destroys the stream on the old node
-    /// and creates one on the new node; a no-op if the node is unchanged (the
-    /// common first-connection case, where the startup session is reused).
+    /// Whether a client is currently marked active by the display pipeline.
     ///
-    /// NOTE: this does not rewrite `stream_info`, so a client resize *after* a
-    /// rebind still references the startup node. Revisit if per-connection
-    /// resize on the Mutter-direct path becomes a requirement.
-    pub async fn rebind_capture_node(
-        &self,
-        old_node: u32,
-        new_node: u32,
-        width: u32,
-        height: u32,
-    ) -> bool {
-        if old_node == new_node {
-            // Not a no-op: the re-established session's stream can land on the
-            // same node id as the stopped one. The old PipeWire stream is dead,
-            // so we still Destroy + Create to reconnect to the new source.
-            debug!(
-                "[capture-rebind] Node id {new_node} reused by re-established session — recreating stream"
-            );
-        }
-        info!(
-            old_node,
-            new_node, width, height, "[capture-rebind] Rebinding capture pipeline to new node"
-        );
-
-        // Destroy the stream on the old (now-defunct) node.
-        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
-        {
-            let mgr = self.pipewire_thread.lock().await;
-            if let Err(e) = mgr.send_command(PipeWireThreadCommand::DestroyStream {
-                stream_id: old_node,
-                response_tx: resp_tx,
-            }) {
-                warn!("[capture-rebind] Failed to send DestroyStream for old node {old_node}: {e}");
-            } else {
-                match resp_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                    Ok(Ok(())) => info!("[capture-rebind] Old stream {old_node} destroyed"),
-                    Ok(Err(e)) => warn!("[capture-rebind] DestroyStream({old_node}) failed: {e}"),
-                    Err(_) => warn!("[capture-rebind] DestroyStream({old_node}) timeout"),
-                }
-            }
-        }
-
-        // Create a stream on the re-established node.
-        let config = lamco_pipewire::StreamConfig {
-            name: "monitor-0".to_string(),
-            width,
-            height,
-            framerate: 60,
-            use_dmabuf: self.use_dmabuf,
-            buffer_count: 3,
-            preferred_format: Some(lamco_pipewire::PixelFormat::BGRx),
-            dmabuf_passthrough: false,
-        };
-        let (resp_tx2, resp_rx2) = std::sync::mpsc::sync_channel(1);
-        let mgr = self.pipewire_thread.lock().await;
-        if let Err(e) = mgr.send_command(PipeWireThreadCommand::CreateStream {
-            stream_id: new_node,
-            node_id: new_node,
-            config,
-            response_tx: resp_tx2,
-        }) {
-            warn!("[capture-rebind] Failed to send CreateStream for new node {new_node}: {e}");
-            return false;
-        }
-        match resp_rx2.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(())) => {
-                self.capture_node
-                    .store(new_node, std::sync::atomic::Ordering::Relaxed);
-                info!("[capture-rebind] New stream {new_node} created at {width}x{height}");
-                true
-            }
-            Ok(Err(e)) => {
-                warn!("[capture-rebind] CreateStream({new_node}) failed: {e}");
-                false
-            }
-            Err(_) => {
-                warn!("[capture-rebind] CreateStream({new_node}) timeout");
-                false
-            }
-        }
+    /// mstsc can open extra short-lived probe/retry TCP connections while the
+    /// authenticated session is active. Those failed probe connections must not
+    /// clear the active session's pipeline state.
+    pub fn is_client_active(&self) -> bool {
+        self.client_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Set graphics queue sender for priority multiplexing

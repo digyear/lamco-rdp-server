@@ -22,8 +22,8 @@ pub struct Args {
     pub listen: Option<String>,
 
     /// Listen port
-    #[arg(short, long, env = "LAMCO_RDP_PORT", default_value = "3389")]
-    pub port: u16,
+    #[arg(short, long, env = "LAMCO_RDP_PORT")]
+    pub port: Option<u16>,
 
     /// Verbose logging (can be specified multiple times)
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -195,6 +195,8 @@ async fn main() -> Result<()> {
         info!("════════════════════════════════════════════════════════");
     }
 
+    config.register_portal_app_id().await;
+
     if args.show_capabilities {
         return show_capabilities(&args.format).await;
     }
@@ -212,7 +214,7 @@ async fn main() -> Result<()> {
     }
 
     if args.grant_permission {
-        return grant_permission_flow().await;
+        return grant_permission_flow(config.clone()).await;
     }
 
     // Ensure TLS certificate material exists (self-generating a self-signed
@@ -668,7 +670,7 @@ async fn clear_tokens() -> Result<()> {
 }
 
 /// Grant permission flow (interactive)
-async fn grant_permission_flow() -> Result<()> {
+async fn grant_permission_flow(config: Config) -> Result<()> {
     println!("╔════════════════════════════════════════════════════════╗");
     println!("║         Permission Grant Flow                          ║");
     println!("╚════════════════════════════════════════════════════════╝");
@@ -681,8 +683,6 @@ async fn grant_permission_flow() -> Result<()> {
     println!();
     println!("When the dialog appears, click 'Allow' to grant permission.");
     println!();
-
-    let config = Config::default_config()?;
 
     info!("Creating server to obtain permission...");
     let _server = LamcoRdpServer::new(config).await?;
