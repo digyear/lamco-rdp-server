@@ -1601,8 +1601,27 @@ impl LamcoRdpServer {
             resolve_security_mode(&self.config.security.security_mode, effective_auth_method);
 
         // auth_method=none: pass None so IronRDP skips credential comparison.
-        // auth_method=pam: PamValidator handles validation via CredentialValidator trait.
+        // auth_method=pam: PamValidator handles TLS-only validation via CredentialValidator.
+        // auth_method=password: StaticPasswordValidator handles TLS-only validation, while
+        // Hybrid/NLA also needs the same static credentials for CredSSP/NTLM.
         self.rdp_server.set_credentials(None);
+
+        let static_password_validator = if effective_auth_method == "password" {
+            let validator =
+                std::sync::Arc::new(crate::security::StaticPasswordValidator::new_hashes(
+                    self.config.security.password_credentials.clone(),
+                )?);
+            self.rdp_server.set_credential_validator(validator.clone());
+            if use_hybrid {
+                anyhow::bail!(
+                    "auth_method=password uses password_credentials and cannot run in Hybrid/NLA mode; set security_mode=tls or auto"
+                );
+            }
+            info!("Static password credential validator attached to RDP server");
+            Some(validator)
+        } else {
+            None
+        };
 
         // Set up PAM credential validator if auth_method=pam
         let pam_validator = if effective_auth_method == "pam" {
@@ -1616,9 +1635,15 @@ impl LamcoRdpServer {
 
         if use_hybrid {
             info!("Security mode: Hybrid (NLA/CredSSP)");
-            if effective_auth_method != "none" {
-                warn!("Hybrid mode active — credentials must be set before clients connect");
-                warn!("Set credentials via D-Bus or GUI before clients connect");
+            match effective_auth_method {
+                "password" => {
+                    unreachable!("password_credentials auth is rejected before Hybrid mode starts")
+                }
+                "none" => {}
+                _ => {
+                    warn!("Hybrid mode active — credentials must be set before clients connect");
+                    warn!("Set credentials via D-Bus or GUI before clients connect");
+                }
             }
         } else {
             info!("Security mode: TLS");
@@ -1646,7 +1671,8 @@ impl LamcoRdpServer {
         // Pre-bind check: detect if the port is already in use and identify the holder
         check_port_available(&listen_addr);
 
-        let socket = tokio::net::TcpSocket::new_v4().context("Failed to create TCP socket")?;
+        let socket =
+            create_tcp_socket_for_addr(listen_addr).context("Failed to create TCP socket")?;
         socket
             .set_reuseaddr(true)
             .context("Failed to set SO_REUSEADDR")?;
@@ -1689,18 +1715,35 @@ impl LamcoRdpServer {
                                 timestamp: conn_timestamp,
                             });
 
-                            // Set peer IP for PAM rate limiting before handshake
+                            // Set peer IP for auth rate limiting before handshake
                             if let Some(ref validator) = pam_validator {
                                 validator.set_peer_ip(peer.ip());
                             }
+                            if let Some(ref validator) = static_password_validator {
+                                validator.set_peer_ip(peer.ip());
+                            }
+
+                            let mut skip_disconnect_cleanup = false;
 
                             if let Err(e) = self.rdp_server.run_connection(stream).await {
                                 let duration = conn_start.elapsed();
                                 let msg = format!("{e:#}");
                                 let is_reset = msg.contains("Connection reset by peer")
                                     || msg.contains("os error 104");
+                                let is_short_handshake_failure = duration < std::time::Duration::from_secs(1)
+                                    && (is_reset
+                                        || msg.contains("no credentials received")
+                                        || msg.contains("not enough bytes")
+                                        || msg.contains("accept_begin failed"));
 
-                                if is_reset && duration < std::time::Duration::from_secs(1) {
+                                if is_short_handshake_failure && self.display_handler.is_client_active() {
+                                    // mstsc can open extra short-lived probe/retry TCP connections
+                                    // after the real connection has already authenticated. Treating
+                                    // those failed side connections as a client disconnect clears the
+                                    // active session pipeline and surfaces as mstsc error 2308.
+                                    warn!("Ignoring short failed side connection from {peer} while an authenticated client is active (lasted {:.0}ms): {msg}", duration.as_secs_f64() * 1000.0);
+                                    skip_disconnect_cleanup = true;
+                                } else if is_reset && duration < std::time::Duration::from_secs(1) {
                                     // mstsc.exe commonly probes with a short-lived
                                     // connection before the real one; not an error.
                                     warn!("Connection from {peer} reset during handshake (likely client probe, lasted {:.0}ms)", duration.as_secs_f64() * 1000.0);
@@ -1712,6 +1755,19 @@ impl LamcoRdpServer {
                                     error!("Connection error from {peer} after {:.1}s: {msg}", duration.as_secs_f64());
                                 }
                             }
+
+                            // Prune stale rate limit entries between connections
+                            if let Some(ref validator) = pam_validator {
+                                validator.prune_stale_entries();
+                            }
+                            if let Some(ref validator) = static_password_validator {
+                                validator.prune_stale_entries();
+                            }
+
+                            if skip_disconnect_cleanup {
+                                continue;
+                            }
+
                             // Emit disconnect event
                             let duration = conn_start.elapsed().as_secs();
                             let _ = self.event_tx.send(ServerEvent::ClientDisconnected {
@@ -1720,22 +1776,17 @@ impl LamcoRdpServer {
                                 duration_seconds: duration,
                             });
 
-                            // Prune stale rate limit entries between connections
-                            if let Some(ref validator) = pam_validator {
-                                validator.prune_stale_entries();
-                            }
-
                             // Client disconnected (or failed): clean up transient state
-                            // while keeping Portal/PipeWire alive for the next client.
-                            // Only breaks the accept loop if the Portal session itself was
-                            // destroyed — subsystem failures (video/input) are recoverable.
+                            // while keeping Portal/PipeWire alive for the next client when
+                            // healthy. If the session/video/input health is invalid, fail
+                            // the daemon so systemd restarts with fresh Portal/PipeWire state.
                             if !self.on_disconnect().await {
                                 let _ = self.event_tx.send(ServerEvent::StatusChanged {
                                     old: "running".into(),
                                     new: "stopped".into(),
-                                    message: "Session invalidated by compositor".into(),
+                                    message: "Session health invalidated".into(),
                                 });
-                                break Ok(());
+                                break Err(anyhow::anyhow!("session health invalidated"));
                             }
                         }
                         Err(e) => {
@@ -1882,13 +1933,13 @@ impl LamcoRdpServer {
         Ok(())
     }
 
-    /// Clears transient state without closing Portal session (reusable for reconnect).
-    /// The Portal session, PipeWire stream, and input handler survive for the next client.
+    /// Clears transient per-client state, and returns whether this process can
+    /// safely accept another client.
     ///
-    /// Returns `true` if the server can accept another client. Video/input failures
-    /// return `true` because the display pipeline reinitializes per-connection.
-    /// Returns `false` only when the Portal session itself was destroyed by the
-    /// compositor — the D-Bus session object is gone and can't be recreated.
+    /// Normal disconnects keep the Portal session, PipeWire stream, and input
+    /// handler alive for the next client. If health is invalid, the current
+    /// Portal/PipeWire handles are not trustworthy after KDE display sleep/wake,
+    /// so the caller should fail the daemon and let systemd restart it.
     async fn on_disconnect(&self) -> bool {
         info!("Client disconnected - performing cleanup");
 
@@ -1898,15 +1949,13 @@ impl LamcoRdpServer {
         self.display_handler.on_client_disconnect();
 
         // Check health state to decide whether this server instance can accept
-        // another client. Only session destruction (compositor closed the Portal
-        // session) is truly fatal — the D-Bus session object is gone and can't be
-        // recreated without user interaction. Video/input failures are recoverable:
-        // a new client connection restarts the display pipeline.
+        // another client. Invalid health after KDE display sleep/wake often means
+        // the D-Bus objects still exist while PipeWire/input handles are unusable;
+        // fail the daemon so systemd restarts with a fresh session.
         if let Some(ref subscriber) = self.health_subscriber {
             let health = subscriber.current();
 
             if health.session.is_failed() {
-                // Session destroyed by compositor — irrecoverable without restart
                 error!("Portal session destroyed — cannot accept new clients");
                 error!("  session: {}", health.session);
                 error!("  video: {}", health.video);
@@ -1917,15 +1966,14 @@ impl LamcoRdpServer {
 
             match health.overall {
                 crate::health::OverallHealth::Invalid => {
-                    // Subsystem failure (video/input) but session is alive.
-                    // The next client connection will reinitialize the display
-                    // pipeline, so we can accept another connection.
-                    warn!(
-                        "Session health is invalid (subsystem failure) but Portal session is alive — accepting new clients"
+                    error!(
+                        "Session health is invalid — restarting daemon to rebuild Portal/PipeWire state"
                     );
-                    warn!("  video: {}", health.video);
-                    warn!("  input: {}", health.input);
-                    warn!("  clipboard: {}", health.clipboard);
+                    error!("  session: {}", health.session);
+                    error!("  video: {}", health.video);
+                    error!("  input: {}", health.input);
+                    error!("  clipboard: {}", health.clipboard);
+                    return false;
                 }
                 crate::health::OverallHealth::Degraded => {
                     warn!("Session health is degraded — will accept new clients cautiously");
@@ -1974,13 +2022,23 @@ impl Drop for LamcoRdpServer {
 
 /// Resolve the effective security mode from config.
 ///
-/// "auto" resolves to "hybrid" when credentials are available (auth != "none"),
-/// "tls" otherwise. Explicit "hybrid" or "tls" pass through.
+/// "auto" resolves to "hybrid" only for authentication backends that can
+/// provide plaintext/equivalent credentials to CredSSP. Hashed static password
+/// auth deliberately stays TLS-only because Argon2id hashes cannot be reversed
+/// into NTLM/CredSSP credentials.
 fn resolve_security_mode(security_mode: &str, effective_auth_method: &str) -> bool {
     match security_mode {
         "hybrid" => true,
-        "auto" => effective_auth_method != "none",
+        "auto" => effective_auth_method != "none" && effective_auth_method != "password",
         _ => false, // "tls" or unknown
+    }
+}
+
+fn create_tcp_socket_for_addr(addr: SocketAddr) -> std::io::Result<tokio::net::TcpSocket> {
+    if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
+    } else {
+        tokio::net::TcpSocket::new_v6()
     }
 }
 
@@ -2124,6 +2182,25 @@ async fn send_portal_notification(id: &str, title: &str, body: &str, high_priori
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use super::create_tcp_socket_for_addr;
+
+    #[test]
+    fn create_tcp_socket_for_addr_binds_ipv4() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let socket = create_tcp_socket_for_addr(addr).expect("create IPv4 socket");
+
+        socket.bind(addr).expect("bind IPv4 socket");
+    }
+
+    #[test]
+    fn create_tcp_socket_for_addr_binds_ipv6() {
+        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, 0));
+        let socket = create_tcp_socket_for_addr(addr).expect("create IPv6 socket");
+
+        socket.bind(addr).expect("bind IPv6 socket");
+    }
 
     #[tokio::test]
     #[ignore = "Requires D-Bus and portal access"]

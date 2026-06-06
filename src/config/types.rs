@@ -1,6 +1,6 @@
 //! Configuration type definitions
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,34 @@ impl Default for ServerConfig {
     }
 }
 
+/// XDG Desktop Portal application identity configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortalConfig {
+    /// Optional application ID to register with xdg-desktop-portal for native
+    /// (non-Flatpak) processes.
+    ///
+    /// KDE/GNOME portal permission stores key grants by app-id. Setting this to
+    /// an already trusted desktop app ID (for example `org.kde.krdpserver`) can
+    /// make lamco reuse that portal identity instead of being treated as a new
+    /// unknown app after each restart.
+    #[serde(default)]
+    pub app_id: Option<String>,
+
+    /// Register `app_id` through org.freedesktop.host.portal.Registry before
+    /// creating any portal proxy.
+    #[serde(default = "default_true")]
+    pub register_host_app: bool,
+}
+
+impl Default for PortalConfig {
+    fn default() -> Self {
+        Self {
+            app_id: None,
+            register_host_app: true,
+        }
+    }
+}
+
 /// Security and authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
@@ -59,8 +87,29 @@ pub struct SecurityConfig {
     #[serde(default = "default_security_mode")]
     pub security_mode: String,
 
-    /// Authentication method ("pam", "none")
+    /// Authentication method ("pam", "password", "none")
     pub auth_method: String,
+
+    /// Username -> Argon2id PHC password hash map for auth_method="password".
+    ///
+    /// Each key is an RDP-only username (not a system account), each value is
+    /// an Argon2id PHC string generated from that user's password.
+    #[serde(default)]
+    pub password_credentials: BTreeMap<String, String>,
+
+    /// Legacy single-credential username field accepted on read only.
+    #[serde(default, skip_serializing)]
+    pub password_username: String,
+
+    /// Legacy single-credential hash field accepted on read only.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    pub password_hash: String,
+
+    /// Legacy plaintext password field accepted on read only so old configs
+    /// can produce a clear validation error instead of failing to deserialize.
+    #[serde(default, skip_serializing)]
+    pub password: String,
 
     /// Require TLS 1.3 or higher
     pub require_tls_13: bool,
@@ -78,6 +127,10 @@ impl Default for SecurityConfig {
             enable_nla: false,
             security_mode: "auto".to_string(),
             auth_method: "none".to_string(),
+            password_credentials: BTreeMap::new(),
+            password_username: String::new(),
+            password_hash: String::new(),
+            password: String::new(),
             require_tls_13: false,
         }
     }
