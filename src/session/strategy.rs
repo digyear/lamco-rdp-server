@@ -90,16 +90,9 @@ pub trait SessionHandle: Send + Sync {
 
     async fn notify_keyboard_keycode(&self, keycode: i32, pressed: bool) -> Result<()>;
 
-    /// Send a keyboard event by XKB keysym (for Unicode input).
-    ///
-    /// Used for characters that don't have a direct evdev keycode mapping,
-    /// such as CJK, accented characters, or symbols outside US QWERTY.
-    /// XKB Unicode keysyms use the range 0x01000000 + Unicode code point.
-    ///
-    /// Default implementation returns Ok (no-op for strategies that don't
-    /// support keysym input, like EIS).
-    async fn notify_keyboard_keysym(&self, _keysym: u32, _pressed: bool) -> Result<()> {
-        Ok(())
+    async fn notify_keyboard_keysym(&self, keysym: i32, pressed: bool) -> Result<()> {
+        let _ = (keysym, pressed);
+        anyhow::bail!("Keyboard keysym injection is not available for this session strategy")
     }
 
     async fn notify_pointer_motion_absolute(&self, stream_id: u32, x: f64, y: f64) -> Result<()>;
