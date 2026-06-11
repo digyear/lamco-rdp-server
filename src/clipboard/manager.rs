@@ -330,6 +330,13 @@ pub struct ClipboardOrchestrator {
     /// When KlipperContentUpdated fires, we store the text here.
     /// When client requests data, we serve from this cache.
     cooperation_content_cache: Arc<RwLock<Option<Vec<u8>>>>,
+
+    /// Timestamp of the last Windows/RDP clipboard payload written into the local provider.
+    ///
+    /// Klipper emits clipboardHistoryUpdated after we write RDP clipboard data locally. That
+    /// signal is an echo, not a new Linux-originated clipboard change, and must not be
+    /// re-advertised back to Windows.
+    last_rdp_provider_write_time: Arc<RwLock<Option<std::time::Instant>>>,
 }
 
 /// State for managing file transfers between Windows and Linux
@@ -595,6 +602,7 @@ impl ClipboardOrchestrator {
             health_reporter: None,
             cooperation_coordinator: Arc::new(RwLock::new(None)),
             cooperation_content_cache: Arc::new(RwLock::new(None)),
+            last_rdp_provider_write_time: Arc::new(RwLock::new(None)),
             shutdown_broadcast: Arc::clone(&shutdown_broadcast),
             task_handles: Arc::clone(&task_handles),
         };
@@ -670,6 +678,7 @@ impl ClipboardOrchestrator {
         let server_event_sender = Arc::clone(&self.server_event_sender);
         let sync_manager = Arc::clone(&self.sync_manager);
         let cooperation_content_cache = Arc::clone(&self.cooperation_content_cache);
+        let last_rdp_provider_write_time = Arc::clone(&self.last_rdp_provider_write_time);
 
         let mut shutdown_rx = self.shutdown_broadcast.subscribe();
 
@@ -685,6 +694,17 @@ impl ClipboardOrchestrator {
                         timestamp_ms,
                     } => {
                         debug!("📨 Cooperation: Klipper content updated ({}ms)", timestamp_ms);
+
+                        if let Some(last_write) = *last_rdp_provider_write_time.read().await {
+                            let elapsed = last_write.elapsed();
+                            if elapsed < std::time::Duration::from_secs(3) {
+                                info!(
+                                    "Ignoring Klipper cooperation echo {}ms after RDP → provider write",
+                                    elapsed.as_millis()
+                                );
+                                continue;
+                            }
+                        }
 
                         // Klipper's D-Bus API only provides text
                         let formats = [
@@ -1070,6 +1090,7 @@ impl ClipboardOrchestrator {
         let klipper_info = Arc::clone(&self.klipper_info);
         let cooperation_coordinator = Arc::clone(&self.cooperation_coordinator);
         let cooperation_content_cache = Arc::clone(&self.cooperation_content_cache);
+        let last_rdp_provider_write_time = Arc::clone(&self.last_rdp_provider_write_time);
         let health_reporter = self.health_reporter.clone();
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -1099,6 +1120,7 @@ impl ClipboardOrchestrator {
                             &klipper_info,
                             &cooperation_coordinator,
                             &cooperation_content_cache,
+                            &last_rdp_provider_write_time,
                         ).await {
                             let err_msg = format!("{e}");
                             error!("Error handling clipboard event: {err_msg}");
@@ -1141,7 +1163,7 @@ impl ClipboardOrchestrator {
         converter: &FormatConverter,
         sync_manager: &Arc<RwLock<SyncManager>>,
         transfer_engine: &TransferEngine,
-        _config: &ClipboardOrchestratorConfig,
+        config: &ClipboardOrchestratorConfig,
         clipboard_provider: &SharedClipboardProvider,
         pending_portal_requests: &PendingPortalRequests,
         server_event_sender: &ServerEventSender,
@@ -1156,6 +1178,7 @@ impl ClipboardOrchestrator {
             RwLock<Option<crate::clipboard::KlipperCooperationCoordinator>>,
         >,
         cooperation_content_cache: &Arc<RwLock<Option<Vec<u8>>>>,
+        last_rdp_provider_write_time: &Arc<RwLock<Option<std::time::Instant>>>,
     ) -> Result<()> {
         match event {
             ClipboardEvent::RdpReady => {
@@ -1214,7 +1237,7 @@ impl ClipboardOrchestrator {
                     sync_manager,
                     clipboard_provider,
                     current_rdp_formats,
-                    _config,
+                    config,
                     klipper_info,
                     cooperation_coordinator,
                     server_event_sender,
@@ -1247,6 +1270,8 @@ impl ClipboardOrchestrator {
                     file_transfer_state,
                     fuse_manager,
                     server_event_sender,
+                    cooperation_content_cache,
+                    last_rdp_provider_write_time,
                 )
                 .await
             }
@@ -1295,6 +1320,7 @@ impl ClipboardOrchestrator {
                     mime_types,
                     force,
                     converter,
+                    config,
                     sync_manager,
                     server_event_sender,
                     local_advertised_formats,
@@ -1880,6 +1906,8 @@ impl ClipboardOrchestrator {
         file_transfer_state: &Arc<RwLock<FileTransferState>>,
         fuse_manager: &Arc<RwLock<Option<crate::clipboard::fuse::FuseMount>>>,
         server_event_sender: &ServerEventSender,
+        cooperation_content_cache: &Arc<RwLock<Option<Vec<u8>>>>,
+        last_rdp_provider_write_time: &Arc<RwLock<Option<std::time::Instant>>>,
     ) -> Result<()> {
         debug!("RDP data response received: {} bytes", data.len());
 
@@ -2404,6 +2432,8 @@ impl ClipboardOrchestrator {
             .await
         {
             Ok(()) => {
+                *last_rdp_provider_write_time.write().await = Some(std::time::Instant::now());
+                *cooperation_content_cache.write().await = None;
                 info!(
                     "Clipboard data delivered via {} provider (serial {})",
                     provider.name(),
@@ -2497,6 +2527,7 @@ impl ClipboardOrchestrator {
         mime_types: Vec<String>,
         force: bool,
         converter: &FormatConverter,
+        config: &ClipboardOrchestratorConfig,
         sync_manager: &Arc<RwLock<SyncManager>>,
         server_event_sender: &ServerEventSender,
         local_advertised_formats: &Arc<RwLock<Vec<ClipboardFormat>>>,
@@ -2638,10 +2669,46 @@ impl ClipboardOrchestrator {
             }
         }
 
-        let rdp_formats = converter.mime_to_rdp_formats(&mime_types)?;
+        let original_mime_count = mime_types.len();
+        let original_mime_types = mime_types.clone();
+        let filtered_mime_types: Vec<String> = mime_types
+            .into_iter()
+            .filter(|mime| {
+                let mime_lower = mime.to_ascii_lowercase();
+                if mime_lower.starts_with("text/html") && !config.enable_html {
+                    return false;
+                }
+                if mime.eq_ignore_ascii_case("text/rtf") && !config.enable_rtf {
+                    return false;
+                }
+                if mime.starts_with("image/") && !config.enable_images {
+                    return false;
+                }
+                if mime.eq_ignore_ascii_case("text/uri-list") && !config.enable_files {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        if filtered_mime_types.is_empty() {
+            info!(
+                "No portal clipboard MIME types remain after config filtering; skipping RDP announcement"
+            );
+            return Ok(());
+        }
+
+        if filtered_mime_types.len() != original_mime_count {
+            info!(
+                "Filtered portal clipboard MIME types by config: {:?} -> {:?}",
+                original_mime_types, filtered_mime_types
+            );
+        }
+
+        let rdp_formats = converter.mime_to_rdp_formats(&filtered_mime_types)?;
         debug!(
             "Converted {} MIME types to {} RDP formats",
-            mime_types.len(),
+            filtered_mime_types.len(),
             rdp_formats.len()
         );
 
