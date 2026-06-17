@@ -8,6 +8,27 @@ Connect to your Linux desktop from any RDP client (Windows, macOS, Linux, iOS, A
 
 ---
 
+## Fork Improvements (v1.4.3)
+
+This fork adds several features and fixes for practical KDE Plasma / Wayland deployments where upstream lacks support:
+
+### New Features
+- **Static password authentication** -- configurable multi-user static passwords without PAM dependency. Ideal for headless or containerized deployments where PAM is undesirable or difficult to configure. Supports multiple username/password pairs via `config.toml` or GUI.
+- **IPv6 listen address** -- bind to `[::1]:3389` or any IPv6 address, in addition to IPv4.
+- **CJK (Chinese/Japanese/Korean) input** -- RDP Unicode keyboard events are routed through clipboard-paste fallback with synthetic Ctrl+V, enabling Chinese input from Windows/macOS RDP clients that send committed IME text as Unicode events.
+
+### KDE Plasma Fixes
+- **Clipboard sync restoration** -- fixes the issue where KDE Plasma sessions using data-control strategy had no working clipboard. Wires the `wl-data-control` / `wl-clipboard` provider independently of Portal Clipboard.
+- **"已复制" toast fix** -- pauses Klipper cooperation sync during CJK clipboard-paste operations, preventing per-character "已复制" (Copied) notification spam from the RDP client. Original clipboard content is preserved and restored after paste.
+- **Portal host identity** -- configurable app identity registration (`org.freedesktop.portal.Request` owner) for better KDE Portal compatibility.
+- **Portal + Token strategy** -- preferred for systemd user deployments to avoid duplicate ScreenCast prompts on service restart.
+- **Session preservation** -- keeps active RDP sessions alive when mstsc opens short side-connections after initial authentication.
+
+### Build
+- Debian package (`lamco-rdp-server_1.4.3-1_amd64.deb`) built and tested on Parrot Security 7.2 / Debian 13 with KDE Plasma on Wayland.
+
+---
+
 ## Highlights
 
 - **Wayland-first** -- XDG Desktop Portal for screen capture and input, no X11 required
