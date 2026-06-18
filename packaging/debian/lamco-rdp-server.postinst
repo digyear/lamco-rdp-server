@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
+    if [ -z "$DPKG_ROOT" ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+        # Desktop packages should default to socket activation: systemd listens
+        # on TCP/3389 while the application is stopped, and starts the service
+        # only after an RDP client connects. This prevents KDE Portal from
+        # showing an active RemoteDesktop session while the machine is idle.
+        deb-systemd-helper --user disable 'lamco-rdp-server.service' >/dev/null || true
+        deb-systemd-helper --user unmask 'lamco-rdp-server.socket' >/dev/null || true
+        deb-systemd-helper --user enable 'lamco-rdp-server.socket' >/dev/null || true
+    fi
+fi
+
+exit 0

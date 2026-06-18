@@ -104,6 +104,17 @@ lamco-rdp-server -c config.toml -vv
 lamco-rdp-server-gui
 ```
 
+Native systemd packages use socket activation by default. Enable
+`lamco-rdp-server.socket`, not `lamco-rdp-server.service`: the socket keeps port
+3389 reachable while the service is stopped, then starts the service only after
+an RDP client connects. This avoids showing a KDE Portal/RemoteDesktop session
+while idle.
+
+```bash
+systemctl --user disable --now lamco-rdp-server.service 2>/dev/null || true
+systemctl --user enable --now lamco-rdp-server.socket
+```
+
 Then connect from any RDP client (Windows Remote Desktop, FreeRDP, Remmina, etc.) to port 3389.
 
 ## Building from Source

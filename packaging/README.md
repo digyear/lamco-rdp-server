@@ -30,7 +30,8 @@ packaging/
 ├── snap/                          # Snap Store packaging
 │   └── snapcraft.yaml                     # Snapcraft manifest
 └── systemd/                       # Systemd service units
-    ├── lamco-rdp-server.service           # User service
+    ├── lamco-rdp-server.socket            # User socket, normally enabled
+    ├── lamco-rdp-server.service           # User worker, socket-activated
     └── lamco-rdp-server-system.service    # System service
 ```
 
@@ -80,23 +81,39 @@ sudo install -Dm644 data/icons/io.lamco.rdp-server.svg \
     /usr/share/icons/hicolor/scalable/apps/io.lamco.rdp-server.svg
 ```
 
-### 3. Systemd User Service
+### 3. Systemd User Socket Activation
 
-Run as a user service (starts with your session):
+Run as a systemd user socket. This is the preferred desktop mode: systemd
+listens on TCP/3389 while the RDP server is stopped, then starts
+`lamco-rdp-server.service` only when a client connects. This keeps KDE
+Portal/RemoteDesktop from appearing while the machine is idle.
 
 ```bash
-# Install user service
+# Install user units
 mkdir -p ~/.config/systemd/user
 cp packaging/systemd/lamco-rdp-server.service ~/.config/systemd/user/
+cp packaging/systemd/lamco-rdp-server.socket ~/.config/systemd/user/
 
-# Enable and start
+# Enable the socket, not the service. The service must exist, but should not be
+# enabled directly for normal desktop use.
 systemctl --user daemon-reload
-systemctl --user enable lamco-rdp-server
-systemctl --user start lamco-rdp-server
+systemctl --user disable --now lamco-rdp-server.service 2>/dev/null || true
+systemctl --user enable --now lamco-rdp-server.socket
 
 # View logs
 journalctl --user -u lamco-rdp-server -f
 ```
+
+Expected idle state:
+
+```bash
+systemctl --user status lamco-rdp-server.socket --no-pager   # active/listening
+systemctl --user status lamco-rdp-server.service --no-pager  # inactive/dead
+```
+
+Debian packages install both user units and default to socket activation in the
+maintainer scripts: `lamco-rdp-server.socket` is enabled and any direct
+`graphical-session.target` enablement of `lamco-rdp-server.service` is removed.
 
 For auto-start on boot (before login):
 

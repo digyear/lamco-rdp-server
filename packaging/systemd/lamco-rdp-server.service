@@ -76,5 +76,7 @@ SystemCallFilter=~@privileged @resources
 SystemCallFilter=mount umount2
 SystemCallArchitectures=native
 
-[Install]
-WantedBy=graphical-session.target
+# Do not enable this unit directly for normal desktop use. Enable
+# lamco-rdp-server.socket instead; the socket keeps TCP/3389 reachable and
+# starts this service only after an RDP client connects, so KDE Portal does not
+# show an active remote-desktop session while idle.
