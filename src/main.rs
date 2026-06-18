@@ -207,6 +207,13 @@ async fn main() -> Result<()> {
     info!("Configuration loaded successfully");
     tracing::debug!("Config: {:?}", config);
 
+    if lamco_rdp_server::server::systemd_socket_activation_without_pending_connection() {
+        info!(
+            "Systemd socket is active but no RDP connection is pending; exiting before KDE Portal initialization"
+        );
+        return Ok(());
+    }
+
     let _dbus_connection = if args.dbus_service {
         info!("Starting D-Bus management interface");
         let state = lamco_rdp_server::dbus::new_shared_state();

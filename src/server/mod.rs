@@ -73,7 +73,7 @@ mod input_handler;
 #[expect(dead_code, reason = "WIP: not yet integrated into the server pipeline")]
 mod multiplexer_loop;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, os::fd::FromRawFd, sync::Arc};
 
 use anyhow::{Context, Result};
 pub use display_handler::LamcoDisplayHandler;
@@ -832,17 +832,19 @@ impl LamcoRdpServer {
 
                 let (input_tx, input_rx) = tokio::sync::mpsc::channel(256);
                 #[cfg(feature = "wl-clipboard")]
-                let cjk_clipboard: Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> =
-                    if config.input.cjk_paste_fallback {
-                        Some(Arc::new(
-                            crate::clipboard::providers::WlClipboardProvider::new(),
-                        ))
-                    } else {
-                        None
-                    };
+                let cjk_clipboard: Option<
+                    Arc<dyn crate::clipboard::provider::ClipboardProvider>,
+                > = if config.input.cjk_paste_fallback {
+                    Some(Arc::new(
+                        crate::clipboard::providers::WlClipboardProvider::new(),
+                    ))
+                } else {
+                    None
+                };
                 #[cfg(not(feature = "wl-clipboard"))]
-                let cjk_clipboard: Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> =
-                    None;
+                let cjk_clipboard: Option<
+                    Arc<dyn crate::clipboard::provider::ClipboardProvider>,
+                > = None;
                 let cjk_paste_paused_flag = match &wlr_clipboard_manager {
                     Some(mgr) => Some(mgr.lock().await.cjk_paste_paused()),
                     None => None,
@@ -1719,30 +1721,36 @@ impl LamcoRdpServer {
             .parse()
             .context("Invalid listen address")?;
 
-        // Pre-bind check: detect if the port is already in use and identify the holder
-        check_port_available(&listen_addr);
+        let (listener, socket_activated) =
+            if let Some(listener) = systemd_activated_listener(listen_addr)? {
+                (listener, true)
+            } else {
+                // Pre-bind check: detect if the port is already in use and identify the holder
+                check_port_available(&listen_addr);
 
-        let socket =
-            create_tcp_socket_for_addr(listen_addr).context("Failed to create TCP socket")?;
-        socket
-            .set_reuseaddr(true)
-            .context("Failed to set SO_REUSEADDR")?;
-        if let Err(e) = socket.bind(listen_addr) {
-            error!(
-                "Failed to bind to {}: {}. Another process may be using this port.",
-                listen_addr, e
-            );
-            // Run the check again after failure for detailed diagnostics
-            check_port_available(&listen_addr);
-            return Err(anyhow::anyhow!(
-                "Failed to bind listen address {listen_addr}: {e}"
-            ));
-        }
-        let listener = socket.listen(128).context("Failed to start TCP listener")?;
-        info!(
-            "TCP listener bound to {} with SO_REUSEADDR",
-            listener.local_addr().unwrap_or(listen_addr)
-        );
+                let socket = create_tcp_socket_for_addr(listen_addr)
+                    .context("Failed to create TCP socket")?;
+                socket
+                    .set_reuseaddr(true)
+                    .context("Failed to set SO_REUSEADDR")?;
+                if let Err(e) = socket.bind(listen_addr) {
+                    error!(
+                        "Failed to bind to {}: {}. Another process may be using this port.",
+                        listen_addr, e
+                    );
+                    // Run the check again after failure for detailed diagnostics
+                    check_port_available(&listen_addr);
+                    return Err(anyhow::anyhow!(
+                        "Failed to bind listen address {listen_addr}: {e}"
+                    ));
+                }
+                let listener = socket.listen(128).context("Failed to start TCP listener")?;
+                info!(
+                    "TCP listener bound to {} with SO_REUSEADDR",
+                    listener.local_addr().unwrap_or(listen_addr)
+                );
+                (listener, false)
+            };
 
         // Accept loop: handle connections via IronRDP's run_connection(),
         // with shutdown coordination via broadcast channel.
@@ -1838,6 +1846,18 @@ impl LamcoRdpServer {
                                     message: "Session health invalidated".into(),
                                 });
                                 break Err(anyhow::anyhow!("session health invalidated"));
+                            }
+
+                            if socket_activated {
+                                info!(
+                                    "Socket-activated connection from {peer} ended; exiting so Portal/RemoteDesktop is not kept active while idle"
+                                );
+                                let _ = self.event_tx.send(ServerEvent::StatusChanged {
+                                    old: "running".into(),
+                                    new: "stopped".into(),
+                                    message: "Socket-activated connection ended".into(),
+                                });
+                                break Ok(());
                             }
                         }
                         Err(e) => {
@@ -2091,6 +2111,117 @@ fn create_tcp_socket_for_addr(addr: SocketAddr) -> std::io::Result<tokio::net::T
     } else {
         tokio::net::TcpSocket::new_v6()
     }
+}
+
+/// Return a listener handed to us by systemd socket activation, if present.
+///
+/// This lets the user enable `lamco-rdp-server.socket` instead of the always-on
+/// service. systemd owns and listens on port 3389 while lamco is stopped; the
+/// first incoming TCP connection starts lamco, and only then do we create the
+/// KDE Portal RemoteDesktop/ScreenCast session. That avoids showing the KDE
+/// desktop as "remote desktop is active" just because the user service started.
+fn systemd_activated_listener(
+    expected_addr: SocketAddr,
+) -> Result<Option<tokio::net::TcpListener>> {
+    const SD_LISTEN_FDS_START: i32 = 3;
+
+    let listen_fds = match std::env::var("LISTEN_FDS") {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let listen_fds: i32 = listen_fds
+        .parse()
+        .context("Invalid LISTEN_FDS from systemd socket activation")?;
+    if listen_fds <= 0 {
+        return Ok(None);
+    }
+
+    if let Ok(listen_pid) = std::env::var("LISTEN_PID") {
+        let listen_pid: u32 = listen_pid
+            .parse()
+            .context("Invalid LISTEN_PID from systemd socket activation")?;
+        if listen_pid != std::process::id() {
+            debug!(
+                "Ignoring systemd socket activation for LISTEN_PID={} (current pid={})",
+                listen_pid,
+                std::process::id()
+            );
+            return Ok(None);
+        }
+    }
+
+    if listen_fds > 1 {
+        warn!(
+            "systemd passed {} socket activation FDs; using fd {} and ignoring the rest",
+            listen_fds, SD_LISTEN_FDS_START
+        );
+    }
+
+    let fd = SD_LISTEN_FDS_START;
+    // SAFETY: fd 3 is the well-known first socket-activation file descriptor
+    // documented by sd_listen_fds(3). From here on this TcpListener owns it.
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    std_listener
+        .set_nonblocking(true)
+        .context("Failed to set systemd-activated listener nonblocking")?;
+
+    let actual_addr = std_listener
+        .local_addr()
+        .context("Systemd-activated fd is not a TCP listener")?;
+    if actual_addr.port() != expected_addr.port() {
+        warn!(
+            "systemd-activated listener is bound to {}, but config listen_addr is {}; using activated listener",
+            actual_addr, expected_addr
+        );
+    } else {
+        info!(
+            "Using systemd-activated TCP listener on {} (config listen_addr={})",
+            actual_addr, expected_addr
+        );
+    }
+
+    tokio::net::TcpListener::from_std(std_listener)
+        .map(Some)
+        .context("Failed to adopt systemd-activated listener")
+}
+
+/// Return true when systemd passed a listening socket but there is no queued
+/// connection to accept yet.
+///
+/// User units can be globally enabled by a package while a user-level socket is
+/// also active. systemd passes socket FDs to any start of the service, even a
+/// graphical-session start that was not caused by an incoming RDP connection.
+/// Polling fd 3 before Portal initialization lets those non-connection starts
+/// exit quietly without making KDE show an active remote-desktop session.
+pub fn systemd_socket_activation_without_pending_connection() -> bool {
+    const SD_LISTEN_FDS_START: i32 = 3;
+
+    let listen_fds = match std::env::var("LISTEN_FDS") {
+        Ok(value) => value.parse::<i32>().unwrap_or(0),
+        Err(_) => return false,
+    };
+    if listen_fds <= 0 {
+        return false;
+    }
+
+    if let Ok(listen_pid) = std::env::var("LISTEN_PID")
+        && let Ok(listen_pid) = listen_pid.parse::<u32>()
+        && listen_pid != std::process::id()
+    {
+        return false;
+    }
+
+    let mut pollfd = libc::pollfd {
+        fd: SD_LISTEN_FDS_START,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    // SAFETY: poll(2) is called with a valid pointer to one pollfd, a count of
+    // one, and a zero timeout. It does not take ownership of the fd.
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    ready == 0
 }
 
 /// Check if a port is available before attempting to bind.
