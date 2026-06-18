@@ -39,8 +39,11 @@ sudo dnf install lamco-rdp-server
 # Generate certificates
 sudo lamco-rdp-server-setup-certs
 
-# Enable and start service
-systemctl --user enable --now lamco-rdp-server.service
+# Enable socket activation. The socket listens on TCP/3389 while the service is
+# stopped; systemd starts lamco-rdp-server.service only after an RDP client
+# connects, so KDE Portal/RemoteDesktop is not shown while idle.
+systemctl --user disable --now lamco-rdp-server.service 2>/dev/null || true
+systemctl --user enable --now lamco-rdp-server.socket
 
 # Grant permissions (one-time)
 lamco-rdp-server --grant-permission
@@ -59,8 +62,11 @@ sudo apt install lamco-rdp-server
 # Generate certificates
 sudo lamco-rdp-server-setup-certs
 
-# Enable and start service
-systemctl --user enable --now lamco-rdp-server.service
+# Enable socket activation. The socket listens on TCP/3389 while the service is
+# stopped; systemd starts lamco-rdp-server.service only after an RDP client
+# connects, so KDE Portal/RemoteDesktop is not shown while idle.
+systemctl --user disable --now lamco-rdp-server.service 2>/dev/null || true
+systemctl --user enable --now lamco-rdp-server.socket
 
 # Grant permissions (one-time)
 lamco-rdp-server --grant-permission
@@ -99,9 +105,10 @@ cargo build --release --features hardware-encoding
 # Install binary
 sudo cp target/release/lamco-rdp-server /usr/local/bin/
 
-# Install systemd service
+# Install systemd user units
 mkdir -p ~/.config/systemd/user
 cp packaging/systemd/lamco-rdp-server.service ~/.config/systemd/user/
+cp packaging/systemd/lamco-rdp-server.socket ~/.config/systemd/user/
 
 # Generate certificates
 sudo mkdir -p /etc/lamco-rdp-server
@@ -110,8 +117,11 @@ sudo ./scripts/generate-certs.sh /etc/lamco-rdp-server $(hostname)
 # Create config
 sudo cp config.toml.example /etc/lamco-rdp-server/config.toml
 
-# Enable service
-systemctl --user enable --now lamco-rdp-server.service
+# Enable socket activation. Do not enable the service directly unless you want
+# the old always-running behavior.
+systemctl --user daemon-reload
+systemctl --user disable --now lamco-rdp-server.service 2>/dev/null || true
+systemctl --user enable --now lamco-rdp-server.socket
 ```
 
 ---
@@ -140,6 +150,31 @@ lamco-rdp-server --grant-permission
 ```
 
 This displays the Portal permission dialog. Click "Allow" to grant screen sharing permissions. A restore token will be stored for future automatic operation.
+
+### Systemd socket activation
+
+Native packages install two user units:
+
+- `lamco-rdp-server.socket` -- the unit you normally enable. It keeps TCP/3389
+  listening without running the RDP server process.
+- `lamco-rdp-server.service` -- the worker started automatically by the socket
+  when an RDP client connects. It should normally be `inactive (dead)` while no
+  client is connected.
+
+Expected idle state:
+
+```bash
+systemctl --user status lamco-rdp-server.socket --no-pager   # active/listening
+systemctl --user status lamco-rdp-server.service --no-pager  # inactive/dead
+```
+
+If KDE shows remote desktop immediately after login, make sure the direct
+service is not enabled:
+
+```bash
+systemctl --user disable --now lamco-rdp-server.service
+systemctl --user enable --now lamco-rdp-server.socket
+```
 
 ### Test Connection
 
