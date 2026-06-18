@@ -1,0 +1,18 @@
+# Lamco RDP Server - Systemd User Socket
+#
+# Prefer enabling this socket instead of enabling lamco-rdp-server.service when
+# you want KDE Portal/RemoteDesktop to start only after an RDP client connects.
+# systemd listens on TCP/3389 while the service is stopped, then passes the
+# listening socket to lamco via standard socket activation.
+
+[Unit]
+Description=Lamco RDP Server Socket
+Documentation=https://github.com/lamco-admin/lamco-rdp-server
+
+[Socket]
+ListenStream=3389
+NoDelay=true
+Backlog=128
+
+[Install]
+WantedBy=sockets.target
