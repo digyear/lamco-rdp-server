@@ -115,8 +115,7 @@ impl CjkPasteBuffer {
             self.pending_high_surrogate = None;
             return None;
         }
-        let code_point =
-            0x10000 + (u32::from(high - 0xD800) << 10) + u32::from(low - 0xDC00);
+        let code_point = 0x10000 + (u32::from(high - 0xD800) << 10) + u32::from(low - 0xDC00);
         let c = char::from_u32(code_point)?;
         self.buf.push(c);
         self.pending_high_surrogate = None;
@@ -583,7 +582,13 @@ impl LamcoInputHandler {
                 // Flush any buffered CJK text before a regular keycode event
                 if !cjk_buffer.is_empty() {
                     drop(keyboard);
-                    Self::flush_cjk_buffer(session_handle, cjk_buffer, clipboard_provider, cjk_paste_paused).await;
+                    Self::flush_cjk_buffer(
+                        session_handle,
+                        cjk_buffer,
+                        clipboard_provider,
+                        cjk_paste_paused,
+                    )
+                    .await;
                     keyboard = keyboard_handler.lock().await;
                 }
 
@@ -697,24 +702,48 @@ impl LamcoInputHandler {
                     // Unicode here. Buffer the committed text and paste it immediately.
                     if (0xD800..=0xDBFF).contains(&unicode) {
                         cjk_buffer.pending_high_surrogate = Some(unicode);
-                        debug!("Unicode press 0x{:04X}: stored high surrogate for CJK paste", unicode);
+                        debug!(
+                            "Unicode press 0x{:04X}: stored high surrogate for CJK paste",
+                            unicode
+                        );
                     } else if (0xDC00..=0xDFFF).contains(&unicode) {
                         if let Some(high) = cjk_buffer.pending_high_surrogate.take() {
                             if cjk_buffer.push_surrogate_pair(high, unicode).is_some() {
-                                info!("Unicode press surrogate pair 0x{:04X}+0x{:04X}: buffered for CJK paste", high, unicode);
+                                info!(
+                                    "Unicode press surrogate pair 0x{:04X}+0x{:04X}: buffered for CJK paste",
+                                    high, unicode
+                                );
                                 drop(keyboard);
-                                Self::flush_cjk_buffer(session_handle, cjk_buffer, clipboard_provider, cjk_paste_paused).await;
+                                Self::flush_cjk_buffer(
+                                    session_handle,
+                                    cjk_buffer,
+                                    clipboard_provider,
+                                    cjk_paste_paused,
+                                )
+                                .await;
                             } else {
-                                debug!("Unicode press 0x{:04X}: invalid surrogate pair, discarding", unicode);
+                                debug!(
+                                    "Unicode press 0x{:04X}: invalid surrogate pair, discarding",
+                                    unicode
+                                );
                             }
                         } else {
-                            debug!("Unicode press 0x{:04X}: lone low surrogate, discarding", unicode);
+                            debug!(
+                                "Unicode press 0x{:04X}: lone low surrogate, discarding",
+                                unicode
+                            );
                         }
                     } else if let Some(c) = char::from_u32(u32::from(unicode)) {
                         cjk_buffer.push_char(c);
                         info!("Unicode press 0x{:04X}: buffered for CJK paste", unicode);
                         drop(keyboard);
-                        Self::flush_cjk_buffer(session_handle, cjk_buffer, clipboard_provider, cjk_paste_paused).await;
+                        Self::flush_cjk_buffer(
+                            session_handle,
+                            cjk_buffer,
+                            clipboard_provider,
+                            cjk_paste_paused,
+                        )
+                        .await;
                     } else {
                         debug!("Unicode press 0x{:04X}: no mapping, discarding", unicode);
                     }
@@ -739,10 +768,7 @@ impl LamcoInputHandler {
                 // Skip release events for chars that were buffered into the CJK buffer
                 // (they have no corresponding keycode to release)
                 if unicode_to_evdev(unicode).is_some() {
-                    debug!(
-                        "Unicode release 0x{:04X} -> evdev",
-                        unicode
-                    );
+                    debug!("Unicode release 0x{:04X} -> evdev", unicode);
                     if let Some((keycode, needs_shift)) = unicode_to_evdev(unicode) {
                         session_handle
                             .notify_keyboard_keycode(keycode as i32, false)
@@ -1061,8 +1087,8 @@ impl Clone for LamcoInputHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::unicode_to_keysym;
     use super::CjkPasteBuffer;
+    use super::unicode_to_keysym;
 
     #[test]
     fn unicode_to_keysym_maps_bmp_cjk_to_xkb_unicode_keysym() {

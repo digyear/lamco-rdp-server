@@ -72,6 +72,7 @@ mod graphics_drain;
 mod input_handler;
 #[expect(dead_code, reason = "WIP: not yet integrated into the server pipeline")]
 mod multiplexer_loop;
+pub mod planar;
 
 use std::{net::SocketAddr, os::fd::FromRawFd, sync::Arc};
 

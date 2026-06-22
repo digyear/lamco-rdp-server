@@ -507,6 +507,173 @@ impl EgfxFrameSender {
         Ok(frame_id)
     }
 
+    /// Send a RemoteFX-encoded frame through EGFX
+    ///
+    /// Used when AVC (H.264) is disabled but EGFX channel is available.
+    /// RemoteFX provides DCT-based compression (~10:1 ratio) via the EGFX
+    /// Send a Planar-encoded frame through EGFX.
+    ///
+    /// Planar codec (0xa) is supported by the MS Android RD Client.
+    /// Used when AVC is disabled and RemoteFX is not supported by the client.
+    ///
+    /// The `planar_encoder` should be created once and reused across frames.
+    pub async fn send_planar_frame(
+        &self,
+        planar_encoder: &mut super::planar::PlanarEncoder,
+        bitmap: &ironrdp_server::BitmapUpdate,
+        display_width: u16,
+        display_height: u16,
+        timestamp_ms: u32,
+    ) -> SendResult<u32> {
+        let state = self
+            .handler_state
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or(SendError::NotReady)?;
+
+        if !state.is_ready {
+            return Err(SendError::NotReady);
+        }
+
+        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
+
+        // Encode bitmap to RDP6 Planar format (RLE + delta encoding, lossless)
+        let planar_data = planar_encoder.encode(
+            &bitmap.data,
+            display_width as usize,
+            display_height as usize,
+            bitmap.stride.get() as usize,
+        );
+
+        let encoded_len = planar_data.len();
+
+        // Send via EGFX channel with Codec1Type::Planar (0xa)
+        let (frame_id, dvc_messages, channel_id) = {
+            let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
+            let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
+
+            let frame_id = server
+                .send_planar_frame(
+                    surface_id,
+                    &planar_data,
+                    display_width,
+                    display_height,
+                    timestamp_ms,
+                )
+                .ok_or(SendError::Backpressure)?;
+
+            let messages = server.drain_output();
+            (frame_id, messages, channel_id)
+        };
+
+        if !dvc_messages.is_empty() {
+            let svc_messages =
+                encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                    .map_err(|e| SendError::EncodingFailed(e.to_string()))?;
+
+            let event = ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages: svc_messages,
+            });
+
+            self.event_tx
+                .send(event)
+                .map_err(|_| SendError::ChannelClosed)?;
+        }
+
+        let count = self
+            .frame_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count.is_multiple_of(30) {
+            debug!(
+                "EGFX Planar: Sent frame {} (id={}, {}x{}, {} bytes encoded from {} bytes raw)",
+                count,
+                frame_id,
+                display_width,
+                display_height,
+                encoded_len,
+                bitmap.data.len(),
+            );
+        }
+
+        Ok(frame_id)
+    }
+
+    /// Send an uncompressed frame via EGFX channel
+    ///
+    /// Uses Codec1Type::Uncompressed (0x0) - sends raw RGB data.
+    /// This is a diagnostic tool to test if the EGFX channel works without Planar encoding.
+    pub async fn send_uncompressed_frame(
+        &self,
+        bitmap: &ironrdp_server::BitmapUpdate,
+        display_width: u16,
+        display_height: u16,
+        timestamp_ms: u32,
+    ) -> SendResult<u32> {
+        let state = self
+            .handler_state
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or(SendError::NotReady)?;
+
+        if !state.is_ready {
+            return Err(SendError::NotReady);
+        }
+
+        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
+
+        // Send raw bitmap data via EGFX with Codec1Type::Uncompressed
+        let (frame_id, dvc_messages, channel_id) = {
+            let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
+            let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
+
+            let frame_id = server
+                .send_uncompressed_frame(
+                    surface_id,
+                    &bitmap.data,
+                    display_width,
+                    display_height,
+                    timestamp_ms,
+                )
+                .ok_or(SendError::Backpressure)?;
+
+            let messages = server.drain_output();
+            (frame_id, messages, channel_id)
+        };
+
+        if !dvc_messages.is_empty() {
+            let svc_messages =
+                encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                    .map_err(|e| SendError::EncodingFailed(e.to_string()))?;
+
+            let event = ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages: svc_messages,
+            });
+
+            self.event_tx
+                .send(event)
+                .map_err(|_| SendError::ChannelClosed)?;
+        }
+
+        let count = self
+            .frame_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        tracing::info!(
+            "📹 EGFX Uncompressed: frame {} (id={}, {}x{}, {} bytes raw)",
+            count,
+            frame_id,
+            display_width,
+            display_height,
+            bitmap.data.len(),
+        );
+
+        Ok(frame_id)
+    }
+
     /// Check if AVC444 is supported by the client
     ///
     /// Currently returns the same as AVC420 support until explicit AVC444

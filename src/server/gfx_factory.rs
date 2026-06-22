@@ -211,9 +211,29 @@ impl GfxServerFactory for LamcoGfxFactory {
             self.compression_mode,
         )));
 
-        // try_write because this is called during sync channel setup
-        if let Ok(mut handle_guard) = self.server_handle.try_write() {
-            *handle_guard = Some(Arc::clone(&server));
+        // This callback is synchronous, while the display pipeline polls the
+        // same tokio RwLock from async code. A single try_write() can lose the
+        // new per-connection handle under read contention, leaving EGFX
+        // negotiated but permanently "not ready" until bitmap fallback crashes
+        // Android with 0xd06/0x200d. Retry briefly: readers hold the lock only
+        // for a very short readiness check.
+        let mut stored_handle = false;
+        for attempt in 0..100 {
+            if let Ok(mut handle_guard) = self.server_handle.try_write() {
+                *handle_guard = Some(Arc::clone(&server));
+                stored_handle = true;
+                break;
+            }
+
+            if attempt < 10 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        if !stored_handle {
+            tracing::error!("EGFX: failed to store GfxServerHandle after retries");
         }
 
         let bridge = GfxDvcBridge::new(Arc::clone(&server));

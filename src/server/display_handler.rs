@@ -889,6 +889,8 @@ impl LamcoDisplayHandler {
             // NOTE: These are reset when egfx_needs_init transitions from true to false
             let mut video_encoder: Option<VideoEncoder> = None;
             let mut egfx_sender: Option<EgfxFrameSender> = None;
+            // Planar encoder for EGFX Planar path (used when AVC is disabled and RFX unsupported)
+            let mut planar_encoder: Option<super::planar::PlanarEncoder> = None;
             // AVC444 vs AVC420 determined by VideoEncoder enum variant match, not a flag
 
             // Force first frame after initialization - bypasses damage detection
@@ -1485,11 +1487,121 @@ impl LamcoDisplayHandler {
                 };
 
                 let is_avc = !egfx_gate_bypassed && handler.is_avc_supported().await;
-                if needs_init && !is_avc {
+                // EGFX RemoteFX path — send actual RFX-encoded data (~200-500KB)
+                // instead of Uncompressed (8.3MB). Smaller PDU = fewer ZGFX segments.
+                let is_egfx_rfx = !egfx_gate_bypassed && !is_avc && handler.is_egfx_ready().await;
+                if needs_init && !is_avc && !is_egfx_rfx {
                     // V8 client: clear flag now, no EGFX setup needed
                     handler
                         .egfx_needs_init
                         .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+
+                // === EGFX Planar PATH (AVC disabled) ===
+                // When EGFX is ready but AVC is disabled, use Planar codec (0xa)
+                // via EGFX channel. This provides ~5:1 to 25:1 compression without H.264.
+                // Planar is supported by the MS Android RD Client; RemoteFX (0x3) is NOT.
+                if is_egfx_rfx && needs_init {
+                    egfx_sender = None;
+
+                    if let Some(ref mut detector) = damage_detector_opt {
+                        detector.invalidate();
+                        info!("🔄 Damage detector invalidated for Planar reconnection");
+                    }
+
+                    info!(
+                        "🎬 EGFX channel ready - initializing Planar encoder (AVC disabled, codec_id=0xa)"
+                    );
+
+                    // Planar codec does NOT require 16-pixel alignment (only AVC/H.264 does).
+                    // Using actual dimensions prevents surface/bitmap height mismatch crashes.
+                    let surface_width = frame.width as u16;
+                    let surface_height = frame.height as u16;
+
+                    // Create PlanarEncoder (lossless RLE + delta encoding)
+                    planar_encoder = Some(super::planar::PlanarEncoder::new(
+                        frame.width as usize,
+                        frame.height as usize,
+                    ));
+
+                    // Create EGFX surface with actual dimensions (no alignment)
+                    if let (Some(gfx_handle), Some(event_tx)) = (
+                        handler.gfx_server_handle.read().await.clone(),
+                        handler.server_event_tx.read().await.clone(),
+                    ) {
+                        {
+                            let mut server =
+                                gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
+                            server.set_output_dimensions(surface_width, surface_height);
+
+                            match server.create_surface(surface_width, surface_height) {
+                                Some(surface_id) => {
+                                    info!(
+                                        "✅ EGFX Planar surface {} created: {}×{}",
+                                        surface_id, surface_width, surface_height
+                                    );
+
+                                    // Map surface to output (REQUIRED - client crashes without it)
+                                    if server.map_surface_to_output(surface_id, 0, 0) {
+                                        info!(
+                                            "✅ EGFX Planar surface {} mapped to output",
+                                            surface_id
+                                        );
+                                    }
+
+                                    let messages = server.drain_output();
+                                    if !messages.is_empty() {
+                                        use ironrdp_dvc::encode_dvc_messages;
+                                        use ironrdp_server::EgfxServerMessage;
+                                        use ironrdp_svc::ChannelFlags;
+
+                                        if let Some(ch_id) = server.channel_id() {
+                                            match encode_dvc_messages(
+                                                ch_id,
+                                                messages,
+                                                ChannelFlags::SHOW_PROTOCOL,
+                                            ) {
+                                                Ok(svc_messages) => {
+                                                    let msg = EgfxServerMessage::SendMessages {
+                                                        messages: svc_messages,
+                                                    };
+                                                    let _ = event_tx.send(ServerEvent::Egfx(msg));
+                                                    info!(
+                                                        "✅ EGFX Planar surface PDUs sent to client"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    error!(
+                                                        "EGFX Planar: Failed to encode DVC messages: {:?}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                None => {
+                                    warn!(
+                                        "Failed to create EGFX Planar surface - server may not be ready"
+                                    );
+                                }
+                            }
+                        }
+
+                        let sender = EgfxFrameSender::new(
+                            gfx_handle,
+                            handler.gfx_handler_state.clone(),
+                            event_tx,
+                        );
+                        egfx_sender = Some(sender);
+                        info!("✅ EGFX Planar frame sender initialized");
+
+                        handler
+                            .egfx_needs_init
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        force_first_frame = true;
+                        info!("📺 First Planar frame after init will be forced");
+                    }
                 }
 
                 if is_avc {
@@ -2052,6 +2164,124 @@ impl LamcoDisplayHandler {
                             }
                         }
                     }
+                }
+
+                // === EGFX Planar FRAME PATH (AVC disabled) ===
+                // Send frames via EGFX channel using Planar codec (0xa) when H.264 is unavailable
+                if let (Some(planar_enc), Some(sender)) = (&mut planar_encoder, &egfx_sender) {
+                    let timestamp_ms = if frame.pts > 0 {
+                        frame.pts / 1_000_000
+                    } else {
+                        let frame_interval_ms =
+                            1000 / u64::from(self.config.video.target_fps.max(1));
+                        frames_sent * frame_interval_ms
+                    };
+
+                    let expected_size = (frame.width * frame.height * 4) as usize;
+                    if frame.data.len() < expected_size {
+                        frames_dropped += 1;
+                        continue;
+                    }
+
+                    // Damage detection
+                    let force_full = force_first_frame;
+                    if force_first_frame {
+                        info!("📺 Forcing first Planar frame after init");
+                        force_first_frame = false;
+                    }
+
+                    let damage_regions = if force_full {
+                        vec![DamageRegion::full_frame(frame.width, frame.height)]
+                    } else if let Some(ref mut detector) = damage_detector_opt {
+                        detector.detect(&frame.data, frame.width, frame.height)
+                    } else {
+                        vec![DamageRegion::full_frame(frame.width, frame.height)]
+                    };
+
+                    let damage_ratio = if !damage_regions.is_empty() {
+                        let frame_area = (frame.width * frame.height) as u64;
+                        let damage_area: u64 = damage_regions
+                            .iter()
+                            .map(super::super::damage::DamageRegion::area)
+                            .sum();
+                        damage_area as f32 / frame_area as f32
+                    } else {
+                        0.0
+                    };
+
+                    if adaptive_fps_enabled {
+                        adaptive_fps.update(damage_ratio);
+                    }
+
+                    if damage_regions.is_empty() {
+                        frames_skipped_damage += 1;
+                        continue;
+                    }
+
+                    // Convert a *full-frame* bitmap for EGFX Planar.
+                    //
+                    // The normal BitmapConverter preserves PipeWire damage regions and may
+                    // return a small dirty rectangle. EGFX WireToSurface1 supports a
+                    // destination rectangle, but our Planar sender currently targets the
+                    // top-left of the surface. Sending dirty rectangles through that path
+                    // writes partial rows at (0,0), which appears on Android RD Client as
+                    // horizontal stretching/scanline corruption. Clear damage metadata so
+                    // the converter emits one full-screen rectangle until the sender grows
+                    // explicit destination-rectangle support.
+                    let mut planar_frame = frame.clone();
+                    planar_frame.damage_regions.clear();
+                    let bitmap_update = match handler.convert_to_bitmap(planar_frame).await {
+                        Ok(bitmap) => bitmap,
+                        Err(e) => {
+                            error!("Planar: Failed to convert full frame: {}", e);
+                            continue;
+                        }
+                    };
+
+                    if bitmap_update.rectangles.is_empty() {
+                        continue;
+                    }
+
+                    let iron_updates = match handler.convert_to_iron_format(&bitmap_update).await {
+                        Ok(updates) => updates,
+                        Err(e) => {
+                            error!("Planar: Failed to convert to IronRDP format: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Send via EGFX Planar (codec_id=0xa)
+                    if let Some(iron_bitmap) = iron_updates.first() {
+                        let send_result = sender
+                            .send_planar_frame(
+                                planar_enc,
+                                iron_bitmap,
+                                iron_bitmap.width.get(),
+                                iron_bitmap.height.get(),
+                                timestamp_ms as u32,
+                            )
+                            .await;
+
+                        match send_result {
+                            Ok(_frame_id) => {
+                                egfx_frames_sent += 1;
+                                if egfx_frames_sent.is_multiple_of(30) {
+                                    debug!(
+                                        "📹 EGFX Planar: Sent {} frames via EGFX",
+                                        egfx_frames_sent
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                trace!("EGFX Uncompressed send failed: {} - dropping frame", e);
+                                frames_dropped += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    // Frame was consumed by EGFX path, don't fall through to bitmap
+                    continue;
                 }
 
                 let convert_start = std::time::Instant::now();
