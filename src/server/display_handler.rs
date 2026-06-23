@@ -67,7 +67,10 @@
 use std::{
     num::{NonZeroU16, NonZeroUsize},
     os::fd::{IntoRawFd, OwnedFd},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -91,11 +94,13 @@ use crate::{
         input_handler::LamcoInputHandler,
     },
     services::{ServiceId, ServiceRegistry},
-    video::{BitmapConverter, BitmapUpdate, RdpPixelFormat},
+    video::{BitmapConverter, BitmapData, BitmapUpdate, RdpPixelFormat, Rectangle},
 };
 
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
 use crate::egfx::{HardwareEncoder, create_hardware_encoder};
+
+static LOGGED_FIRST_BITMAP_UPDATE: AtomicBool = AtomicBool::new(false);
 
 /// Client-initiated resize request
 ///
@@ -373,6 +378,39 @@ pub struct LamcoDisplayHandler {
 }
 
 impl LamcoDisplayHandler {
+    fn crop_frame_to_size(frame: &VideoFrame, width: u16, height: u16) -> VideoFrame {
+        let target_width = u32::from(width).min(frame.width);
+        let target_height = u32::from(height).min(frame.height);
+
+        if target_width == frame.width && target_height == frame.height {
+            return frame.clone();
+        }
+
+        let bytes_per_pixel = frame.format.bytes_per_pixel() as u32;
+        let row_bytes = target_width * bytes_per_pixel;
+        // Keep cropped video frames compact. EGFX AVC/Planar encoders validate
+        // data_len == width * height * bytes_per_pixel; leaking stride padding
+        // here causes Android-sized frames such as 1596×768 to become 1600×768
+        // worth of bytes while still being advertised as 1596×768.
+        let target_stride = row_bytes;
+        let mut cropped = vec![0u8; (row_bytes * target_height) as usize];
+
+        for y in 0..target_height {
+            let src_offset = (y * frame.stride) as usize;
+            let dst_offset = (y * row_bytes) as usize;
+            cropped[dst_offset..dst_offset + row_bytes as usize]
+                .copy_from_slice(&frame.data[src_offset..src_offset + row_bytes as usize]);
+        }
+
+        let mut out = frame.clone();
+        out.width = target_width;
+        out.height = target_height;
+        out.stride = target_stride;
+        out.data = Arc::new(cropped);
+        out.damage_regions.clear();
+        out
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "display handler needs pipeline components at construction"
@@ -644,52 +682,6 @@ impl LamcoDisplayHandler {
         debug!("Display update channel reset for new client");
     }
 
-    /// Pad frame to aligned dimensions (16-pixel boundary)
-    ///
-    /// MS-RDPEGFX requires surface dimensions to be multiples of 16.
-    /// This function pads the frame by replicating edge pixels.
-    fn pad_frame_to_aligned(
-        data: &[u8],
-        width: u32,
-        height: u32,
-        aligned_width: u32,
-        aligned_height: u32,
-    ) -> Vec<u8> {
-        let bytes_per_pixel = 4; // BGRA
-        let src_stride = width * bytes_per_pixel;
-        let dst_stride = aligned_width * bytes_per_pixel;
-        let mut padded = vec![0u8; (aligned_width * aligned_height * bytes_per_pixel) as usize];
-
-        for y in 0..height {
-            let src_offset = (y * src_stride) as usize;
-            let dst_offset = (y * dst_stride) as usize;
-            padded[dst_offset..dst_offset + src_stride as usize]
-                .copy_from_slice(&data[src_offset..src_offset + src_stride as usize]);
-
-            if aligned_width > width {
-                let last_pixel_src = src_offset + (src_stride - bytes_per_pixel) as usize;
-                for x in width..aligned_width {
-                    let dst_offset = (y * dst_stride + x * bytes_per_pixel) as usize;
-                    padded[dst_offset..dst_offset + bytes_per_pixel as usize].copy_from_slice(
-                        &data[last_pixel_src..last_pixel_src + bytes_per_pixel as usize],
-                    );
-                }
-            }
-        }
-
-        if aligned_height > height {
-            let last_row_offset = ((height - 1) * dst_stride) as usize;
-            // Create a copy of the last row to avoid borrow checker issues
-            let last_row = padded[last_row_offset..last_row_offset + dst_stride as usize].to_vec();
-            for y in height..aligned_height {
-                let dst_offset = (y * dst_stride) as usize;
-                padded[dst_offset..dst_offset + dst_stride as usize].copy_from_slice(&last_row);
-            }
-        }
-
-        padded
-    }
-
     /// Check if EGFX is ready for frame sending
     ///
     /// Returns true if:
@@ -889,8 +881,8 @@ impl LamcoDisplayHandler {
             // NOTE: These are reset when egfx_needs_init transitions from true to false
             let mut video_encoder: Option<VideoEncoder> = None;
             let mut egfx_sender: Option<EgfxFrameSender> = None;
-            // Planar encoder for EGFX Planar path (used when AVC is disabled and RFX unsupported)
-            let mut planar_encoder: Option<super::planar::PlanarEncoder> = None;
+            // IronRDP Planar encoder for EGFX Planar path (used when AVC is disabled and RFX unsupported)
+            let mut planar_encoder: Option<ironrdp_graphics::rdp6::BitmapStreamEncoder> = None;
             // AVC444 vs AVC420 determined by VideoEncoder enum variant match, not a flag
 
             // Force first frame after initialization - bypasses damage detection
@@ -971,9 +963,11 @@ impl LamcoDisplayHandler {
             let mut egfx_gate_bypassed = false;
             let mut was_client_active = false;
             // Set after PipeWire CreateStream during resize — cleared when the
-            // first frame from the new stream arrives and we finalize the resize
-            // using the actual negotiated resolution
-            let mut pending_resize = false;
+            // first frame from the new stream arrives. Keep the RDP desktop at
+            // the client-requested size; PipeWire may still return the compositor
+            // source size, which must be cropped before encoding instead of being
+            // advertised back to the RDP client.
+            let mut pending_resize: Option<DesktopSize> = None;
             let zero_frame_threshold = std::time::Duration::from_secs(10);
 
             // === PTS INTERVAL TRACKING ===
@@ -1142,12 +1136,14 @@ impl LamcoDisplayHandler {
                                 };
 
                                 if create_ok {
-                                    // Defer display update until the first frame arrives
-                                    // from the new stream. The compositor controls the
-                                    // actual output resolution — it may differ from what
-                                    // we requested. We use the frame's negotiated
-                                    // width/height to tell the RDP client the truth.
-                                    pending_resize = true;
+                                    // Defer EGFX reinitialization until the first frame arrives
+                                    // from the new stream. Keep the RDP desktop at the
+                                    // client-requested resolution; if the compositor returns
+                                    // a larger source frame, the pipeline crops it before encoding.
+                                    pending_resize = Some(DesktopSize {
+                                        width: req.width,
+                                        height: req.height,
+                                    });
 
                                     // Reset pipeline encoder state so the first frame
                                     // from the new stream triggers full re-init
@@ -1240,25 +1236,22 @@ impl LamcoDisplayHandler {
                         // Mark that we've received at least one frame
                         first_frame_received = true;
 
-                        // Finalize deferred resize using the frame's actual
-                        // dimensions (set by PipeWire param_changed negotiation)
-                        if pending_resize {
-                            pending_resize = false;
-                            let actual_w = f.width as u16;
-                            let actual_h = f.height as u16;
-
+                        // Finalize deferred resize. The RDP desktop stays at the
+                        // client-requested size; the PipeWire frame may be larger
+                        // and will be cropped before encoding.
+                        if let Some(target) = pending_resize.take() {
                             {
                                 let mut converter = handler.bitmap_converter.lock().await;
-                                *converter = BitmapConverter::new(actual_w, actual_h);
+                                *converter = BitmapConverter::new(target.width, target.height);
                             }
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            handler.update_size(actual_w, actual_h).await;
+                            handler.update_size(target.width, target.height).await;
 
                             info!(
-                                "Resize finalized from first frame: {}x{} (compositor negotiated)",
-                                actual_w, actual_h
+                                "Resize finalized: client desktop {}x{}, source frame {}x{} (crop if needed)",
+                                target.width, target.height, f.width, f.height
                             );
                         }
 
@@ -1297,6 +1290,18 @@ impl LamcoDisplayHandler {
                             egfx_frames_sent = 0;
                             video_encoder = None;
                             egfx_sender = None;
+                            planar_encoder = None;
+                            handler
+                                .egfx_needs_init
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            // Clear stale EGFX handler state so is_egfx_ready()
+                            // returns false until the new client's capset arrives.
+                            if let Ok(mut s) = handler.gfx_handler_state.try_write() {
+                                *s = None;
+                            }
+                            if let Ok(mut h) = handler.gfx_server_handle.try_write() {
+                                *h = None;
+                            }
                             info!("Pipeline state reset for new client connection");
                         }
                         debug!("Received frame from PipeWire");
@@ -1366,6 +1371,16 @@ impl LamcoDisplayHandler {
                             egfx_frames_sent = 0;
                             video_encoder = None;
                             egfx_sender = None;
+                            planar_encoder = None;
+                            handler
+                                .egfx_needs_init
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            if let Ok(mut s) = handler.gfx_handler_state.try_write() {
+                                *s = None;
+                            }
+                            if let Ok(mut h) = handler.gfx_server_handle.try_write() {
+                                *h = None;
+                            }
                             info!("Pipeline state reset for new client connection (no-frame path)");
                         }
 
@@ -1373,7 +1388,10 @@ impl LamcoDisplayHandler {
                             .egfx_needs_init
                             .load(std::sync::atomic::Ordering::Relaxed);
 
-                        if client_waiting && needs_init && handler.is_egfx_ready().await {
+                        let should_replay_for_egfx =
+                            client_waiting && needs_init && handler.is_egfx_ready().await;
+
+                        if should_replay_for_egfx {
                             if let Some(ref cached) = cached_frame {
                                 info!(
                                     "📦 Replaying cached frame for EGFX init ({}x{}, frame {})",
@@ -1390,6 +1408,37 @@ impl LamcoDisplayHandler {
                             tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                             continue;
                         }
+                    }
+                };
+
+                // Use the client-negotiated desktop size for display encoding.
+                // PipeWire may keep producing the compositor/source size after a
+                // mobile client rotates or requests a smaller portrait/landscape
+                // desktop. If we encode/send the raw source dimensions while EGFX
+                // ResetGraphics/CreateSurface use the client size, Android RD
+                // Client renders corrupted pixels or a blank surface. Crop to the
+                // negotiated size before damage detection, encoder setup, surface
+                // creation, regions, and frame transmission.
+                let frame = {
+                    let size = handler.size.read().await;
+                    let target_w = size.width;
+                    let target_h = size.height;
+                    drop(size);
+
+                    if target_w > 0
+                        && target_h > 0
+                        && (u32::from(target_w) < frame.width || u32::from(target_h) < frame.height)
+                    {
+                        let cropped = Self::crop_frame_to_size(&frame, target_w, target_h);
+                        if cropped.width != frame.width || cropped.height != frame.height {
+                            info!(
+                                "📐 Cropped source frame {}×{} → client desktop {}×{} before encoding",
+                                frame.width, frame.height, cropped.width, cropped.height
+                            );
+                        }
+                        cropped
+                    } else {
+                        frame
                     }
                 };
 
@@ -1464,6 +1513,19 @@ impl LamcoDisplayHandler {
                     }
                 }
 
+                // === EGFX LATE ARRIVAL ===
+                // If EGFX was bypassed due to timeout but later becomes ready
+                // (capability exchange completed after the 5s window), clear the
+                // bypass so the Planar/AVC init path can run. Without this, the
+                // replay loop spins forever: is_egfx_ready()=true + needs_init=true
+                // but egfx_gate_bypassed=true prevents Planar init from executing.
+                if egfx_gate_bypassed && handler.is_egfx_ready().await {
+                    egfx_gate_bypassed = false;
+                    info!(
+                        "🔄 EGFX became ready after bypass — re-enabling EGFX path for Planar/AVC init"
+                    );
+                }
+
                 // === EGFX/H.264 PATH ===
                 // Only enter H.264 path when client supports AVC codec AND EGFX is
                 // actually ready (not bypassed due to timeout). V8 clients (no AVC)
@@ -1487,8 +1549,10 @@ impl LamcoDisplayHandler {
                 };
 
                 let is_avc = !egfx_gate_bypassed && handler.is_avc_supported().await;
-                // EGFX RemoteFX path — send actual RFX-encoded data (~200-500KB)
-                // instead of Uncompressed (8.3MB). Smaller PDU = fewer ZGFX segments.
+                // Android RD Client advertises EGFX with AVC_DISABLED. Use the
+                // EGFX Planar codec path for these clients; FastPath Bitmap/RLE
+                // is not accepted reliably by this Android client once the EGFX
+                // dynamic channel is present.
                 let is_egfx_rfx = !egfx_gate_bypassed && !is_avc && handler.is_egfx_ready().await;
                 if needs_init && !is_avc && !is_egfx_rfx {
                     // V8 client: clear flag now, no EGFX setup needed
@@ -1518,8 +1582,8 @@ impl LamcoDisplayHandler {
                     let surface_width = frame.width as u16;
                     let surface_height = frame.height as u16;
 
-                    // Create PlanarEncoder (lossless RLE + delta encoding)
-                    planar_encoder = Some(super::planar::PlanarEncoder::new(
+                    // Create IronRDP BitmapStreamEncoder (reference Planar implementation)
+                    planar_encoder = Some(ironrdp_graphics::rdp6::BitmapStreamEncoder::new(
                         frame.width as usize,
                         frame.height as usize,
                     ));
@@ -1533,6 +1597,28 @@ impl LamcoDisplayHandler {
                             let mut server =
                                 gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
                             server.set_output_dimensions(surface_width, surface_height);
+
+                            // MS-RDPEGFX §2.2.2.15: ResetGraphics MUST include at least
+                            // 1 RDPGFX_MONITOR_DEF entry. nMonitors=0 causes Android
+                            // client rendering corruption (horizontal scan-line artifacts).
+                            // Call resize_with_monitors before create_surface so the
+                            // auto-ResetGraphics inside create_surface is skipped.
+                            // RDPGFX_MONITOR_DEF.right/bottom are INCLUSIVE (last pixel),
+                            // so right = width - 1, bottom = height - 1.
+                            {
+                                use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+                                server.resize_with_monitors(
+                                    surface_width,
+                                    surface_height,
+                                    vec![Monitor {
+                                        left: 0,
+                                        top: 0,
+                                        right: surface_width as i32 - 1,
+                                        bottom: surface_height as i32 - 1,
+                                        flags: MonitorFlags::PRIMARY,
+                                    }],
+                                );
+                            }
 
                             match server.create_surface(surface_width, surface_height) {
                                 Some(surface_id) => {
@@ -1622,25 +1708,28 @@ impl LamcoDisplayHandler {
                             "🎬 EGFX channel ready - initializing H.264 encoder (needs_init=true)"
                         );
 
-                        // Calculate aligned dimensions first (needed for encoder and surface)
-                        use crate::egfx::align_to_16;
-                        let aligned_width = align_to_16(frame.width as u32) as u16;
-                        let aligned_height = align_to_16(frame.height as u32) as u16;
+                        // Keep protocol-visible AVC dimensions at the actual desktop size.
+                        // H.264 only requires even dimensions for YUV420; advertising 16-pixel
+                        // macroblock padding (for example 1080→1088) as the EGFX surface/SPS
+                        // makes Android RD Client render corrupted frames or no picture after
+                        // rotation. Encoder-internal padding must remain private.
+                        let encoded_width = frame.width as u16;
+                        let encoded_height = frame.height as u16;
 
                         // Create H.264 encoder with resolution-appropriate level
                         // Use config values for quality settings and color space
                         let color_space = ColorSpaceConfig::from_config(
                             &self.config.egfx.color_matrix,
                             &self.config.egfx.color_range,
-                            aligned_width as u32,
-                            aligned_height as u32,
+                            encoded_width as u32,
+                            encoded_height as u32,
                         );
                         let config = EncoderConfig {
                             bitrate_kbps: self.config.egfx.h264_bitrate,
                             max_fps: self.config.video.target_fps as f32,
                             enable_skip_frame: true,
-                            width: Some(aligned_width),
-                            height: Some(aligned_height),
+                            width: Some(encoded_width),
+                            height: Some(encoded_height),
                             color_space: Some(color_space),
                             qp_min: self.config.egfx.qp_min,
                             qp_max: self.config.egfx.qp_max,
@@ -1721,8 +1810,8 @@ impl LamcoDisplayHandler {
                             if self.config.hardware_encoding.enabled {
                                 match create_hardware_encoder(
                                     &self.config.hardware_encoding,
-                                    aligned_width as u32,
-                                    aligned_height as u32,
+                                    encoded_width as u32,
+                                    encoded_height as u32,
                                 ) {
                                     Ok(hw_encoder) => {
                                         video_encoder = Some(VideoEncoder::Hardware(
@@ -1730,7 +1819,7 @@ impl LamcoDisplayHandler {
                                         ));
                                         info!(
                                             "✅ Hardware encoder initialized for {}×{} (GPU encoding)",
-                                            aligned_width, aligned_height
+                                            encoded_width, encoded_height
                                         );
                                     }
                                     Err(e) => {
@@ -1765,7 +1854,7 @@ impl LamcoDisplayHandler {
                                         video_encoder = Some(VideoEncoder::Avc444(encoder));
                                         info!(
                                             "✅ AVC444 encoder initialized for {}×{} (4:4:4 chroma)",
-                                            aligned_width, aligned_height
+                                            encoded_width, encoded_height
                                         );
                                     }
                                     Err(e) => {
@@ -1778,7 +1867,7 @@ impl LamcoDisplayHandler {
                                                 video_encoder = Some(VideoEncoder::Avc420(encoder));
                                                 info!(
                                                     "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
-                                                    aligned_width, aligned_height
+                                                    encoded_width, encoded_height
                                                 );
                                             }
                                             Err(e) => {
@@ -1796,8 +1885,8 @@ impl LamcoDisplayHandler {
                                     Ok(encoder) => {
                                         video_encoder = Some(VideoEncoder::Avc420(encoder));
                                         info!(
-                                            "✅ AVC420 encoder initialized for {}×{} (aligned)",
-                                            aligned_width, aligned_height
+                                            "✅ AVC420 encoder initialized for {}×{}",
+                                            encoded_width, encoded_height
                                         );
                                     }
                                     Err(e) => {
@@ -1821,37 +1910,56 @@ impl LamcoDisplayHandler {
                             handler.gfx_server_handle.read().await.clone(),
                             handler.server_event_tx.read().await.clone(),
                         ) {
-                            // Create primary surface for EGFX rendering
-                            // Must be done BEFORE sending any frames
-                            // MS-RDPEGFX REQUIRES 16-pixel alignment!
+                            // Create primary surface for EGFX rendering.
+                            // Must be done BEFORE sending any frames. Keep the
+                            // protocol-visible surface at the actual desktop size;
+                            // Android RD Client does not tolerate advertised
+                            // macroblock padding during rotation.
                             {
                                 info!(
-                                    "📐 Aligning surface: {}×{} → {}×{} (16-pixel boundary)",
-                                    frame.width, frame.height, aligned_width, aligned_height
+                                    "📐 Creating EGFX surface at actual desktop size: {}×{}",
+                                    encoded_width, encoded_height
                                 );
 
                                 let mut server =
                                     gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
 
-                                // CRITICAL FIX: Set desktop size BEFORE creating surface
-                                // This prevents desktop size mismatch when ResetGraphics is auto-sent
-                                // Desktop = actual resolution (800×600)
-                                // Surface = aligned resolution (800×608)
-                                server
-                                    .set_output_dimensions(frame.width as u16, frame.height as u16);
+                                // CRITICAL: Set desktop size BEFORE creating surface so
+                                // ResetGraphics, CreateSurface, SPS, and regions agree.
+                                server.set_output_dimensions(encoded_width, encoded_height);
                                 info!(
                                     "✅ EGFX desktop dimensions set: {}×{} (actual)",
                                     frame.width, frame.height
                                 );
 
-                                // Create surface with ALIGNED dimensions
-                                // create_surface() will auto-send ResetGraphics using output_dimensions
+                                // Send ResetGraphics with 1 monitor entry before CreateSurface.
+                                // MS-RDPEGFX §2.2.2.15: nMonitors=0 causes black screen on
+                                // Windows mstsc and corruption on Android. right/bottom are
+                                // INCLUSIVE (last pixel): right = width-1, bottom = height-1.
+                                {
+                                    use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+                                    server.resize_with_monitors(
+                                        encoded_width,
+                                        encoded_height,
+                                        vec![Monitor {
+                                            left: 0,
+                                            top: 0,
+                                            right: encoded_width as i32 - 1,
+                                            bottom: encoded_height as i32 - 1,
+                                            flags: MonitorFlags::PRIMARY,
+                                        }],
+                                    );
+                                }
+
+                                // Create surface with actual dimensions.
+                                // create_surface() auto-ResetGraphics is skipped because
+                                // resize_with_monitors already set reset_graphics_sent=true.
                                 if let Some(surface_id) =
-                                    server.create_surface(aligned_width, aligned_height)
+                                    server.create_surface(encoded_width, encoded_height)
                                 {
                                     info!(
-                                        "✅ EGFX surface {} created ({}×{} aligned)",
-                                        surface_id, aligned_width, aligned_height
+                                        "✅ EGFX surface {} created ({}×{})",
+                                        surface_id, encoded_width, encoded_height
                                     );
                                     // Map surface to output at origin (0,0)
                                     if server.map_surface_to_output(surface_id, 0, 0) {
@@ -1936,8 +2044,6 @@ impl LamcoDisplayHandler {
 
                     // Try to send via EGFX if encoder is available
                     if let (Some(encoder), Some(sender)) = (&mut video_encoder, &egfx_sender) {
-                        use crate::egfx::align_to_16;
-
                         // Use PipeWire PTS when available, fall back to synthetic timing
                         let timestamp_ms = if frame.pts > 0 {
                             frame.pts / 1_000_000 // nanoseconds → milliseconds
@@ -2060,25 +2166,14 @@ impl LamcoDisplayHandler {
                             }
                         }
 
-                        // MS-RDPEGFX REQUIRES 16-pixel alignment
-                        // Frame from PipeWire may not be aligned (e.g., 800×600)
-                        // Must align dimensions AND pad frame data
-                        let aligned_width = align_to_16(frame.width as u32);
-                        let aligned_height = align_to_16(frame.height as u32);
-
-                        let frame_data = if aligned_width != frame.width as u32
-                            || aligned_height != frame.height as u32
-                        {
-                            Self::pad_frame_to_aligned(
-                                &frame.data,
-                                frame.width,
-                                frame.height,
-                                aligned_width,
-                                aligned_height,
-                            )
-                        } else {
-                            (*frame.data).clone()
-                        };
+                        // Encode and advertise the actual frame dimensions.
+                        // Do not pad to 16-pixel macroblocks here: OpenH264 accepts
+                        // even YUV420 sizes such as 1920×1080, and leaking padded
+                        // sizes into EGFX regions/surfaces breaks Android RD Client
+                        // especially after portrait/landscape rotation.
+                        let frame_data = (*frame.data).clone();
+                        let encoded_width = frame.width as u32;
+                        let encoded_height = frame.height as u32;
 
                         // OpenH264's encode() is synchronous and CPU-bound.
                         // On slow hardware (e.g., QEMU VMs) it can block for seconds.
@@ -2087,8 +2182,8 @@ impl LamcoDisplayHandler {
                         let encode_result = tokio::task::block_in_place(|| {
                             encoder.encode_bgra(
                                 &frame_data,
-                                aligned_width,
-                                aligned_height,
+                                encoded_width,
+                                encoded_height,
                                 timestamp_ms,
                             )
                         });
@@ -2099,8 +2194,8 @@ impl LamcoDisplayHandler {
                                         sender
                                             .send_frame_with_regions(
                                                 &data,
-                                                aligned_width as u16,
-                                                aligned_height as u16,
+                                                encoded_width as u16,
+                                                encoded_height as u16,
                                                 frame.width as u16,
                                                 frame.height as u16,
                                                 &damage_regions,
@@ -2113,8 +2208,8 @@ impl LamcoDisplayHandler {
                                             .send_avc444_frame_with_regions(
                                                 &main,
                                                 aux.as_deref(), // Option<Vec<u8>> → Option<&[u8]>
-                                                aligned_width as u16,
-                                                aligned_height as u16,
+                                                encoded_width as u16,
+                                                encoded_height as u16,
                                                 frame.width as u16,
                                                 frame.height as u16,
                                                 &damage_regions,
@@ -2218,46 +2313,63 @@ impl LamcoDisplayHandler {
                         continue;
                     }
 
-                    // Convert a *full-frame* bitmap for EGFX Planar.
-                    //
-                    // The normal BitmapConverter preserves PipeWire damage regions and may
-                    // return a small dirty rectangle. EGFX WireToSurface1 supports a
-                    // destination rectangle, but our Planar sender currently targets the
-                    // top-left of the surface. Sending dirty rectangles through that path
-                    // writes partial rows at (0,0), which appears on Android RD Client as
-                    // horizontal stretching/scanline corruption. Clear damage metadata so
-                    // the converter emits one full-screen rectangle until the sender grows
-                    // explicit destination-rectangle support.
-                    let mut planar_frame = frame.clone();
-                    planar_frame.damage_regions.clear();
-                    let bitmap_update = match handler.convert_to_bitmap(planar_frame).await {
-                        Ok(bitmap) => bitmap,
-                        Err(e) => {
-                            error!("Planar: Failed to convert full frame: {}", e);
-                            continue;
-                        }
-                    };
-
-                    if bitmap_update.rectangles.is_empty() {
+                    // Build a *full-frame* IronRDP bitmap directly for EGFX Planar.
+                    // The frame has already been cropped to the client desktop and
+                    // is compact BGRx32. Do not route this through BitmapConverter:
+                    // for Android-sized compact BGRx frames it may hit the generic
+                    // BGRx -> BGRx conversion path, which is intentionally unsupported
+                    // and results in a blank screen because no Planar frames are sent.
+                    let bytes_per_pixel = frame.format.bytes_per_pixel() as usize;
+                    let expected_len =
+                        frame.width as usize * frame.height as usize * bytes_per_pixel;
+                    if frame.data.len() < expected_len {
+                        error!(
+                            "Planar: compact frame too small: len={} expected={} for {}×{}",
+                            frame.data.len(),
+                            expected_len,
+                            frame.width,
+                            frame.height
+                        );
+                        frames_dropped += 1;
                         continue;
                     }
 
-                    let iron_updates = match handler.convert_to_iron_format(&bitmap_update).await {
-                        Ok(updates) => updates,
-                        Err(e) => {
-                            error!("Planar: Failed to convert to IronRDP format: {}", e);
-                            continue;
-                        }
+                    let planar_bitmap = IronBitmapUpdate {
+                        x: 0,
+                        y: 0,
+                        width: match NonZeroU16::new(frame.width as u16) {
+                            Some(width) => width,
+                            None => {
+                                frames_dropped += 1;
+                                continue;
+                            }
+                        },
+                        height: match NonZeroU16::new(frame.height as u16) {
+                            Some(height) => height,
+                            None => {
+                                frames_dropped += 1;
+                                continue;
+                            }
+                        },
+                        format: IronPixelFormat::BgrX32,
+                        data: Bytes::copy_from_slice(&frame.data[..expected_len]),
+                        stride: match NonZeroUsize::new(frame.width as usize * bytes_per_pixel) {
+                            Some(stride) => stride,
+                            None => {
+                                frames_dropped += 1;
+                                continue;
+                            }
+                        },
                     };
 
                     // Send via EGFX Planar (codec_id=0xa)
-                    if let Some(iron_bitmap) = iron_updates.first() {
+                    {
                         let send_result = sender
                             .send_planar_frame(
                                 planar_enc,
-                                iron_bitmap,
-                                iron_bitmap.width.get(),
-                                iron_bitmap.height.get(),
+                                &planar_bitmap,
+                                planar_bitmap.width.get(),
+                                planar_bitmap.height.get(),
                                 timestamp_ms as u32,
                             )
                             .await;
@@ -2267,7 +2379,7 @@ impl LamcoDisplayHandler {
                                 egfx_frames_sent += 1;
                                 if egfx_frames_sent.is_multiple_of(30) {
                                     debug!(
-                                        "📹 EGFX Planar: Sent {} frames via EGFX",
+                                        "📹 EGFX Uncompressed (diag): Sent {} frames via EGFX",
                                         egfx_frames_sent
                                     );
                                 }
@@ -2280,16 +2392,58 @@ impl LamcoDisplayHandler {
                             }
                         }
                     }
-                    // Frame was consumed by EGFX path, don't fall through to bitmap
-                    continue;
                 }
 
                 let convert_start = std::time::Instant::now();
-                let bitmap_update = match handler.convert_to_bitmap(frame).await {
-                    Ok(bitmap) => bitmap,
-                    Err(e) => {
-                        error!("Failed to convert frame to bitmap: {}", e);
+                let target_size = *handler.size.read().await;
+                let bitmap_frame =
+                    Self::crop_frame_to_size(&frame, target_size.width, target_size.height);
+                if bitmap_frame.width != frame.width || bitmap_frame.height != frame.height {
+                    debug!(
+                        "Cropping bitmap fallback frame: {}x{} -> {}x{}",
+                        frame.width, frame.height, bitmap_frame.width, bitmap_frame.height
+                    );
+                }
+                // BGRx passthrough: PipeWire always produces BGRx, and when the
+                // client desktop also uses BGRx the BitmapConverter's generic path
+                // rejects BGRx→BGRx as unsupported. Build the BitmapUpdate directly
+                // from the compact frame data to bypass the converter.
+                use lamco_pipewire::PixelFormat as PwPixelFormat;
+                let bitmap_update = if bitmap_frame.format == PwPixelFormat::BGRx {
+                    let bpp = 4usize;
+                    let expected_len =
+                        bitmap_frame.width as usize * bitmap_frame.height as usize * bpp;
+                    if bitmap_frame.data.len() < expected_len {
+                        error!(
+                            "BGRx passthrough: frame too small: len={} expected={} for {}×{}",
+                            bitmap_frame.data.len(),
+                            expected_len,
+                            bitmap_frame.width,
+                            bitmap_frame.height
+                        );
+                        frames_dropped += 1;
                         continue;
+                    }
+                    BitmapUpdate {
+                        rectangles: vec![BitmapData {
+                            rectangle: Rectangle::new(
+                                0,
+                                0,
+                                bitmap_frame.width as u16,
+                                bitmap_frame.height as u16,
+                            ),
+                            format: RdpPixelFormat::BgrX32,
+                            data: bitmap_frame.data[..expected_len].to_vec(),
+                            compressed: false,
+                        }],
+                    }
+                } else {
+                    match handler.convert_to_bitmap(bitmap_frame).await {
+                        Ok(bitmap) => bitmap,
+                        Err(e) => {
+                            error!("Failed to convert frame to bitmap: {}", e);
+                            continue;
+                        }
                     }
                 };
                 let convert_elapsed = convert_start.elapsed();
@@ -2417,6 +2571,20 @@ impl LamcoDisplayHandler {
                 stride,
             };
 
+            if !LOGGED_FIRST_BITMAP_UPDATE.swap(true, Ordering::Relaxed) {
+                info!(
+                    "First IronRDP bitmap update: x={} y={} width={} height={} format={:?} stride={} data_len={} expected_compact_len={}",
+                    iron_bitmap.x,
+                    iron_bitmap.y,
+                    iron_bitmap.width.get(),
+                    iron_bitmap.height.get(),
+                    iron_bitmap.format,
+                    iron_bitmap.stride.get(),
+                    iron_bitmap.data.len(),
+                    width as usize * height as usize * bytes_per_pixel,
+                );
+            }
+
             iron_updates.push(iron_bitmap);
         }
 
@@ -2428,6 +2596,28 @@ impl LamcoDisplayHandler {
 impl RdpServerDisplay for LamcoDisplayHandler {
     async fn size(&mut self) -> DesktopSize {
         let size = self.size.read().await;
+        *size
+    }
+
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        let mut size = self.size.write().await;
+        if client_size.width > 0
+            && client_size.height > 0
+            && (client_size.width < size.width || client_size.height < size.height)
+        {
+            info!(
+                "Accepting client initial desktop size: {}x{} (was {}x{})",
+                client_size.width, client_size.height, size.width, size.height
+            );
+            *size = client_size;
+            *self.bitmap_converter.lock().await =
+                BitmapConverter::new(client_size.width, client_size.height);
+        } else {
+            debug!(
+                "Keeping server initial desktop size: {}x{} (client requested {}x{})",
+                size.width, size.height, client_size.width, client_size.height
+            );
+        }
         *size
     }
 

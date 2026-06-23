@@ -507,10 +507,6 @@ impl EgfxFrameSender {
         Ok(frame_id)
     }
 
-    /// Send a RemoteFX-encoded frame through EGFX
-    ///
-    /// Used when AVC (H.264) is disabled but EGFX channel is available.
-    /// RemoteFX provides DCT-based compression (~10:1 ratio) via the EGFX
     /// Send a Planar-encoded frame through EGFX.
     ///
     /// Planar codec (0xa) is supported by the MS Android RD Client.
@@ -519,7 +515,7 @@ impl EgfxFrameSender {
     /// The `planar_encoder` should be created once and reused across frames.
     pub async fn send_planar_frame(
         &self,
-        planar_encoder: &mut super::planar::PlanarEncoder,
+        planar_encoder: &mut ironrdp_graphics::rdp6::BitmapStreamEncoder,
         bitmap: &ironrdp_server::BitmapUpdate,
         display_width: u16,
         display_height: u16,
@@ -539,17 +535,41 @@ impl EgfxFrameSender {
 
         let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
 
-        // Encode bitmap to RDP6 Planar format (RLE + delta encoding, lossless)
-        let planar_data = planar_encoder.encode(
-            &bitmap.data,
-            display_width as usize,
-            display_height as usize,
-            bitmap.stride.get() as usize,
-        );
+        // Encode to RDP6_BITMAP_STREAM (Planar codec, codec_id=0xa).
+        // PipeWire delivers BGRx32 (B=byte0, G=byte1, R=byte2, X=byte3),
+        // so BgrAChannels must be used for correct RGB channel mapping.
+        //
+        // BitmapStreamEncoder stores width/height and uses them to split the pixel
+        // iterator into per-scanline RLE segments. If the stored dimensions differ
+        // from the actual frame, the delta encoding uses the wrong row boundary and
+        // produces striped corruption. Rebuild from actual frame dimensions on every
+        // call — encoder construction is O(1) with no allocation.
+        let w = bitmap.width.get() as usize;
+        let h = bitmap.height.get() as usize;
+        *planar_encoder = ironrdp_graphics::rdp6::BitmapStreamEncoder::new(w, h);
+        let mut planar_buf = vec![0u8; w * h * 4 + 1024];
+        let encoded_len = planar_encoder
+            .encode_bitmap::<ironrdp_graphics::rdp6::BgrAChannels>(
+                &bitmap.data,
+                &mut planar_buf,
+                true,
+            )
+            .map_err(|e| SendError::EncodingFailed(format!("Planar encode: {e}")))?;
+        let planar_data = &planar_buf[..encoded_len];
 
-        let encoded_len = planar_data.len();
+        let count_before = self.frame_count.load(std::sync::atomic::Ordering::Relaxed);
+        if count_before == 0 {
+            tracing::info!(
+                "EGFX Planar first frame: surface={} {}x{} raw={}B encoded={}B (ratio={:.1}x)",
+                surface_id,
+                display_width,
+                display_height,
+                bitmap.data.len(),
+                encoded_len,
+                bitmap.data.len() as f32 / encoded_len.max(1) as f32,
+            );
+        }
 
-        // Send via EGFX channel with Codec1Type::Planar (0xa)
         let (frame_id, dvc_messages, channel_id) = {
             let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
             let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
@@ -557,7 +577,7 @@ impl EgfxFrameSender {
             let frame_id = server
                 .send_planar_frame(
                     surface_id,
-                    &planar_data,
+                    planar_data,
                     display_width,
                     display_height,
                     timestamp_ms,
@@ -587,13 +607,8 @@ impl EgfxFrameSender {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count.is_multiple_of(30) {
             debug!(
-                "EGFX Planar: Sent frame {} (id={}, {}x{}, {} bytes encoded from {} bytes raw)",
-                count,
-                frame_id,
-                display_width,
-                display_height,
-                encoded_len,
-                bitmap.data.len(),
+                "EGFX Planar: Sent frame {} (id={}, {}x{}, {}B encoded)",
+                count, frame_id, display_width, display_height, encoded_len,
             );
         }
 

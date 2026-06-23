@@ -141,103 +141,85 @@ fn rle_compress_plane(plane: &[u8], width: usize, height: usize) -> Vec<u8> {
 
 /// RLE-encode a single scanline per MS-RDPEGDI 3.1.9.2.
 ///
-/// Control byte layout:
-///   bits 7:4 = cRawBytes  — count of literal bytes that follow this control byte
-///   bits 3:0 = nRunLength — how many times to repeat the last raw byte after
-///
-/// Special nRunLength values (only when cRawBytes == 0):
-///   1 → repeat 16 times
-///   2 → repeat 32 times
-///
-/// The run value is always the LAST raw byte read in the current scanline.
-/// There is no explicit run-value byte on the wire.
+/// This mirrors IronRDP's RDP6 plane encoder. A segment carries up to 15 raw
+/// bytes followed by a run of the last raw byte. Long runs use the special
+/// 16/32+ forms. Some clients, including Microsoft RD Client on Android, are
+/// sensitive to this canonical segmentation even when a non-canonical stream
+/// round-trips through IronRDP's decoder.
 fn encode_rle_scanline(input: &[u8], output: &mut Vec<u8>) {
     if input.is_empty() {
         return;
     }
 
-    let mut i = 0;
-    // Accumulate raw bytes that don't belong to any run >= 3
-    let mut pending: Vec<u8> = Vec::with_capacity(16);
+    let mut iter = input.iter().copied();
+    let first = iter.next().expect("input is not empty");
+    let mut raw = vec![first];
+    // `count` is the number of repeats after the first byte in the current run.
+    let mut seq = (first, 0usize);
 
-    while i < input.len() {
-        let val = input[i];
-
-        // Count run length
-        let mut run = 1usize;
-        while i + run < input.len() && input[i + run] == val {
-            run += 1;
-        }
-
-        if run >= 3 {
-            // Flush pending raw bytes first
-            flush_raw(&pending, output);
-            pending.clear();
-
-            // Emit val as a 1-byte raw block, establishing it as the run value.
-            // Then emit (run - 1) repetitions using run-only control bytes.
-            // Any remainder that can't be expressed as a pure run (1-2 left over)
-            // is emitted as raw bytes (via flush_raw) since we have val available here.
-            flush_raw(&[val], output);
-            let remainder = emit_run_reps(run - 1, output);
-            // emit_run_reps returns leftover reps (0, 1, or 2) it couldn't encode.
-            // Emit them as raw copies of val.
-            if remainder > 0 {
-                for _ in 0..remainder {
-                    pending.push(val);
-                }
-                flush_raw(&pending, output);
-                pending.clear();
-            }
+    for byte in iter {
+        let (last, count) = seq;
+        seq = if byte == last {
+            (byte, count + 1)
         } else {
-            // Short run: accumulate as raw bytes
-            for _ in 0..run {
-                pending.push(val);
+            match count {
+                3.. => {
+                    encode_segment(&raw, count, output);
+                    raw.clear();
+                }
+                2 => raw.extend_from_slice(&[last, last]),
+                1 => raw.push(last),
+                _ => {}
             }
+            raw.push(byte);
+            (byte, 0)
+        };
+    }
+
+    let (last, mut count) = seq;
+    if count < 3 {
+        raw.extend(std::iter::repeat_n(last, count));
+        count = 0;
+    }
+    encode_segment(&raw, count, output);
+}
+
+fn encode_segment(mut raw: &[u8], run: usize, output: &mut Vec<u8>) {
+    if raw.is_empty() {
+        return;
+    }
+
+    while raw.len() > 15 {
+        encode_segment(&raw[..15], 0, output);
+        raw = &raw[15..];
+    }
+
+    let raw_len = raw.len() as u8;
+    let run_capped = run.min(15) as u8;
+    output.push((raw_len << 4) | run_capped);
+    output.extend_from_slice(raw);
+
+    if run > 15 {
+        let last = *raw.last().expect("raw segment is not empty");
+        encode_long_sequence(run - 15, last, output);
+    }
+}
+
+fn encode_long_sequence(mut run: usize, last: u8, output: &mut Vec<u8>) {
+    while run >= 16 {
+        let current = run.min(47);
+        let c_raw_bytes = (current / 16).min(2);
+        let n_run_length = current - c_raw_bytes * 16;
+        output.push(((n_run_length as u8) << 4) | c_raw_bytes as u8);
+        run -= current;
+    }
+
+    if run > 0 {
+        match run {
+            short @ 1..=3 => encode_segment(&vec![last; short], 0, output),
+            long => encode_segment(&[last], long - 1, output),
         }
-
-        i += run;
     }
-
-    // Flush any remaining raw bytes
-    flush_raw(&pending, output);
-}
-
-/// Write raw bytes as one or more (cRaw, raw_bytes...) segments.
-/// Each segment carries at most 15 bytes (cRaw is 4 bits).
-fn flush_raw(raw: &[u8], output: &mut Vec<u8>) {
-    let mut offset = 0;
-    while offset < raw.len() {
-        let chunk = (raw.len() - offset).min(15);
-        // ctrl: bits 7:4 = chunk (cRaw), bits 3:0 = 0 (nRun = no repeat)
-        output.push((chunk as u8) << 4);
-        output.extend_from_slice(&raw[offset..offset + chunk]);
-        offset += chunk;
-    }
-}
-
-/// Emit `reps` repetitions of the current run value using run-only control bytes.
-/// Must follow a raw byte that establishes the run value.
-/// Returns leftover reps (0, 1, or 2) that could not be expressed as pure-run segments.
-/// The caller must emit those leftover copies as raw bytes.
-fn emit_run_reps(mut reps: usize, output: &mut Vec<u8>) -> usize {
-    // Emit 32-repeat blocks (nRun=2, cRaw=0)
-    while reps >= 32 {
-        output.push(0x02);
-        reps -= 32;
-    }
-    // Emit 16-repeat block (nRun=1, cRaw=0)
-    if reps >= 16 {
-        output.push(0x01);
-        reps -= 16;
-    }
-    // Emit 3..15-repeat block (nRun=reps, cRaw=0)
-    if reps >= 3 {
-        output.push(reps as u8);
-        reps = 0;
-    }
-    // Return remaining 0, 1, or 2 — caller emits them as raw bytes
-    reps
 }
 
 #[cfg(test)]
