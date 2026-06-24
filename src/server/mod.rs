@@ -855,6 +855,7 @@ impl LamcoRdpServer {
                     monitors,
                     primary_stream_id,
                     input_tx,
+                    Some(display_handler.get_update_sender()),
                     input_rx,
                     shutdown_broadcast.subscribe(),
                     config.input.cjk_paste_fallback,
@@ -1199,7 +1200,8 @@ impl LamcoRdpServer {
             monitors.clone(),
             primary_stream_id,
             input_tx.clone(), // Multiplexer input queue sender (for handler callbacks)
-            input_rx,         // Multiplexer input queue receiver (for batching task)
+            Some(display_handler.get_update_sender()),
+            input_rx, // Multiplexer input queue receiver (for batching task)
             shutdown_broadcast.subscribe(), // Shutdown signal for batching task
             config.input.cjk_paste_fallback,
             cjk_clipboard,

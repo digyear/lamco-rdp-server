@@ -79,8 +79,10 @@ use std::{
     time::Instant,
 };
 
+use ironrdp_pdu::pointer::PointerPositionAttribute;
 use ironrdp_server::{
-    KeyboardEvent as IronKeyboardEvent, MouseEvent as IronMouseEvent, RdpServerInputHandler,
+    DisplayUpdate, KeyboardEvent as IronKeyboardEvent, MouseEvent as IronMouseEvent,
+    RdpServerInputHandler,
 };
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -371,6 +373,11 @@ pub struct LamcoInputHandler {
     /// Input event queue sender (for multiplexer - bounded with drop policy)
     input_tx: mpsc::Sender<InputEvent>,
 
+    /// Display update channel used to echo pointer shape/position back to clients.
+    /// Android Microsoft RD Client does not draw a local pointer unless the
+    /// server sends pointer updates, even though input injection works.
+    pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
+
     /// Whether CJK clipboard-paste fallback is enabled (from config)
     cjk_paste_enabled: bool,
 
@@ -388,6 +395,7 @@ impl LamcoInputHandler {
         monitors: Vec<MonitorInfo>,
         primary_stream_id: u32,
         input_tx: mpsc::Sender<InputEvent>,
+        pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
         mut input_rx: mpsc::Receiver<InputEvent>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         cjk_paste_enabled: bool,
@@ -413,6 +421,7 @@ impl LamcoInputHandler {
         let cjk_enabled_task = cjk_paste_enabled;
         let clipboard_provider_task = clipboard_provider.clone();
         let cjk_paste_paused_task = cjk_paste_paused.clone();
+        let pointer_update_tx_task = pointer_update_tx.clone();
 
         tokio::spawn(async move {
             let mut keyboard_batch = Vec::with_capacity(16);
@@ -480,7 +489,8 @@ impl LamcoInputHandler {
                                 &mouse_clone,
                                 &coord_clone,
                                 mouse_event,
-                                primary_stream_id
+                                primary_stream_id,
+                                &pointer_update_tx_task,
                             ).await {
                                 let count = consecutive_mouse_errors.fetch_add(1, Ordering::Relaxed) + 1;
                                 if count == 1 {
@@ -526,6 +536,7 @@ impl LamcoInputHandler {
             coordinate_transformer,
             primary_stream_id,
             input_tx,
+            pointer_update_tx,
             cjk_paste_enabled,
             clipboard_provider,
             cjk_paste_paused,
@@ -892,6 +903,22 @@ impl LamcoInputHandler {
         info!("CJK paste fallback: flushed {char_count} chars via clipboard");
     }
 
+    async fn send_pointer_position_update(
+        pointer_update_tx: &Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
+        x: u16,
+        y: u16,
+    ) {
+        let Some(update_tx) = pointer_update_tx else {
+            return;
+        };
+
+        let update = DisplayUpdate::PointerPosition(PointerPositionAttribute { x, y });
+        let sender = update_tx.lock().await;
+        if let Err(err) = sender.try_send(update) {
+            trace!("Dropping pointer position update: {err}");
+        }
+    }
+
     /// Handle mouse event with full error handling and logging
     /// Handle mouse event implementation (static for batching task)
     async fn handle_mouse_event_impl(
@@ -900,6 +927,7 @@ impl LamcoInputHandler {
         coordinate_transformer: &Arc<Mutex<CoordinateTransformer>>,
         event: IronMouseEvent,
         stream_id: u32,
+        pointer_update_tx: &Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
     ) -> Result<(), InputError> {
         let mut mouse = mouse_handler.lock().await;
         let mut transformer = coordinate_transformer.lock().await;
@@ -919,6 +947,8 @@ impl LamcoInputHandler {
                         ));
                     }
                 };
+
+                Self::send_pointer_position_update(pointer_update_tx, x, y).await;
 
                 session_handle
                     .notify_pointer_motion_absolute(stream_id, stream_x, stream_y)
@@ -941,6 +971,10 @@ impl LamcoInputHandler {
                 };
 
                 // We converted relative to absolute already
+                let pointer_x = stream_x.clamp(0.0, f64::from(u16::MAX)).round() as u16;
+                let pointer_y = stream_y.clamp(0.0, f64::from(u16::MAX)).round() as u16;
+                Self::send_pointer_position_update(pointer_update_tx, pointer_x, pointer_y).await;
+
                 session_handle
                     .notify_pointer_motion_absolute(stream_id, stream_x, stream_y)
                     .await
@@ -1078,6 +1112,7 @@ impl Clone for LamcoInputHandler {
             coordinate_transformer: Arc::clone(&self.coordinate_transformer),
             primary_stream_id: self.primary_stream_id,
             input_tx: self.input_tx.clone(),
+            pointer_update_tx: self.pointer_update_tx.clone(),
             cjk_paste_enabled: self.cjk_paste_enabled,
             clipboard_provider: self.clipboard_provider.clone(),
             cjk_paste_paused: self.cjk_paste_paused.clone(),
