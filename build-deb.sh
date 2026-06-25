@@ -2,7 +2,14 @@
 set -euo pipefail
 
 # lamco-rdp-server Debian package build script
-# Uses Docker builder image and bind-mounts ONLY this project directory at /src.
+#
+# This is the canonical packaging entrypoint. It intentionally builds inside the
+# known-good Docker image (not on the host) so release artifacts are reproducible
+# and include the same feature set as deployed packages.
+#
+# Important: Debian packages MUST be built with the `vaapi` Cargo feature enabled.
+# Do not "fix" VA-API bugs by producing a package without VA-API; that creates a
+# mismatched test/deploy artifact and hides the broken runtime path.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -20,12 +27,18 @@ echo ""
 
 if ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
     echo "ERROR: Docker image not found: $DOCKER_IMAGE" >&2
+    echo "Create/reuse the known-good builder image before packaging." >&2
+    exit 1
+fi
+
+if ! grep -Eq 'cargo build .*--features "default,vaapi,gui"' packaging/debian/rules; then
+    echo "ERROR: packaging/debian/rules must build with --features \"default,vaapi,gui\"" >&2
+    echo "Refusing to produce a package that cannot exercise the VA-API runtime path." >&2
     exit 1
 fi
 
 mkdir -p "$OUT_DIR"
 
-# Always recreate the builder so stale containers/mounts cannot survive.
 if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
     echo "Removing old builder container..."
     docker rm -f "$CONTAINER_NAME" >/dev/null
@@ -83,6 +96,11 @@ docker exec "$CONTAINER_NAME" bash -c '
 
     echo "Debian metadata ready:"
     find debian -maxdepth 2 -type f | sort
+
+    if ! grep -Eq "cargo build .*--features \"default,vaapi,gui\"" debian/rules; then
+        echo "ERROR: generated debian/rules lost required VA-API feature set" >&2
+        exit 1
+    fi
 '
 
 echo ""
@@ -93,6 +111,7 @@ docker exec "$CONTAINER_NAME" bash -c '
     set -euo pipefail
     export PATH=/usr/local/cargo/bin:$PATH
     cd /src
+    echo "Rust toolchain: $(rustc --version); $(cargo --version)"
     dpkg-buildpackage -us -uc -b -d -nc
 '
 
@@ -132,7 +151,29 @@ if [ -f "$TMPDIR/usr/bin/lamco-rdp-server" ]; then
     ls -lh "$TMPDIR/usr/bin/lamco-rdp-server"
     sha256sum "$TMPDIR/usr/bin/lamco-rdp-server"
     "$TMPDIR/usr/bin/lamco-rdp-server" --version 2>/dev/null || true
+
+    echo ""
+    echo "=== VA-API linkage verification ==="
+    if ! ldd "$TMPDIR/usr/bin/lamco-rdp-server" | grep -q 'libva'; then
+        echo "ERROR: packaged server binary is not linked against libva; vaapi feature was not built" >&2
+        exit 1
+    fi
+    ldd "$TMPDIR/usr/bin/lamco-rdp-server" | grep -E 'libva|libdrm' || true
 fi
+
+
+echo ""
+echo "=== Packaged systemd service verification ==="
+if [ ! -f "$TMPDIR/usr/lib/systemd/user/lamco-rdp-server.service" ]; then
+    echo "ERROR: package is missing lamco-rdp-server.service" >&2
+    exit 1
+fi
+grep -F 'ExecStart=/usr/bin/lamco-rdp-server --dbus-service' \
+    "$TMPDIR/usr/lib/systemd/user/lamco-rdp-server.service" >/dev/null || {
+    echo "ERROR: packaged service does not start /usr/bin/lamco-rdp-server --dbus-service" >&2
+    exit 1
+}
+grep -F 'ExecStart=' "$TMPDIR/usr/lib/systemd/user/lamco-rdp-server.service"
 rm -rf "$TMPDIR"
 
 echo ""

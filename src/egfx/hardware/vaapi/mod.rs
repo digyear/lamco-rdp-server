@@ -208,6 +208,12 @@ impl VaapiEncoder {
             .unwrap_or_else(|_| "unknown".to_string());
         debug!("VA-API vendor: {}", driver_name);
 
+        if Self::is_known_broken_h264_encoder(&driver_name) {
+            return Err(HardwareEncoderError::UnsupportedConfig(format!(
+                "VA-API H.264 disabled for known-broken driver/device: {driver_name}"
+            )));
+        }
+
         // Check for H.264 encode support
         let profiles = display
             .query_config_profiles()
@@ -362,6 +368,11 @@ impl VaapiEncoder {
 
     fn is_idr_frame(&self) -> bool {
         self.force_idr || self.frame_count.is_multiple_of(self.idr_interval as u64)
+    }
+
+    fn is_known_broken_h264_encoder(driver_name: &str) -> bool {
+        let driver = driver_name.to_ascii_lowercase();
+        driver.contains("radeonsi") && driver.contains("gfx1151")
     }
 
     fn get_h264_level(&self) -> u8 {
@@ -1292,6 +1303,19 @@ mod tests {
             quality_preset: "balanced".to_string(),
             prefer_nvenc: false,
         }
+    }
+
+    #[test]
+    fn known_broken_radeonsi_gfx1151_is_blacklisted() {
+        assert!(VaapiEncoder::is_known_broken_h264_encoder(
+            "Mesa Gallium driver for AMD Radeon Graphics (radeonsi, gfx1151)"
+        ));
+        assert!(!VaapiEncoder::is_known_broken_h264_encoder(
+            "Intel iHD driver for Intel(R) Graphics"
+        ));
+        assert!(!VaapiEncoder::is_known_broken_h264_encoder(
+            "Mesa Gallium driver for AMD Radeon Graphics (radeonsi, gfx1100)"
+        ));
     }
 
     #[test]

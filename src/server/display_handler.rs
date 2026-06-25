@@ -155,6 +155,34 @@ enum EncodedVideoFrame {
     },
 }
 
+impl EncodedVideoFrame {
+    fn payload_len(&self) -> usize {
+        match self {
+            Self::Single(data) => data.len(),
+            Self::Dual { main, aux } => main.len() + aux.as_ref().map_or(0, Vec::len),
+        }
+    }
+}
+
+fn hardware_runtime_fallback_reason(
+    codec_name: &str,
+    payload_len: Option<usize>,
+) -> Option<&'static str> {
+    let is_hardware = matches!(
+        codec_name,
+        "VA-API H.264" | "NVENC H.264" | "Hardware H.264"
+    );
+    if !is_hardware {
+        return None;
+    }
+
+    match payload_len {
+        None => Some("hardware encoder returned no frame"),
+        Some(0) => Some("hardware encoder produced empty H.264 payload"),
+        Some(_) => None,
+    }
+}
+
 impl VideoEncoder {
     /// Encode a BGRA frame to H.264
     ///
@@ -205,6 +233,14 @@ impl VideoEncoder {
                     "Hardware H.264"
                 }
             },
+        }
+    }
+
+    fn is_hardware(&self) -> bool {
+        match self {
+            VideoEncoder::Avc420(_) | VideoEncoder::Avc444(_) => false,
+            #[cfg(any(feature = "vaapi", feature = "nvenc"))]
+            VideoEncoder::Hardware(_) => true,
         }
     }
 
@@ -928,6 +964,8 @@ impl LamcoDisplayHandler {
             // NOTE: These are reset when egfx_needs_init transitions from true to false
             let mut video_encoder: Option<VideoEncoder> = None;
             let mut egfx_sender: Option<EgfxFrameSender> = None;
+            let mut h264_encoder_config: Option<EncoderConfig> = None;
+            let mut hardware_encoding_runtime_disabled = false;
             // IronRDP Planar encoder for EGFX Planar path (used when AVC is disabled and RFX unsupported)
             let mut planar_encoder: Option<ironrdp_graphics::rdp6::BitmapStreamEncoder> = None;
             // AVC444 vs AVC420 determined by VideoEncoder enum variant match, not a flag
@@ -1434,7 +1472,9 @@ impl LamcoDisplayHandler {
                             // LamcoGfxFactory::build_server_with_handle(); clearing them
                             // here races with fast EGFX capability negotiation (Android
                             // AVC_DISABLED) and prevents Planar init.
-                            info!("Pipeline state reset for new client connection (no-frame path, cache cleared)");
+                            info!(
+                                "Pipeline state reset for new client connection (no-frame path, cache cleared)"
+                            );
                         }
 
                         let needs_init = handler
@@ -1807,6 +1847,7 @@ impl LamcoDisplayHandler {
                             qp_max: self.config.egfx.qp_max,
                             encoder_threads: self.config.performance.encoder_threads as u16,
                         };
+                        h264_encoder_config = Some(config.clone());
                         let threads_desc = if self.config.performance.encoder_threads == 0 {
                             "auto".to_string()
                         } else {
@@ -1879,7 +1920,9 @@ impl LamcoDisplayHandler {
                         // Try hardware encoding first when enabled in config.
                         #[cfg(any(feature = "vaapi", feature = "nvenc"))]
                         {
-                            if self.config.hardware_encoding.enabled {
+                            if self.config.hardware_encoding.enabled
+                                && !hardware_encoding_runtime_disabled
+                            {
                                 match create_hardware_encoder(
                                     &self.config.hardware_encoding,
                                     encoded_width as u32,
@@ -2276,6 +2319,34 @@ impl LamcoDisplayHandler {
                         });
                         match encode_result {
                             Ok(Some(encoded_frame)) => {
+                                let codec_name = encoder.codec_name();
+                                let payload_len = encoded_frame.payload_len();
+                                if let Some(reason) =
+                                    hardware_runtime_fallback_reason(codec_name, Some(payload_len))
+                                {
+                                    warn!(
+                                        "{} from {}; disabling hardware encoding for this session and falling back to OpenH264 AVC420",
+                                        reason, codec_name
+                                    );
+                                    hardware_encoding_runtime_disabled = true;
+                                    if let Some(config) = h264_encoder_config.clone() {
+                                        match Avc420Encoder::new(config) {
+                                            Ok(sw_encoder) => {
+                                                *encoder = VideoEncoder::Avc420(sw_encoder);
+                                                force_first_frame = true;
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to create OpenH264 fallback encoder after hardware runtime failure: {:?}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    frames_dropped += 1;
+                                    continue;
+                                }
+
                                 let send_result = match encoded_frame {
                                     EncodedVideoFrame::Single(data) => {
                                         sender
@@ -2319,28 +2390,97 @@ impl LamcoDisplayHandler {
                                         continue; // Frame sent via EGFX, skip RemoteFX path
                                     }
                                     Err(e) => {
-                                        // CRITICAL: Once EGFX is active, NEVER fall back to RemoteFX!
-                                        // Mixing codecs causes display conflicts - EGFX surface invisible
-                                        trace!(
-                                            "EGFX send failed: {} - dropping frame (no RemoteFX fallback)",
-                                            e
-                                        );
+                                        if encoder.is_hardware() {
+                                            warn!(
+                                                "EGFX send failed after hardware encode: {}; disabling hardware encoding for this session and falling back to OpenH264 AVC420",
+                                                e
+                                            );
+                                            hardware_encoding_runtime_disabled = true;
+                                            if let Some(config) = h264_encoder_config.clone() {
+                                                match Avc420Encoder::new(config) {
+                                                    Ok(sw_encoder) => {
+                                                        *encoder = VideoEncoder::Avc420(sw_encoder);
+                                                        force_first_frame = true;
+                                                    }
+                                                    Err(err) => {
+                                                        error!(
+                                                            "Failed to create OpenH264 fallback encoder after EGFX send failure: {:?}",
+                                                            err
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // CRITICAL: Once EGFX is active, NEVER fall back to RemoteFX!
+                                            // Mixing codecs causes display conflicts - EGFX surface invisible
+                                            trace!(
+                                                "EGFX send failed: {} - dropping frame (no RemoteFX fallback)",
+                                                e
+                                            );
+                                        }
                                         frames_dropped += 1;
                                         continue; // Drop frame, don't fall through to RemoteFX
                                     }
                                 }
                             }
                             Ok(None) => {
-                                trace!("H.264 encoder skipped frame");
+                                let codec_name = encoder.codec_name();
+                                if let Some(reason) =
+                                    hardware_runtime_fallback_reason(codec_name, None)
+                                {
+                                    warn!(
+                                        "{} from {}; disabling hardware encoding for this session and falling back to OpenH264 AVC420",
+                                        reason, codec_name
+                                    );
+                                    hardware_encoding_runtime_disabled = true;
+                                    if let Some(config) = h264_encoder_config.clone() {
+                                        match Avc420Encoder::new(config) {
+                                            Ok(sw_encoder) => {
+                                                *encoder = VideoEncoder::Avc420(sw_encoder);
+                                                force_first_frame = true;
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to create OpenH264 fallback encoder after hardware no-output: {:?}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    trace!("H.264 encoder skipped frame");
+                                }
                                 frames_dropped += 1;
                                 continue;
                             }
                             Err(e) => {
-                                // CRITICAL: Once EGFX is active, don't fall back to RemoteFX
-                                trace!(
-                                    "H.264 encoding failed: {:?} - dropping frame (no RemoteFX fallback)",
-                                    e
-                                );
+                                if encoder.is_hardware() {
+                                    warn!(
+                                        "Hardware H.264 encoding failed: {:?}; disabling hardware encoding for this session and falling back to OpenH264 AVC420",
+                                        e
+                                    );
+                                    hardware_encoding_runtime_disabled = true;
+                                    if let Some(config) = h264_encoder_config.clone() {
+                                        match Avc420Encoder::new(config) {
+                                            Ok(sw_encoder) => {
+                                                *encoder = VideoEncoder::Avc420(sw_encoder);
+                                                force_first_frame = true;
+                                            }
+                                            Err(err) => {
+                                                error!(
+                                                    "Failed to create OpenH264 fallback encoder after hardware encode error: {:?}",
+                                                    err
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // CRITICAL: Once EGFX is active, don't fall back to RemoteFX
+                                    trace!(
+                                        "H.264 encoding failed: {:?} - dropping frame (no RemoteFX fallback)",
+                                        e
+                                    );
+                                }
                                 frames_dropped += 1;
                                 continue; // Drop frame, don't fall through to RemoteFX
                             }
@@ -3174,6 +3314,27 @@ mod tests {
                 our_format, iron_format, our_bpp, iron_bpp
             );
         }
+    }
+
+    #[test]
+    fn hardware_runtime_failures_trigger_software_fallback() {
+        assert_eq!(
+            hardware_runtime_fallback_reason("VA-API H.264", None),
+            Some("hardware encoder returned no frame")
+        );
+        assert_eq!(
+            hardware_runtime_fallback_reason("VA-API H.264", Some(0)),
+            Some("hardware encoder produced empty H.264 payload")
+        );
+        assert_eq!(
+            hardware_runtime_fallback_reason("AVC420", Some(0)),
+            None,
+            "software encoder failures must not be misclassified as hardware fallback"
+        );
+        assert_eq!(
+            hardware_runtime_fallback_reason("VA-API H.264", Some(128)),
+            None
+        );
     }
 
     #[tokio::test]
