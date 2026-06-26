@@ -923,12 +923,13 @@ impl LamcoInputHandler {
         const W: u16 = 32;
         const H: u16 = 32;
         const HOT_X: u16 = 4;
-        const HOT_Y: u16 = 27;
+        const HOT_Y: u16 = 4;
         let mut data = vec![0u8; usize::from(W) * usize::from(H) * 4];
 
         // Draw a simple Breeze-like left pointer, stored vertically flipped for
-        // Microsoft RD Client on Android. Windows clients must not receive this
-        // bitmap, because they render it with normal orientation.
+        // Microsoft RD Client on Android. The hotspot remains in normal
+        // top-left cursor coordinates; otherwise the client places the pointer
+        // bitmap about one cursor height above the actual injected position.
         for y in 0..24u16 {
             for x in 0..=y.min(14) {
                 let border = x == 0 || x == y.min(14) || y == 23;
@@ -1250,6 +1251,7 @@ impl Clone for LamcoInputHandler {
 #[cfg(test)]
 mod tests {
     use super::CjkPasteBuffer;
+    use super::LamcoInputHandler;
     use super::unicode_to_keysym;
 
     #[test]
@@ -1267,6 +1269,17 @@ mod tests {
     fn unicode_to_keysym_rejects_surrogate_code_units() {
         assert_eq!(unicode_to_keysym(0xD83D), None);
         assert_eq!(unicode_to_keysym(0xDE00), None);
+    }
+
+    #[test]
+    fn android_arrow_cursor_keeps_hotspot_in_visual_coordinates() {
+        let cursor = LamcoInputHandler::create_android_arrow_cursor();
+
+        assert_eq!(cursor.width, 32);
+        assert_eq!(cursor.height, 32);
+        assert_eq!(cursor.hot_x, 4);
+        assert_eq!(cursor.hot_y, 4);
+        assert_eq!(cursor.data.len(), 32 * 32 * 4);
     }
 
     #[test]

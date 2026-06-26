@@ -1395,7 +1395,9 @@ impl LamcoDisplayHandler {
                             // LamcoGfxFactory::build_server_with_handle(); clearing them
                             // here races with fast EGFX capability negotiation (Android
                             // AVC_DISABLED) and prevents Planar init.
-                            info!("Pipeline state reset for new client connection (no-frame path, cache cleared)");
+                            info!(
+                                "Pipeline state reset for new client connection (no-frame path, cache cleared)"
+                            );
                         }
 
                         let needs_init = handler
@@ -2614,8 +2616,9 @@ impl LamcoDisplayHandler {
     /// The source asset is /usr/share/icons/Breeze_Light/cursors/left_ptr
     /// 32x32 XCursor image, converted from ARGB to RGBA. Android Microsoft RD
     /// Client displays this pointer bitmap vertically flipped in our RDP path,
-    /// so the embedded rows are stored vertically flipped and the hotspot is
-    /// adjusted from (4, 4) to (4, 27).
+    /// so the embedded rows are stored vertically flipped. The hotspot stays
+    /// in normal top-left cursor coordinates so PointerPosition tracks the
+    /// actual click/injection point instead of the flipped bitmap row.
     fn create_arrow_cursor() -> RGBAPointer {
         const W: u16 = 32;
         const H: u16 = 32;
@@ -2781,7 +2784,7 @@ impl LamcoDisplayHandler {
             width: W,
             height: H,
             hot_x: 4u16,
-            hot_y: 27u16,
+            hot_y: 4u16,
             data: DATA.to_vec(),
         }
     }
@@ -3123,5 +3126,16 @@ mod tests {
         assert_eq!(data.rectangle.right, 100);
         assert_eq!(data.rectangle.bottom, 100);
         assert_eq!(data.data.len(), 100 * 100 * 4);
+    }
+
+    #[test]
+    fn arrow_cursor_keeps_hotspot_in_visual_coordinates() {
+        let cursor = LamcoDisplayHandler::create_arrow_cursor();
+
+        assert_eq!(cursor.width, 32);
+        assert_eq!(cursor.height, 32);
+        assert_eq!(cursor.hot_x, 4);
+        assert_eq!(cursor.hot_y, 4);
+        assert_eq!(cursor.data.len(), 32 * 32 * 4);
     }
 }
