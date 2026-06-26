@@ -17,7 +17,10 @@ use std::sync::{
 };
 
 use ironrdp_egfx::{
-    pdu::{CapabilitiesAdvertisePdu, CapabilitiesV81Flags, CapabilitySet},
+    pdu::{
+        CapabilitiesAdvertisePdu, CapabilitiesV10Flags, CapabilitiesV81Flags,
+        CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitySet,
+    },
     server::{GraphicsPipelineHandler, QoeMetrics, Surface},
 };
 use tracing::{debug, info, trace, warn};
@@ -60,6 +63,9 @@ pub struct LamcoGraphicsHandler {
     /// Whether AVC444 was negotiated (V10+ with AVC420)
     avc444_enabled: AtomicBool,
 
+    /// Whether negotiated capabilities indicate the Android RD Client pointer quirk.
+    needs_android_pointer_updates: AtomicBool,
+
     /// Whether the channel is ready for frames (local fast access)
     ready: AtomicBool,
 
@@ -100,6 +106,7 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
+            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
@@ -116,6 +123,7 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
+            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
@@ -132,6 +140,7 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
+            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
@@ -170,6 +179,7 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
+            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
@@ -180,44 +190,52 @@ impl LamcoGraphicsHandler {
         }
     }
 
-    /// Synchronize current state to the shared HandlerState
+    /// Synchronize current state to the shared HandlerState.
     ///
-    /// Called internally after state changes. Uses try_write to avoid
-    /// blocking in callback contexts (sync callback with async state).
+    /// GraphicsPipelineHandler callbacks are synchronous but the shared state is
+    /// a tokio RwLock read frequently by the display pipeline. A one-shot
+    /// try_write() can lose the readiness transition under read contention,
+    /// leaving EGFX negotiated but permanently "not ready" until bitmap fallback
+    /// crashes Android clients. Retry briefly; readers hold the lock only for
+    /// short readiness checks.
     fn sync_shared_state(&self) {
         if let Some(ref shared) = self.shared_state {
-            // Note: We use try_write because callbacks are synchronous but
-            // SharedHandlerState uses tokio::sync::RwLock. This is safe because
-            // we initialize the state in the same thread before callbacks start.
-            match shared.try_write() {
-                Ok(mut guard) => {
-                    // Preserve existing channel_id if we had one.
-                    // NOTE: channel_id is stored in GraphicsPipelineServer (set by DvcProcessor::start),
-                    // and EgfxFrameSender queries it directly via server.channel_id() when sending frames.
-                    // We preserve it here for diagnostic purposes only - it's not used for frame sending.
-                    let existing_channel_id: u32 = guard
-                        .as_ref()
-                        .map_or(0, |s: &HandlerState| s.dvc_channel_id);
+            for attempt in 0..100 {
+                match shared.try_write() {
+                    Ok(mut guard) => {
+                        // Preserve existing channel_id if we had one.
+                        // NOTE: channel_id is stored in GraphicsPipelineServer (set by DvcProcessor::start),
+                        // and EgfxFrameSender queries it directly via server.channel_id() when sending frames.
+                        // We preserve it here for diagnostic purposes only - it's not used for frame sending.
+                        let existing_channel_id: u32 = guard
+                            .as_ref()
+                            .map_or(0, |s: &HandlerState| s.dvc_channel_id);
 
-                    let state = HandlerState {
-                        is_ready: self.ready.load(Ordering::Acquire),
-                        is_avc420_enabled: self.avc420_enabled.load(Ordering::Acquire),
-                        is_avc444_enabled: self.avc444_enabled.load(Ordering::Acquire),
-                        // Convert has_surface + surface_id to Option<u16>
-                        // Surface ID 0 is valid in EGFX, so we use Option instead of sentinel
-                        primary_surface_id: if self.has_surface.load(Ordering::Acquire) {
-                            Some(self.primary_surface_id.load(Ordering::Acquire))
-                        } else {
-                            None
-                        },
-                        dvc_channel_id: existing_channel_id,
-                    };
-                    *guard = Some(state);
-                }
-                _ => {
-                    warn!("Failed to sync EGFX handler state (lock contention)");
+                        let state = HandlerState {
+                            is_ready: self.ready.load(Ordering::Acquire),
+                            is_avc420_enabled: self.avc420_enabled.load(Ordering::Acquire),
+                            is_avc444_enabled: self.avc444_enabled.load(Ordering::Acquire),
+                            needs_android_pointer_updates: self
+                                .needs_android_pointer_updates
+                                .load(Ordering::Acquire),
+                            // Convert has_surface + surface_id to Option<u16>
+                            // Surface ID 0 is valid in EGFX, so we use Option instead of sentinel
+                            primary_surface_id: if self.has_surface.load(Ordering::Acquire) {
+                                Some(self.primary_surface_id.load(Ordering::Acquire))
+                            } else {
+                                None
+                            },
+                            dvc_channel_id: existing_channel_id,
+                        };
+                        *guard = Some(state);
+                        return;
+                    }
+                    Err(_) if attempt < 10 => std::thread::yield_now(),
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
                 }
             }
+
+            warn!("Failed to sync EGFX handler state after retries (lock contention)");
         }
     }
 
@@ -266,25 +284,69 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         // - V10+ with AVC420_ENABLED → AVC420 AND AVC444v2 (4:4:4 chroma via dual-stream)
         //
         // AVC444v2 provides superior text/UI rendering through full chroma resolution.
+        let needs_android_pointer_updates = match negotiated {
+            CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
+                flags.contains(CapabilitiesV10Flags::AVC_DISABLED)
+            }
+            CapabilitySet::V10_3 { flags } => flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+            CapabilitySet::V10_4 { flags }
+            | CapabilitySet::V10_5 { flags }
+            | CapabilitySet::V10_6 { flags }
+            | CapabilitySet::V10_6Err { flags } => {
+                flags.contains(CapabilitiesV104Flags::AVC_DISABLED)
+            }
+            CapabilitySet::V10_7 { flags } => flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+            _ => false,
+        };
+
         let (avc420, avc444) = match negotiated {
             CapabilitySet::V8_1 { flags, .. } => {
                 // V8.1: AVC420 only, no AVC444 support
                 let has_avc420 = flags.contains(CapabilitiesV81Flags::AVC420_ENABLED);
                 (has_avc420, false)
             }
-            // V10+ with AVC420 implies AVC444v2 support
-            CapabilitySet::V10 { .. }
-            | CapabilitySet::V10_1
-            | CapabilitySet::V10_2 { .. }
-            | CapabilitySet::V10_3 { .. }
-            | CapabilitySet::V10_4 { .. }
-            | CapabilitySet::V10_5 { .. }
-            | CapabilitySet::V10_6 { .. }
-            | CapabilitySet::V10_7 { .. } => {
-                // V10+: Both AVC420 and AVC444v2 are implied by client capability
-                (true, true)
+            // V10+: check AVC_DISABLED flag — client may explicitly disable AVC
+            CapabilitySet::V10 { flags } => {
+                if flags.contains(CapabilitiesV10Flags::AVC_DISABLED) {
+                    (false, false)
+                } else {
+                    (true, true)
+                }
             }
-            // V8 and earlier don't support AVC
+            CapabilitySet::V10_2 { flags } => {
+                if flags.contains(CapabilitiesV10Flags::AVC_DISABLED) {
+                    (false, false)
+                } else {
+                    (true, true)
+                }
+            }
+            CapabilitySet::V10_3 { flags } => {
+                if flags.contains(CapabilitiesV103Flags::AVC_DISABLED) {
+                    (false, false)
+                } else {
+                    (true, true)
+                }
+            }
+            CapabilitySet::V10_4 { flags }
+            | CapabilitySet::V10_5 { flags }
+            | CapabilitySet::V10_6 { flags }
+            | CapabilitySet::V10_6Err { flags } => {
+                if flags.contains(CapabilitiesV104Flags::AVC_DISABLED) {
+                    (false, false)
+                } else {
+                    (true, true)
+                }
+            }
+            CapabilitySet::V10_7 { flags } => {
+                if flags.contains(CapabilitiesV107Flags::AVC_DISABLED) {
+                    (false, false)
+                } else {
+                    (true, true)
+                }
+            }
+            // V10_1 has no flags field
+            CapabilitySet::V10_1 => (true, true),
+            // V8 and earlier / Unknown don't support AVC
             _ => (false, false),
         };
 
@@ -304,6 +366,8 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         self.avc420_enabled.store(avc420, Ordering::Release);
         self.avc444_enabled
             .store(effective_avc444, Ordering::Release);
+        self.needs_android_pointer_updates
+            .store(needs_android_pointer_updates, Ordering::Release);
         self.ready.store(true, Ordering::Release);
 
         // Sync to shared state for EgfxFrameSender visibility
@@ -381,6 +445,8 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         );
         self.ready.store(false, Ordering::Release);
         self.avc420_enabled.store(false, Ordering::Release);
+        self.needs_android_pointer_updates
+            .store(false, Ordering::Release);
         self.has_surface.store(false, Ordering::Release);
         // Sync to shared state - channel closed
         self.sync_shared_state();
@@ -392,11 +458,6 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
     }
 
     fn preferred_capabilities(&self) -> Vec<CapabilitySet> {
-        use ironrdp_egfx::pdu::{
-            CapabilitiesV10Flags, CapabilitiesV103Flags, CapabilitiesV104Flags,
-            CapabilitiesV107Flags,
-        };
-
         // Prefer highest V10.x version for best features (all V10+ support AVC420)
         // Fall back to V8.1 for older clients that explicitly enable AVC420
         vec![

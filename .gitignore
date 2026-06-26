@@ -62,3 +62,4 @@ packaging/repo/
 packaging/vendor/
 repo/
 .flatpak-builder/
+.clauge-worktrees/

@@ -104,6 +104,13 @@ pub struct HandlerState {
     pub is_avc420_enabled: bool,
     /// Whether AVC444 (H.264 YUV444) codec is supported
     pub is_avc444_enabled: bool,
+    /// Whether this client needs Android RD Client pointer workaround updates.
+    ///
+    /// Android clients that negotiate EGFX with AVC_DISABLED do not reliably draw
+    /// a visible local pointer unless the server sends explicit pointer PDUs.
+    /// Windows clients must not receive this workaround because the Android cursor
+    /// bitmap is vertically flipped for that client quirk.
+    pub needs_android_pointer_updates: bool,
     /// Primary surface ID for frame sending (None = no surface yet)
     /// Note: Surface ID 0 is valid in EGFX, so we use Option
     pub primary_surface_id: Option<u16>,
@@ -194,6 +201,22 @@ impl GfxServerFactory for LamcoGfxFactory {
     }
 
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        // This is called while IronRDP attaches channels for a new connection.
+        // Clear readiness here, before the new client's EGFX capability exchange;
+        // the handler below will repopulate it from on_ready(). Do not clear this
+        // later from the display pipeline, because that races with Android's fast
+        // AVC_DISABLED negotiation and leaves the pipeline stuck in bitmap fallback.
+        for attempt in 0..100 {
+            match self.handler_state.try_write() {
+                Ok(mut state) => {
+                    *state = None;
+                    break;
+                }
+                Err(_) if attempt < 10 => std::thread::yield_now(),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+
         // Handler updates handler_state when callbacks are invoked,
         // allowing EgfxFrameSender to check EGFX readiness
         let handler = LamcoGraphicsHandler::with_config(
@@ -211,9 +234,29 @@ impl GfxServerFactory for LamcoGfxFactory {
             self.compression_mode,
         )));
 
-        // try_write because this is called during sync channel setup
-        if let Ok(mut handle_guard) = self.server_handle.try_write() {
-            *handle_guard = Some(Arc::clone(&server));
+        // This callback is synchronous, while the display pipeline polls the
+        // same tokio RwLock from async code. A single try_write() can lose the
+        // new per-connection handle under read contention, leaving EGFX
+        // negotiated but permanently "not ready" until bitmap fallback crashes
+        // Android with 0xd06/0x200d. Retry briefly: readers hold the lock only
+        // for a very short readiness check.
+        let mut stored_handle = false;
+        for attempt in 0..100 {
+            if let Ok(mut handle_guard) = self.server_handle.try_write() {
+                *handle_guard = Some(Arc::clone(&server));
+                stored_handle = true;
+                break;
+            }
+
+            if attempt < 10 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        if !stored_handle {
+            tracing::error!("EGFX: failed to store GfxServerHandle after retries");
         }
 
         let bridge = GfxDvcBridge::new(Arc::clone(&server));
