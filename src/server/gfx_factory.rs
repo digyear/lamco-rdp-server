@@ -120,40 +120,19 @@ pub struct SharedHandlerState {
     /// Whether AVC420 (H.264 YUV420) codec is supported
     pub client_supports_avc420: std::sync::atomic::AtomicBool,
     /// Whether AVC444 (H.264 YUV444) codec is supported
-    pub is_avc444_enabled: std::sync::atomic::AtomicBool,
-    /// Whether a primary surface exists
-    pub has_surface: std::sync::atomic::AtomicBool,
-    /// Primary surface ID (valid only when has_surface is true)
-    pub primary_surface_id: std::sync::atomic::AtomicU16,
-    /// Set when the client sends a SECOND CapabilitiesAdvertise mid-session.
+    pub is_avc444_enabled: bool,
+    /// Whether this client needs Android RD Client pointer workaround updates.
     ///
-    /// mstsc emits a fresh CapsAdvertise (+ CacheImportOffer) when its EGFX
-    /// decoder loses sync — typically after a long P-slice chain under load
-    /// where one corrupt frame becomes unrecoverable. The expected server
-    /// response is a full re-init: DeleteSurface + ResetGraphics + CreateSurface
-    /// + MapSurfaceToOutput + fresh IDR. Without this, mstsc waits ~ms, then
-    /// closes the Graphics DVC channel and RSTs the TCP connection.
-    ///
-    /// When this flag is set, the display loop performs the full re-init
-    /// sequence and clears the flag.
-    pub needs_full_reinit: std::sync::atomic::AtomicBool,
-    /// Latest `total_frames_decoded` value from the client (MS-RDPEGFX 2.2.2.13).
-    ///
-    /// Updated on each FrameAcknowledge PDU. Used by display_handler to compute
-    /// a "frame delay" = encoded_frames_total - total_frames_decoded, which is
-    /// the most direct measure of how far behind the client decoder is.
-    /// Reference: GNOME RD `GrdRdpGfxFrameController`.
-    pub last_total_frames_decoded: std::sync::atomic::AtomicU32,
-    /// Latest queue_depth reported by client (FrameAcknowledge.queueDepth).
-    /// 0xFFFFFFFF means SUSPEND_FRAME_ACK per MS-RDPEGFX 2.2.4.3.
-    pub last_client_queue_depth: std::sync::atomic::AtomicU32,
-    /// Closed-loop EGFX flow controller (GrdRdpGfxFrameController equivalent).
-    /// Both `LamcoGraphicsHandler::on_frame_ack_full` (FreeRDP callback thread)
-    /// and the display loop (async runtime) touch it via this Mutex. Critical
-    /// sections are short (a few atomic counter increments) so contention is
-    /// minimal. The display loop checks `should_throttle()` before encoding;
-    /// the handler calls `ack_frame()` on each inbound FrameAcknowledge.
-    pub flow_controller: std::sync::Mutex<crate::egfx::flow_controller::FlowController>,
+    /// Android clients that negotiate EGFX with AVC_DISABLED do not reliably draw
+    /// a visible local pointer unless the server sends explicit pointer PDUs.
+    /// Windows clients must not receive this workaround because the Android cursor
+    /// bitmap is vertically flipped for that client quirk.
+    pub needs_android_pointer_updates: bool,
+    /// Primary surface ID for frame sending (None = no surface yet)
+    /// Note: Surface ID 0 is valid in EGFX, so we use Option
+    pub primary_surface_id: Option<u16>,
+    /// DVC channel ID assigned to EGFX (needed for encode_dvc_messages)
+    pub dvc_channel_id: u32,
 }
 
 impl SharedHandlerState {
@@ -319,17 +298,21 @@ impl GfxServerFactory for LamcoGfxFactory {
     }
 
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
-        // A new client connection invalidates all previous EGFX negotiation
-        // state (codec capabilities, surface IDs, readiness). This factory and
-        // its `handler_state` outlive individual connections (they sit on the
-        // long-lived `RdpServer`), so without an explicit reset the reused
-        // shared state still reads `is_ready`/`has_surface` from the *previous*
-        // client. The send loop would then skip the new caps exchange and emit
-        // P-slices referencing the old client's decoder state — mstsc closes the
-        // Graphics DVC and RSTs. Resetting here pauses the send loop until the
-        // new client completes capability exchange. The QEMU factory already
-        // does this at its own connection boundary; the desktop path must match.
-        self.handler_state.reset();
+        // This is called while IronRDP attaches channels for a new connection.
+        // Clear readiness here, before the new client's EGFX capability exchange;
+        // the handler below will repopulate it from on_ready(). Do not clear this
+        // later from the display pipeline, because that races with Android's fast
+        // AVC_DISABLED negotiation and leaves the pipeline stuck in bitmap fallback.
+        for attempt in 0..100 {
+            match self.handler_state.try_write() {
+                Ok(mut state) => {
+                    *state = None;
+                    break;
+                }
+                Err(_) if attempt < 10 => std::thread::yield_now(),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
 
         // Handler updates handler_state when callbacks are invoked,
         // allowing EgfxFrameSender to check EGFX readiness
@@ -357,20 +340,29 @@ impl GfxServerFactory for LamcoGfxFactory {
             self.compression_mode,
         )));
 
-        // Retry try_write in a spin loop. The pipeline may hold a brief read lock
-        // on the shared handle (is_egfx_ready check). A single try_write failure
-        // leaves the handle as None, breaking EGFX on reconnection.
+        // This callback is synchronous, while the display pipeline polls the
+        // same tokio RwLock from async code. A single try_write() can lose the
+        // new per-connection handle under read contention, leaving EGFX
+        // negotiated but permanently "not ready" until bitmap fallback crashes
+        // Android with 0xd06/0x200d. Retry briefly: readers hold the lock only
+        // for a very short readiness check.
+        let mut stored_handle = false;
         for attempt in 0..100 {
             if let Ok(mut handle_guard) = self.server_handle.try_write() {
                 *handle_guard = Some(Arc::clone(&server));
+                stored_handle = true;
                 break;
             }
-            if attempt == 99 {
-                tracing::error!(
-                    "Failed to acquire gfx_server_handle write lock after 100 attempts"
-                );
+
+            if attempt < 10 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        if !stored_handle {
+            tracing::error!("EGFX: failed to store GfxServerHandle after retries");
         }
 
         let bridge = GfxDvcBridge::new(Arc::clone(&server));
