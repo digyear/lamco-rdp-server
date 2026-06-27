@@ -2619,7 +2619,7 @@ impl LamcoDisplayHandler {
     /// so the embedded rows are stored vertically flipped. The hotspot stays
     /// in normal top-left cursor coordinates so PointerPosition tracks the
     /// actual click/injection point instead of the flipped bitmap row.
-    fn create_arrow_cursor() -> RGBAPointer {
+    pub(crate) fn create_arrow_cursor() -> RGBAPointer {
         const W: u16 = 32;
         const H: u16 = 32;
         const DATA: [u8; 4096] = [
@@ -2798,24 +2798,18 @@ impl RdpServerDisplay for LamcoDisplayHandler {
     }
 
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
-        let mut size = self.size.write().await;
-        if client_size.width > 0
-            && client_size.height > 0
-            && (client_size.width < size.width || client_size.height < size.height)
-        {
-            info!(
-                "Accepting client initial desktop size: {}x{} (was {}x{})",
-                client_size.width, client_size.height, size.width, size.height
-            );
-            *size = client_size;
-            *self.bitmap_converter.lock().await =
-                BitmapConverter::new(client_size.width, client_size.height);
-        } else {
-            debug!(
-                "Keeping server initial desktop size: {}x{} (client requested {}x{})",
-                size.width, size.height, client_size.width, client_size.height
-            );
-        }
+        let size = self.size.read().await;
+
+        // Windows mstsc commonly proposes the local window/client size here
+        // (for example 1366×768). Accepting that before EGFX setup makes the
+        // remote desktop visibly shrink immediately after connection and also
+        // exercises non-16-aligned AVC surface/desktop geometry. Keep the
+        // compositor/portal-selected size for the initial session; true dynamic
+        // resize requests still go through DisplayControl::request_layout().
+        info!(
+            "Keeping server initial desktop size: {}x{} (client requested {}x{})",
+            size.width, size.height, client_size.width, client_size.height
+        );
         *size
     }
 

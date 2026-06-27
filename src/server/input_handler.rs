@@ -143,6 +143,7 @@ use crate::clipboard::provider::ClipboardProvider;
 use crate::input::{
     CoordinateTransformer, InputError, KeyboardHandler, MonitorInfo, MouseButton, MouseHandler,
 };
+use crate::server::display_handler::LamcoDisplayHandler;
 use crate::server::gfx_factory::HandlerState;
 
 /// Map a Unicode code point to an evdev keycode and whether Shift is needed.
@@ -920,41 +921,7 @@ impl LamcoInputHandler {
     }
 
     fn create_android_arrow_cursor() -> RGBAPointer {
-        const W: u16 = 32;
-        const H: u16 = 32;
-        const HOT_X: u16 = 4;
-        const HOT_Y: u16 = 4;
-        let mut data = vec![0u8; usize::from(W) * usize::from(H) * 4];
-
-        // Draw a simple Breeze-like left pointer, stored vertically flipped for
-        // Microsoft RD Client on Android. The hotspot remains in normal
-        // top-left cursor coordinates; otherwise the client places the pointer
-        // bitmap about one cursor height above the actual injected position.
-        for y in 0..24u16 {
-            for x in 0..=y.min(14) {
-                let border = x == 0 || x == y.min(14) || y == 23;
-                let src_y = H - 1 - y;
-                let idx = (usize::from(src_y) * usize::from(W) + usize::from(x)) * 4;
-                let (r, g, b, a) = if border {
-                    (0, 0, 0, 255)
-                } else {
-                    (255, 255, 255, 255)
-                };
-                data[idx] = r;
-                data[idx + 1] = g;
-                data[idx + 2] = b;
-                data[idx + 3] = a;
-            }
-        }
-
-        RGBAPointer {
-            cache_index: 0,
-            width: W,
-            height: H,
-            hot_x: HOT_X,
-            hot_y: HOT_Y,
-            data,
-        }
+        LamcoDisplayHandler::create_arrow_cursor()
     }
 
     async fn needs_android_pointer_updates(

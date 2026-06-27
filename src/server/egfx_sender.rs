@@ -739,15 +739,16 @@ impl EgfxFrameSender {
 
         let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
 
-        // CRITICAL: When damage_regions is empty (full frame update), use encoded
-        // dimensions for the region. Windows mstsc requires the AVC region to match
-        // the encoded frame dimensions (16-pixel aligned), not the display dimensions.
-        // The H.264 bitstream contains encoded_width×encoded_height macroblocks; the
-        // region must cover the entire encoded frame or mstsc will reject/black-screen.
+        // CRITICAL: Full-frame AVC updates must use the encoded dimensions.
+        // Windows mstsc expects the AVC420 region to cover the entire H.264
+        // bitstream/surface. For non-16-aligned desktop sizes the bitstream is
+        // padded (e.g. 1584×756 -> 1584×768); sending a visible-size region for
+        // an IDR/full-frame update leaves the bottom macroblocks outside the
+        // region and mstsc black-screens/rejects the frame.
         //
-        // For damage regions (partial updates), we still use display_width/height
-        // because damage detection operates on the visible display area.
-        let regions = if damage_regions.is_empty() {
+        // The caller represents forced full frames as a single full-display
+        // DamageRegion, not as an empty slice, so check both forms here.
+        let regions = if is_full_frame_update(damage_regions, display_width, display_height) {
             vec![Avc420Region::full_frame(encoded_width, encoded_height, 22)]
         } else {
             damage_regions_to_avc420(damage_regions, display_width, display_height)
@@ -843,10 +844,10 @@ impl EgfxFrameSender {
 
         let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
 
-        // Same fix as send_frame_with_regions: full-frame regions must use encoded
-        // (16-aligned) dimensions so Windows mstsc sees a region that covers the
-        // entire H.264 bitstream. Partial damage regions stay at display size.
-        let regions = if damage_regions.is_empty() {
+        // Same full-frame rule as send_frame_with_regions: a forced full-display
+        // update must cover the 16-aligned encoded bitstream, not just the
+        // visible desktop rectangle.
+        let regions = if is_full_frame_update(damage_regions, display_width, display_height) {
             vec![Avc420Region::full_frame(encoded_width, encoded_height, 22)]
         } else {
             damage_regions_to_avc420(damage_regions, display_width, display_height)
@@ -901,6 +902,22 @@ impl EgfxFrameSender {
 
         Ok(frame_id)
     }
+}
+
+fn is_full_frame_update(
+    regions: &[DamageRegion],
+    display_width: u16,
+    display_height: u16,
+) -> bool {
+    if regions.is_empty() {
+        return true;
+    }
+
+    regions.len() == 1
+        && regions[0].x == 0
+        && regions[0].y == 0
+        && regions[0].width >= u32::from(display_width)
+        && regions[0].height >= u32::from(display_height)
 }
 
 /// Convert DamageRegion list to Avc420Region list
@@ -959,5 +976,38 @@ mod tests {
             SendError::Backpressure.to_string(),
             "Frame dropped due to backpressure"
         );
+    }
+
+    #[test]
+    fn full_display_damage_region_is_full_frame_update() {
+        assert!(is_full_frame_update(&[], 1584, 756));
+        assert!(is_full_frame_update(
+            &[DamageRegion::full_frame(1584, 756)],
+            1584,
+            756
+        ));
+        assert!(is_full_frame_update(
+            &[DamageRegion::new(0, 0, 1584, 768)],
+            1584,
+            756
+        ));
+        assert!(!is_full_frame_update(
+            &[DamageRegion::new(0, 0, 1584, 755)],
+            1584,
+            756
+        ));
+        assert!(!is_full_frame_update(
+            &[DamageRegion::new(10, 0, 1574, 756)],
+            1584,
+            756
+        ));
+        assert!(!is_full_frame_update(
+            &[
+                DamageRegion::new(0, 0, 792, 756),
+                DamageRegion::new(792, 0, 792, 756),
+            ],
+            1584,
+            756
+        ));
     }
 }
