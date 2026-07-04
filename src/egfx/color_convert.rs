@@ -789,80 +789,83 @@ unsafe fn subsample_chroma_420_avx2(chroma_444: &[u8], width: usize, height: usi
 ///
 /// Processes 8 output pixels (16 input pixels per row) at a time.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 unsafe fn subsample_chroma_420_neon(chroma_444: &[u8], width: usize, height: usize) -> Vec<u8> {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*;
 
-    let out_width = width / 2;
-    let out_height = height / 2;
-    let mut chroma_420 = vec![0u8; out_width * out_height];
+        let out_width = width / 2;
+        let out_height = height / 2;
+        let mut chroma_420 = vec![0u8; out_width * out_height];
 
-    // Process 8 output pixels at a time (16 input pixels per row)
-    let simd_width = out_width / 8;
+        // Process 8 output pixels at a time (16 input pixels per row)
+        let simd_width = out_width / 8;
 
-    for out_y in 0..out_height {
-        let in_y = out_y * 2;
-        let row0 = in_y * width;
-        let row1 = (in_y + 1) * width;
-        let out_row = out_y * out_width;
+        for out_y in 0..out_height {
+            let in_y = out_y * 2;
+            let row0 = in_y * width;
+            let row1 = (in_y + 1) * width;
+            let out_row = out_y * out_width;
 
-        for chunk in 0..simd_width {
-            let in_x = chunk * 16; // 16 input pixels -> 8 output pixels
-            let out_x = chunk * 8;
+            for chunk in 0..simd_width {
+                let in_x = chunk * 16; // 16 input pixels -> 8 output pixels
+                let out_x = chunk * 8;
 
-            // Load 16 pixels from row 0
-            let r0 = vld1q_u8(chroma_444.as_ptr().add(row0 + in_x));
+                // Load 16 pixels from row 0
+                let r0 = vld1q_u8(chroma_444.as_ptr().add(row0 + in_x));
 
-            // Load 16 pixels from row 1
-            let r1 = vld1q_u8(chroma_444.as_ptr().add(row1 + in_x));
+                // Load 16 pixels from row 1
+                let r1 = vld1q_u8(chroma_444.as_ptr().add(row1 + in_x));
 
-            // Vertical sum (expand to 16-bit to prevent overflow)
-            // Low 8 pixels
-            let r0_lo = vmovl_u8(vget_low_u8(r0));
-            let r1_lo = vmovl_u8(vget_low_u8(r1));
-            let v_lo = vaddq_u16(r0_lo, r1_lo);
+                // Vertical sum (expand to 16-bit to prevent overflow)
+                // Low 8 pixels
+                let r0_lo = vmovl_u8(vget_low_u8(r0));
+                let r1_lo = vmovl_u8(vget_low_u8(r1));
+                let v_lo = vaddq_u16(r0_lo, r1_lo);
 
-            // High 8 pixels
-            let r0_hi = vmovl_u8(vget_high_u8(r0));
-            let r1_hi = vmovl_u8(vget_high_u8(r1));
-            let v_hi = vaddq_u16(r0_hi, r1_hi);
+                // High 8 pixels
+                let r0_hi = vmovl_u8(vget_high_u8(r0));
+                let r1_hi = vmovl_u8(vget_high_u8(r1));
+                let v_hi = vaddq_u16(r0_hi, r1_hi);
 
-            // Horizontal pair sum using pairwise add
-            // vpaddq_u16 adds adjacent pairs: [a0+a1, a2+a3, a4+a5, a6+a7, b0+b1, ...]
-            let h_sum = vpaddq_u16(v_lo, v_hi);
+                // Horizontal pair sum using pairwise add
+                // vpaddq_u16 adds adjacent pairs: [a0+a1, a2+a3, a4+a5, a6+a7, b0+b1, ...]
+                let h_sum = vpaddq_u16(v_lo, v_hi);
 
-            // Add rounding constant (2) and divide by 4
-            let rounding = vdupq_n_u16(2);
-            let sum = vaddq_u16(h_sum, rounding);
-            let avg = vshrq_n_u16(sum, 2);
+                // Add rounding constant (2) and divide by 4
+                let rounding = vdupq_n_u16(2);
+                let sum = vaddq_u16(h_sum, rounding);
+                let avg = vshrq_n_u16(sum, 2);
 
-            // Pack back to 8-bit
-            let result = vmovn_u16(avg);
+                // Pack back to 8-bit
+                let result = vmovn_u16(avg);
 
-            // Store 8 output pixels
-            vst1_u8(chroma_420.as_mut_ptr().add(out_row + out_x), result);
+                // Store 8 output pixels
+                vst1_u8(chroma_420.as_mut_ptr().add(out_row + out_x), result);
+            }
+
+            // Handle remaining pixels with scalar code
+            let remaining_start = simd_width * 8;
+            for out_x in remaining_start..out_width {
+                let in_x = out_x * 2;
+                let idx00 = row0 + in_x;
+                let idx01 = row0 + in_x + 1;
+                let idx10 = row1 + in_x;
+                let idx11 = row1 + in_x + 1;
+
+                let avg = (chroma_444[idx00] as u32
+                    + chroma_444[idx01] as u32
+                    + chroma_444[idx10] as u32
+                    + chroma_444[idx11] as u32
+                    + 2)
+                    / 4;
+
+                chroma_420[out_row + out_x] = avg as u8;
+            }
         }
 
-        // Handle remaining pixels with scalar code
-        let remaining_start = simd_width * 8;
-        for out_x in remaining_start..out_width {
-            let in_x = out_x * 2;
-            let idx00 = row0 + in_x;
-            let idx01 = row0 + in_x + 1;
-            let idx10 = row1 + in_x;
-            let idx11 = row1 + in_x + 1;
-
-            let avg = (chroma_444[idx00] as u32
-                + chroma_444[idx01] as u32
-                + chroma_444[idx10] as u32
-                + chroma_444[idx11] as u32
-                + 2)
-                / 4;
-
-            chroma_420[out_row + out_x] = avg as u8;
-        }
+        chroma_420
     }
-
-    chroma_420
 }
 
 #[cfg(test)]

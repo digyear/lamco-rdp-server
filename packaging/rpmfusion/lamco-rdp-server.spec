@@ -507,7 +507,6 @@ Provides:       bundled(crate(miniz_oxide)) = 0.8.9
 Provides:       bundled(crate(mio)) = 1.1.1
 Provides:       bundled(crate(mockall)) = 0.12.1
 Provides:       bundled(crate(mockall_derive)) = 0.12.1
-Provides:       bundled(crate(moka)) = 0.12.13
 Provides:       bundled(crate(moxcms)) = 0.7.11
 Provides:       bundled(crate(mundy)) = 0.2.2
 Provides:       bundled(crate(mutate_once)) = 0.1.2

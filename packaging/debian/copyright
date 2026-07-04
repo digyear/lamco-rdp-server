@@ -23,10 +23,6 @@ Files: vendor/aws-lc-sys/*
 Copyright: AWS-LC
 License: (Apache-2.0 OR ISC) AND ISC AND OpenSSL
 
-Files: vendor/moka/*
-Copyright: Tatsuya Kawano
-License: (Apache-2.0 OR MIT) AND Apache-2.0
-
 Files: vendor/libfuzzer-sys/*
 Copyright: The rust-fuzz Project Developers
 License: (Apache-2.0 OR MIT) AND NCSA
