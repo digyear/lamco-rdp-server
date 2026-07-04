@@ -8,6 +8,9 @@ This directory contains packaging resources for various distribution methods.
 packaging/
 ├── aur/                           # Arch User Repository
 │   └── PKGBUILD                           # AUR package build script
+├── obs/                           # openSUSE Build Service (OBS)
+│   ├── lamco-rdp-server.spec              # OBS-specific RPM spec
+│   └── obs-initial-setup.sh               # Initial home project setup script
 ├── dbus/                          # D-Bus service files
 │   ├── io.lamco.RdpServer.service         # Session bus activation (native)
 │   ├── io.lamco.RdpServer.service.flatpak # Session bus activation (Flatpak)

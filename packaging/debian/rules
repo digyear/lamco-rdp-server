@@ -11,9 +11,10 @@ override_dh_auto_build:
 	done
 	CARGO_PROFILE_RELEASE_LTO=thin \
 	CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4 \
-	cargo build --release --frozen --features "default,vaapi,gui"
+	cargo build --release --frozen --features "default,vaapi,gui,vsock,websocket"
 
 override_dh_auto_install:
+	# --- lamco-rdp-server binary package (Wayland desktop sharing) ---
 	install -Dm755 target/release/lamco-rdp-server debian/lamco-rdp-server/usr/bin/lamco-rdp-server
 	install -Dm755 target/release/lamco-rdp-server-gui debian/lamco-rdp-server/usr/bin/lamco-rdp-server-gui
 	install -Dm644 packaging/systemd/lamco-rdp-server.service debian/lamco-rdp-server/usr/lib/systemd/user/lamco-rdp-server.service

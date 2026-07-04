@@ -12,7 +12,7 @@ use tracing::{debug, info};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use super::{
-    clipboard::MutterClipboardManager,
+    clipboard::MutterClipboard,
     remote_desktop::{MutterRemoteDesktop, MutterRemoteDesktopSession},
     screencast::{MutterScreenCast, MutterScreenCastSession, MutterScreenCastStream},
 };
@@ -45,21 +45,18 @@ pub struct MutterSessionHandle {
     /// Connection (kept alive for session, crate-internal for input injection)
     pub(crate) connection: zbus::Connection,
     /// Mutter clipboard manager (available when clipboard is enabled)
-    pub clipboard: Option<Arc<MutterClipboardManager>>,
-    /// EIS socket FD (available on GNOME 46+)
-    #[cfg(feature = "libei")]
-    pub eis_fd: Option<std::os::fd::OwnedFd>,
+    pub clipboard: Option<Arc<MutterClipboard>>,
 }
 
 /// Mutter Session Manager
 ///
 /// Manages Mutter ScreenCast and RemoteDesktop sessions without portal dialogs.
 /// This is GNOME-specific and requires non-sandboxed D-Bus access.
-pub struct MutterSessionManager {
+pub struct MutterSession {
     connection: zbus::Connection,
 }
 
-impl MutterSessionManager {
+impl MutterSession {
     /// Create a new Mutter session manager
     ///
     /// # Returns
@@ -245,7 +242,7 @@ impl MutterSessionManager {
 
         // Step 5: Try to enable clipboard
         let clipboard = {
-            let mgr = MutterClipboardManager::new(self.connection.clone(), rd_session_path.clone());
+            let mgr = MutterClipboard::new(self.connection.clone(), rd_session_path.clone());
             match mgr.enable().await {
                 Ok(()) => {
                     info!("Mutter clipboard enabled");
@@ -258,21 +255,9 @@ impl MutterSessionManager {
             }
         };
 
-        // Step 6: Try to get EIS FD (GNOME 46+)
-        #[cfg(feature = "libei")]
-        let eis_fd = {
-            let options = HashMap::new();
-            match rd_session_proxy.connect_to_eis(options).await {
-                Ok(fd) => {
-                    info!("Connected to EIS for low-latency input");
-                    Some(fd)
-                }
-                Err(e) => {
-                    info!("EIS not available, using D-Bus input: {}", e);
-                    None
-                }
-            }
-        };
+        // EIS input is established lazily by the Mutter Direct strategy on the
+        // first client connection (and reconnected on socket death). Opening it
+        // here, before any client, let the compositor's idle timeout close it.
 
         let handle = MutterSessionHandle {
             screencast_session: screencast_session_path,
@@ -281,8 +266,6 @@ impl MutterSessionManager {
             stream_info: vec![stream_info],
             connection: self.connection.clone(),
             clipboard,
-            #[cfg(feature = "libei")]
-            eis_fd,
         };
 
         info!("Mutter session created successfully (NO DIALOG REQUIRED)");
@@ -346,7 +329,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires GNOME with Mutter running"]
     async fn test_mutter_session_creation() {
-        match MutterSessionManager::new().await {
+        match MutterSession::new().await {
             Ok(_manager) => {
                 println!("Mutter session manager created");
 
@@ -362,9 +345,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires GNOME with actual monitor"]
     async fn test_mutter_monitor_capture() {
-        let _manager = MutterSessionManager::new()
-            .await
-            .expect("Mutter not available");
+        let _manager = MutterSession::new().await.expect("Mutter not available");
 
         // This would require knowing actual monitor connectors
         // Skipped in automated tests

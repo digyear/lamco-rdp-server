@@ -24,7 +24,7 @@ pub fn view_server_tab(state: &AppState) -> Element<'_, Message> {
                 Message::ServerListenAddrChanged,
                 Message::ServerPortChanged,
             ),
-            "IP address and port for RDP server",
+            "IP and port. Default [::] is dual-stack (IPv6 + IPv4); use 0.0.0.0 for IPv4-only.",
         ),
         space().height(16.0),
         // Maximum Connections

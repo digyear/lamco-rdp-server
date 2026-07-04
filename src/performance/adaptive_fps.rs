@@ -29,6 +29,35 @@
 //! Uses a rolling window of recent damage ratios to calculate
 //! average activity. This smooths out sudden spikes and provides
 //! stable FPS transitions.
+//!
+//! # Calibration is sensitive to the damage-region source
+//!
+//! `damage_ratio` in [`AdaptiveFpsController::update`] can come from either a
+//! compositor-supplied damage hint (trusted directly, zero extra CPU cost —
+//! see `display_handler.rs`'s damage-source selection) or lamco's own SIMD
+//! pixel-diff fallback. The thresholds above were tuned against whichever
+//! source was dominant at the time; they are **not** guaranteed to mean the
+//! same thing across different compositor damage protocols.
+//!
+//! Confirmed case (2026-07, archie/Hyprland leg 6 of the v1.4.4 test
+//! campaign): an OS upgrade flipped the third-party
+//! `xdg-desktop-portal-generic` crate's protocol preference from
+//! `wlr-screencopy` to `ext-image-copy-capture-v1` (both compositor and
+//! portal now advertise the newer protocol). The newer protocol reports
+//! damage more precisely/conservatively for the same visual change, which
+//! measurably shifted the SAME workload from `activity=High` (30fps) to
+//! `activity=Medium` (~21fps) — a ~2.2x real-world throughput drop with
+//! nothing wrong in capture, encode, or this controller's logic. Raw capture
+//! cadence was unaffected or slightly improved; only the *measured* damage
+//! ratio changed.
+//!
+//! `display_handler.rs` now logs `damage_source` alongside the periodic
+//! activity/fps debug line, plus an occasional (every 60 frames)
+//! compositor-hint-vs-pixel-diff cross-check when compositor hints are in
+//! use, specifically so this class of drift is diagnosable from a trace log
+//! without a full forensic pass. If recalibration is ever undertaken, prefer
+//! thresholds relative to a rolling per-source baseline over the current
+//! fixed absolute percentages, which is what actually broke here.
 
 use std::{
     collections::VecDeque,

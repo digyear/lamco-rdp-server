@@ -88,6 +88,11 @@ pub enum HardwareEncoderError {
     #[cfg(feature = "nvenc")]
     #[error("NVENC error: {0}")]
     Nvenc(#[from] NvencError),
+
+    /// Vulkan Video specific error
+    #[cfg(feature = "vulkan-video")]
+    #[error("Vulkan Video error: {0}")]
+    VulkanVideo(#[from] VulkanVideoError),
 }
 
 impl HardwareEncoderError {
@@ -232,6 +237,39 @@ pub enum NvencError {
     /// Encoder resources exhausted
     #[error("Encoder resources exhausted")]
     ResourcesExhausted,
+}
+
+// =============================================================================
+// Vulkan Video Specific Errors
+// =============================================================================
+
+/// Vulkan Video backend specific errors
+#[cfg(feature = "vulkan-video")]
+#[derive(Debug, Error)]
+pub enum VulkanVideoError {
+    /// No Vulkan Video capable device found
+    #[error("No Vulkan Video capable device found")]
+    NoDevice,
+
+    /// VK_KHR_video_encode_h264 not supported by any adapter
+    #[error("VK_KHR_video_encode_h264 not supported")]
+    H264EncodeNotSupported,
+
+    /// Vulkan instance creation failed
+    #[error("Vulkan instance creation failed: {0}")]
+    InstanceFailed(String),
+
+    /// Encoder creation failed
+    #[error("Encoder creation failed: {0}")]
+    EncoderFailed(String),
+
+    /// Encode operation failed
+    #[error("Encode operation failed: {0}")]
+    EncodeFailed(String),
+
+    /// BGRA to NV12 color conversion failed
+    #[error("Color conversion failed: {0}")]
+    ColorConversionFailed(String),
 }
 
 /// Result type for hardware encoder operations

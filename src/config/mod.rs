@@ -18,7 +18,7 @@ use ashpd::desktop::{
 };
 use enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Check if running inside a Flatpak sandbox
 pub fn is_flatpak() -> bool {
@@ -28,27 +28,47 @@ pub fn is_flatpak() -> bool {
         || std::path::Path::new("/.flatpak-info").exists()
 }
 
+/// Check if running inside a Snap sandbox.
+pub fn is_snap() -> bool {
+    // Confined snaps export SNAP (the mount point) and SNAP_NAME; requiring
+    // both avoids matching an unrelated `SNAP` var in a non-snap environment.
+    std::env::var("SNAP").is_ok() && std::env::var("SNAP_NAME").is_ok()
+}
+
+/// Check if running inside any supported application sandbox.
+pub fn is_sandboxed() -> bool {
+    is_flatpak() || is_snap()
+}
+
 pub fn get_cert_config_dir() -> PathBuf {
-    if is_flatpak() {
-        // Flatpak: use XDG paths which are mapped to ~/.var/app/<app-id>/
+    // Sandboxes remap XDG paths inside the confinement (Flatpak
+    // ~/.var/app/<id>, Snap ~/snap/<name>/current) and the host /etc is not
+    // reachable/writable — always stay inside the mapped config dir.
+    if is_sandboxed() {
         if let Some(config_dir) = dirs::config_dir() {
-            return config_dir;
+            // Flatpak's config dir is already app-scoped; Snap's is shared
+            // across the snap, so give the app its own subdirectory there.
+            return if is_flatpak() {
+                config_dir
+            } else {
+                config_dir.join("lamco-rdp-server")
+            };
         }
-        // Fallback for Flatpak (shouldn't happen but be safe)
-        PathBuf::from("/app/config")
+        // Should not happen inside a sandbox, but stay contained if it does.
+        return PathBuf::from("/app/config");
+    }
+
+    // Native: prefer user config if not root, otherwise /etc/.
+    let uid = unsafe { libc::getuid() };
+    if uid == 0 {
+        // Running as root - use system directory
+        PathBuf::from("/etc/lamco-rdp-server")
     } else {
-        // Native: prefer user config if not root, otherwise /etc/
-        let uid = unsafe { libc::getuid() };
-        if uid == 0 {
-            // Running as root - use system directory
-            PathBuf::from("/etc/lamco-rdp-server")
-        } else {
-            // Running as user - use XDG config
-            dirs::config_dir().map_or_else(
-                || PathBuf::from("/etc/lamco-rdp-server"),
-                |d| d.join("lamco-rdp-server"),
-            )
-        }
+        // Running as user - use XDG config
+        dirs::config_dir().map_or_else(
+            || PathBuf::from("/etc/lamco-rdp-server"),
+            |d| d.join("lamco-rdp-server"),
+        )
     }
 }
 
@@ -91,7 +111,8 @@ use types::{
     PerformanceConfig, SecurityConfig, ServerConfig, VideoConfig, VideoPipelineConfig,
 };
 pub use types::{
-    AudioConfig, CursorConfig, CursorPredictorConfig, GuiStateConfig, HardwareEncodingConfig,
+    AudioConfig, CursorConfig, CursorPredictorConfig, DiagnosticsConfig, GuiStateConfig,
+    HardwareEncodingConfig, MonitoringConfig,
 };
 
 /// Current config file version. Bumped when breaking changes require migration.
@@ -161,10 +182,17 @@ pub struct Config {
     /// Notification configuration (Flatpak portal notifications)
     #[serde(default)]
     pub notifications: NotificationConfig,
+    /// Monitoring and metrics exposure configuration
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
     /// GUI state configuration (persisted between sessions)
     /// Optional - not required for server operation
     #[serde(default)]
     pub gui_state: GuiStateConfig,
+    /// Encoder diagnostics — H.264 stream dump file and decoder self-test.
+    /// Off by default; opt-in when investigating encoder/decoder correctness.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
 }
 
 fn default_config_version() -> u32 {
@@ -254,6 +282,70 @@ impl Config {
         Ok(config)
     }
 
+    /// Ensure a usable TLS certificate + key exist, self-generating a signed
+    /// pair when they are missing.
+    ///
+    /// Tries the configured paths first, then the sandbox-aware config dir,
+    /// adopting whichever location works. A fresh headless install can then
+    /// come up without a manual cert step, and it keeps working inside
+    /// Flatpak/Snap sandboxes where the configured (often `/etc`) path is not
+    /// writable and inside which the GUI's cert generator never runs.
+    pub fn ensure_tls_material(&mut self) -> Result<()> {
+        use crate::security::certificates::CertificateGenerator;
+
+        if self.security.cert_path.exists() && self.security.key_path.exists() {
+            return Ok(());
+        }
+
+        // Preference order: the configured location, then the sandbox-aware
+        // config dir. Each is attempted independently so an unwritable first
+        // choice (e.g. `/etc` as a normal user) falls through to the next.
+        let fallback = get_cert_config_dir();
+        let candidates = [
+            (
+                self.security.cert_path.clone(),
+                self.security.key_path.clone(),
+            ),
+            (fallback.join("cert.pem"), fallback.join("key.pem")),
+        ];
+
+        let cn = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "lamco-rdp-server".to_string());
+
+        let mut last_err = None;
+        for (cert_path, key_path) in candidates {
+            // Adopt an already-complete pair rather than overwriting it.
+            if cert_path.exists() && key_path.exists() {
+                self.security.cert_path = cert_path;
+                self.security.key_path = key_path;
+                return Ok(());
+            }
+            match CertificateGenerator::generate_and_save(&cn, 365, &cert_path, &key_path) {
+                Ok(()) => {
+                    info!(
+                        "Generated self-signed TLS certificate at {}",
+                        cert_path.display()
+                    );
+                    self.security.cert_path = cert_path;
+                    self.security.key_path = key_path;
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not create TLS certificate at {}: {e:#}; trying next location",
+                        cert_path.display()
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("no writable TLS certificate location available")))
+    }
+
     /// Apply any necessary migrations for older config versions.
     fn migrate(&mut self) {
         // v0 (implicit): enable_nla field used instead of security_mode
@@ -309,18 +401,9 @@ impl Config {
             .parse::<SocketAddr>()
             .context("Invalid listen address")?;
 
-        if !self.security.cert_path.exists() {
-            anyhow::bail!(
-                "Certificate not found: {}",
-                self.security.cert_path.display()
-            );
-        }
-        if !self.security.key_path.exists() {
-            anyhow::bail!(
-                "Private key not found: {}",
-                self.security.key_path.display()
-            );
-        }
+        // Certificate material is ensured (and self-generated if missing) by
+        // `ensure_tls_material`, called from startup after logging is up — so
+        // validation no longer fails here on a not-yet-generated cert.
 
         match self.security.auth_method.as_str() {
             "none" | "pam" => {}
@@ -518,7 +601,9 @@ impl Default for Config {
             cursor: CursorConfig::default(),
             audio: AudioConfig::default(),
             notifications: NotificationConfig::default(),
+            monitoring: MonitoringConfig::default(),
             gui_state: GuiStateConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
         }
     }
 }
@@ -547,7 +632,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default_config().unwrap();
-        assert_eq!(config.server.listen_addr, "0.0.0.0:3389");
+        assert_eq!(config.server.listen_addr, "[::]:3389");
         assert!(config.server.use_portals);
         assert_eq!(config.video.target_fps, 30);
     }

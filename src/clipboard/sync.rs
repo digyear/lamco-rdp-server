@@ -110,6 +110,10 @@ pub struct SyncManager {
     state: ClipboardState,
     /// Loop detector (from lamco-clipboard-core)
     loop_detector: LoopDetector,
+    /// Whether Klipper (KDE) is running. Gates the Klipper-specific
+    /// clear-after-takeover reannounce so it can't misfire on non-KDE
+    /// compositors (e.g. COSMIC), where an empty selection is normal.
+    klipper_present: bool,
 }
 
 impl SyncManager {
@@ -118,6 +122,7 @@ impl SyncManager {
         Self {
             state: ClipboardState::Idle,
             loop_detector: LoopDetector::new(),
+            klipper_present: false,
         }
     }
 
@@ -126,7 +131,13 @@ impl SyncManager {
         Self {
             state: ClipboardState::Idle,
             loop_detector: LoopDetector::with_config(config),
+            klipper_present: false,
         }
+    }
+
+    /// Record whether Klipper (KDE) is present, gating the Klipper-clear path.
+    pub fn set_klipper_present(&mut self, present: bool) {
+        self.klipper_present = present;
     }
 
     pub fn state(&self) -> &ClipboardState {
@@ -172,8 +183,8 @@ impl SyncManager {
         debug!("└────────────────────────────────────────────────────────────────");
 
         self.loop_detector
-            .record_formats(&formats, ClipboardSource::Rdp);
-        self.loop_detector.record_sync(ClipboardSource::Rdp);
+            .record_formats(&formats, ClipboardSource::Remote);
+        self.loop_detector.record_sync(ClipboardSource::Remote);
 
         true
     }
@@ -233,9 +244,10 @@ impl SyncManager {
                     debug!("└────────────────────────────────────────────────────────────────");
                     // Don't transition state - we want to stay RdpOwned and reclaim
                     return PortalSyncDecision::KlipperReannounce;
-                } else if mime_types.is_empty() {
-                    // Klipper clearing clipboard (0 MIME types) after we reclaimed ownership
-                    // This is a secondary Klipper behavior - it clears after takeover
+                } else if mime_types.is_empty() && self.klipper_present {
+                    // Klipper clearing clipboard (0 MIME types) after we reclaimed ownership.
+                    // This is a secondary Klipper behavior - it clears after takeover.
+                    // Gated to KDE: on COSMIC/others an empty selection is normal, not a clear
                     warn!(
                         "│ KLIPPER CLIPBOARD CLEAR: 0 MIME types {}ms after RDP ownership",
                         elapsed.as_millis()
@@ -289,7 +301,7 @@ impl SyncManager {
 
     pub fn check_content(&mut self, content: &[u8], from_rdp: bool) -> bool {
         let source = if from_rdp {
-            ClipboardSource::Rdp
+            ClipboardSource::Remote
         } else {
             ClipboardSource::Local
         };
@@ -333,7 +345,7 @@ impl SyncManager {
     pub fn set_rdp_formats(&mut self, formats: Vec<ClipboardFormat>) {
         self.state = ClipboardState::RdpOwned(formats.clone(), SystemTime::now());
         self.loop_detector
-            .record_formats(&formats, ClipboardSource::Rdp);
+            .record_formats(&formats, ClipboardSource::Remote);
     }
 
     pub fn set_portal_formats(&mut self, mime_types: Vec<String>) {
@@ -347,7 +359,7 @@ impl SyncManager {
     /// Only returns true if rate limiting is configured.
     pub fn is_rate_limited(&self, from_rdp: bool) -> bool {
         let source = if from_rdp {
-            ClipboardSource::Rdp
+            ClipboardSource::Remote
         } else {
             ClipboardSource::Local
         };

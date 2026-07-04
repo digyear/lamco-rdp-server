@@ -11,7 +11,7 @@
 //! for integration with monitoring systems.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -94,34 +94,49 @@ impl MetricsCollector {
         self.histograms.write().clear();
     }
 
-    /// Export metrics in Prometheus text format
+    /// Export metrics in OpenMetrics/Prometheus text format.
+    ///
+    /// All metric names are prefixed with `lamco_rdp_` namespace.
+    /// Each metric includes HELP and TYPE metadata lines.
     pub fn export_prometheus(&self) -> String {
         let mut output = String::new();
 
-        // Export counters
+        // Uptime gauge (always present)
+        let uptime_secs = self.start_time.elapsed().as_secs();
+        output.push_str("# HELP lamco_rdp_uptime_seconds Time since server started.\n");
+        output.push_str("# TYPE lamco_rdp_uptime_seconds gauge\n");
+        output.push_str(&format!("lamco_rdp_uptime_seconds {uptime_secs}\n\n"));
+
         for (name, value) in self.counters.read().iter() {
-            output.push_str(&format!("# TYPE {name} counter\n"));
-            output.push_str(&format!("{name} {value}\n"));
+            let prefixed = namespace_metric(name);
+            let help = metric_help(name);
+            output.push_str(&format!("# HELP {prefixed} {help}\n"));
+            output.push_str(&format!("# TYPE {prefixed} counter\n"));
+            output.push_str(&format!("{prefixed} {value}\n\n"));
         }
 
-        // Export gauges
         for (name, value) in self.gauges.read().iter() {
-            output.push_str(&format!("# TYPE {name} gauge\n"));
-            output.push_str(&format!("{name} {value}\n"));
+            let prefixed = namespace_metric(name);
+            let help = metric_help(name);
+            output.push_str(&format!("# HELP {prefixed} {help}\n"));
+            output.push_str(&format!("# TYPE {prefixed} gauge\n"));
+            output.push_str(&format!("{prefixed} {value}\n\n"));
         }
 
-        // Export histograms
         for (name, histogram) in self.histograms.read().iter() {
+            let prefixed = namespace_metric(name);
+            let help = metric_help(name);
             let stats = histogram.stats();
-            output.push_str(&format!("# TYPE {name} histogram\n"));
-            output.push_str(&format!("{}_count {}\n", name, stats.count));
-            output.push_str(&format!("{}_sum {}\n", name, stats.sum));
-            output.push_str(&format!("{}_min {}\n", name, stats.min));
-            output.push_str(&format!("{}_max {}\n", name, stats.max));
-            output.push_str(&format!("{}_avg {}\n", name, stats.mean));
-            output.push_str(&format!("{}_p50 {}\n", name, stats.p50));
-            output.push_str(&format!("{}_p95 {}\n", name, stats.p95));
-            output.push_str(&format!("{}_p99 {}\n", name, stats.p99));
+            output.push_str(&format!("# HELP {prefixed} {help}\n"));
+            output.push_str(&format!("# TYPE {prefixed} summary\n"));
+            output.push_str(&format!("{prefixed}_count {}\n", stats.count));
+            output.push_str(&format!("{prefixed}_sum {}\n", stats.sum));
+            output.push_str(&format!("{prefixed}{{quantile=\"0.5\"}} {}\n", stats.p50));
+            output.push_str(&format!("{prefixed}{{quantile=\"0.95\"}} {}\n", stats.p95));
+            output.push_str(&format!(
+                "{prefixed}{{quantile=\"0.99\"}} {}\n\n",
+                stats.p99
+            ));
         }
 
         output
@@ -140,29 +155,54 @@ impl Default for MetricsCollector {
     }
 }
 
-/// Histogram for tracking value distributions
+/// Rolling-window histogram for tracking value distributions.
+///
+/// Capped at `MAX_SAMPLES` to prevent unbounded memory growth during
+/// long-running sessions. When full, oldest samples are evicted. The
+/// `total_count` and `all_time_sum` fields track lifetime aggregates
+/// independent of the window.
 pub struct Histogram {
-    values: Vec<f64>,
+    values: VecDeque<f64>,
     min: f64,
     max: f64,
-    sum: f64,
+    /// Sum of values currently in the window (for accurate window stats)
+    window_sum: f64,
+    /// Lifetime count of all recorded values (monotonic)
+    total_count: u64,
+    /// Lifetime sum of all recorded values (monotonic)
+    all_time_sum: f64,
 }
+
+/// Rolling window cap — 10k samples at 30 FPS is ~5.5 minutes of history,
+/// enough for percentile accuracy without unbounded growth.
+const MAX_HISTOGRAM_SAMPLES: usize = 10_000;
 
 impl Histogram {
     fn new() -> Self {
         Self {
-            values: Vec::new(),
+            values: VecDeque::new(),
             min: f64::MAX,
             max: f64::MIN,
-            sum: 0.0,
+            window_sum: 0.0,
+            total_count: 0,
+            all_time_sum: 0.0,
         }
     }
 
     fn record(&mut self, value: f64) {
-        self.values.push(value);
+        // Evict oldest sample when window is full
+        if self.values.len() >= MAX_HISTOGRAM_SAMPLES
+            && let Some(evicted) = self.values.pop_front()
+        {
+            self.window_sum -= evicted;
+        }
+
+        self.values.push_back(value);
         self.min = self.min.min(value);
         self.max = self.max.max(value);
-        self.sum += value;
+        self.window_sum += value;
+        self.total_count += 1;
+        self.all_time_sum += value;
     }
 
     fn stats(&self) -> HistogramStats {
@@ -171,9 +211,8 @@ impl Histogram {
         }
 
         let count = self.values.len();
-        let mean = self.sum / count as f64;
+        let mean = self.window_sum / count as f64;
 
-        // Calculate variance and stddev
         let variance = self
             .values
             .iter()
@@ -185,8 +224,7 @@ impl Histogram {
             / count as f64;
         let stddev = variance.sqrt();
 
-        // Calculate percentiles
-        let mut sorted = self.values.clone();
+        let mut sorted: Vec<f64> = self.values.iter().copied().collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let p50 = percentile(&sorted, 0.50);
@@ -194,8 +232,8 @@ impl Histogram {
         let p99 = percentile(&sorted, 0.99);
 
         HistogramStats {
-            count: count as u64,
-            sum: self.sum,
+            count: self.total_count,
+            sum: self.all_time_sum,
             min: self.min,
             max: self.max,
             mean,
@@ -335,6 +373,67 @@ pub mod metric_names {
     pub const VIDEO_LATENCY_MS: &str = "video_latency_ms";
     /// End-to-end latency histogram (milliseconds)
     pub const END_TO_END_LATENCY_MS: &str = "end_to_end_latency_ms";
+
+    // -- EGFX pipeline metrics --
+
+    /// EGFX frame acknowledgement queue depth (gauge)
+    pub const EGFX_QUEUE_DEPTH: &str = "egfx_queue_depth";
+    /// Total EGFX frame acknowledgements received (counter)
+    pub const EGFX_FRAME_ACKS: &str = "egfx_frame_acks_total";
+    /// Client-reported decode+render time in microseconds (histogram, from QoE)
+    pub const CLIENT_DECODE_RENDER_US: &str = "client_decode_render_us";
+
+    // -- Encoder metrics --
+
+    /// Current encoder FPS (gauge)
+    pub const ENCODER_FPS: &str = "encoder_fps";
+    /// Current encoder bitrate in kbps (gauge)
+    pub const ENCODER_BITRATE_KBPS: &str = "encoder_bitrate_kbps";
+    /// Encoding duration per frame in milliseconds (histogram)
+    pub const ENCODE_DURATION_MS: &str = "encode_duration_ms";
+    /// Total frames encoded (counter)
+    pub const FRAMES_ENCODED: &str = "frames_encoded_total";
+}
+
+const NAMESPACE: &str = "lamco_rdp_";
+
+/// Add `lamco_rdp_` prefix if not already present
+fn namespace_metric(name: &str) -> String {
+    if name.starts_with(NAMESPACE) {
+        name.to_string()
+    } else {
+        format!("{NAMESPACE}{name}")
+    }
+}
+
+/// Derive a HELP string from the metric name.
+/// Uses the known metric_names constants for accurate descriptions,
+/// falls back to humanizing the metric name.
+fn metric_help(name: &str) -> &'static str {
+    match name {
+        metric_names::FRAMES_RECEIVED => "Total video frames received from PipeWire.",
+        metric_names::FRAMES_PROCESSED => "Total video frames successfully processed.",
+        metric_names::FRAMES_DROPPED => "Total video frames dropped.",
+        metric_names::FRAME_PROCESSING_TIME_MS => "Frame processing time in milliseconds.",
+        metric_names::CONVERSIONS_TOTAL => "Total format conversions performed.",
+        metric_names::CONVERSION_TIME_MS => "Conversion time in milliseconds.",
+        metric_names::FRAMES_DISPATCHED => "Total frames dispatched to RDP clients.",
+        metric_names::FRAMES_QUEUED => "Current frames waiting in dispatch queue.",
+        metric_names::BYTES_SENT => "Total bytes sent to RDP clients.",
+        metric_names::BYTES_RECEIVED => "Total bytes received from RDP clients.",
+        metric_names::CONNECTIONS_ACTIVE => "Currently active RDP connections.",
+        metric_names::CONNECTIONS_TOTAL => "Total RDP connections since server start.",
+        metric_names::CONNECTION_ERRORS => "Total connection errors.",
+        metric_names::EGFX_QUEUE_DEPTH => "EGFX frame acknowledgement queue depth.",
+        metric_names::EGFX_FRAME_ACKS => "Total EGFX frame acknowledgements received.",
+        metric_names::CLIENT_DECODE_RENDER_US => {
+            "Client-reported decode+render time in microseconds."
+        }
+        metric_names::ENCODER_FPS => "Current encoder frames per second.",
+        metric_names::ENCODER_BITRATE_KBPS => "Current encoder bitrate in kbps.",
+        metric_names::ENCODE_DURATION_MS => "Encoding duration per frame in milliseconds.",
+        _ => "Server metric.",
+    }
 }
 
 /// Timer helper for measuring durations
@@ -450,8 +549,15 @@ mod tests {
         metrics.set_gauge("test_gauge", 3.14);
 
         let output = metrics.export_prometheus();
-        assert!(output.contains("test_counter 42"));
-        assert!(output.contains("test_gauge 3.14"));
+        // Prometheus export adds lamco_rdp_ namespace prefix
+        assert!(output.contains("lamco_rdp_test_counter 42"));
+        assert!(output.contains("lamco_rdp_test_gauge 3.14"));
+        // HELP and TYPE metadata must be present
+        assert!(output.contains("# HELP lamco_rdp_test_counter"));
+        assert!(output.contains("# TYPE lamco_rdp_test_counter counter"));
+        assert!(output.contains("# TYPE lamco_rdp_test_gauge gauge"));
+        // Uptime gauge is always present
+        assert!(output.contains("lamco_rdp_uptime_seconds"));
     }
 
     #[test]
@@ -507,5 +613,25 @@ mod tests {
         assert_eq!(stats.max, 50.0);
         assert_eq!(stats.mean, 30.0);
         assert_eq!(stats.p50, 30.0);
+    }
+
+    #[test]
+    fn test_histogram_rolling_window() {
+        let mut hist = Histogram::new();
+
+        // Fill beyond MAX_HISTOGRAM_SAMPLES
+        for i in 0..MAX_HISTOGRAM_SAMPLES + 500 {
+            hist.record(i as f64);
+        }
+
+        // Window should be capped
+        assert_eq!(hist.values.len(), MAX_HISTOGRAM_SAMPLES);
+
+        let stats = hist.stats();
+        // total_count tracks all recordings, not just window
+        assert_eq!(stats.count, (MAX_HISTOGRAM_SAMPLES + 500) as u64);
+        // Window mean should reflect the most recent 10k samples (500..10500)
+        let expected_window_mean = (500.0 + (MAX_HISTOGRAM_SAMPLES + 499) as f64) / 2.0;
+        assert!((stats.mean - expected_window_mean).abs() < 1.0);
     }
 }

@@ -63,12 +63,7 @@ pub struct PortalSessionHandleImpl {
     /// Session for input injection and clipboard
     /// Uses RwLock to allow concurrent input injection during clipboard operations
     pub(crate) session: Arc<
-        tokio::sync::RwLock<
-            ashpd::desktop::Session<
-                'static,
-                ashpd::desktop::remote_desktop::RemoteDesktop<'static>,
-            >,
-        >,
+        tokio::sync::RwLock<ashpd::desktop::Session<ashpd::desktop::remote_desktop::RemoteDesktop>>,
     >,
     /// Clipboard manager (for clipboard operations) - None on Portal v1
     pub(crate) clipboard_manager: Option<Arc<lamco_portal::ClipboardManager>>,
@@ -76,6 +71,11 @@ pub struct PortalSessionHandleImpl {
     pub(crate) session_type: SessionType,
     /// Session validity flag - set to false when Portal session is destroyed
     pub(crate) session_valid: Arc<AtomicBool>,
+    /// PipeWire stream active flag — false when stream is paused.
+    /// On Portal sessions, GNOME rejects input D-Bus calls when the ScreenCast
+    /// stream is not actively streaming. Checking this avoids hundreds of
+    /// futile D-Bus calls that would all fail with the same error.
+    pub(crate) stream_active: Arc<AtomicBool>,
     /// Health reporter for session lifecycle events (set once after construction).
     /// Arc-wrapped so spawned tasks (e.g., Closed listener) can read it lazily.
     pub(crate) health_reporter: Arc<std::sync::OnceLock<HealthReporter>>,
@@ -86,10 +86,7 @@ impl PortalSessionHandleImpl {
     pub fn from_portal_session(
         session: Arc<
             tokio::sync::RwLock<
-                ashpd::desktop::Session<
-                    'static,
-                    ashpd::desktop::remote_desktop::RemoteDesktop<'static>,
-                >,
+                ashpd::desktop::Session<ashpd::desktop::remote_desktop::RemoteDesktop>,
             >,
         >,
         remote_desktop: Arc<lamco_portal::RemoteDesktopManager>,
@@ -104,6 +101,7 @@ impl PortalSessionHandleImpl {
             clipboard_manager,
             session_type: SessionType::Portal,
             session_valid: Arc::new(AtomicBool::new(true)),
+            stream_active: Arc::new(AtomicBool::new(true)),
             health_reporter: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -117,22 +115,24 @@ impl PortalSessionHandleImpl {
     /// This is the key fix for Bug #6: the server learns about session destruction
     /// proactively rather than discovering it through error strings.
     pub async fn start_closed_listener(&self) {
-        let session_guard = self.session.read().await;
-        let closed_stream = match session_guard.receive_closed().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                warn!("Failed to subscribe to Portal session Closed signal: {e}");
-                return;
-            }
-        };
-        drop(session_guard);
-
+        let session = Arc::clone(&self.session);
         let session_valid = Arc::clone(&self.session_valid);
         let health_reporter = Arc::clone(&self.health_reporter);
 
         tokio::spawn(async move {
+            // Acquire read lock inside the spawned task so the stream's borrow
+            // of the session guard lives for the task's entire lifetime.
+            let session_guard = session.read().await;
+            let closed_stream = match session_guard.receive_closed().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!("Failed to subscribe to Portal session Closed signal: {e}");
+                    return;
+                }
+            };
+
             futures_util::pin_mut!(closed_stream);
-            // Stream yields () when the session is closed
+            // Stream yields signal data when the session is closed
             closed_stream.next().await;
 
             error!("Portal session Closed signal received — session destroyed by compositor");
@@ -195,6 +195,15 @@ impl PortalSessionHandleImpl {
 }
 
 impl PortalSessionHandleImpl {
+    /// Update PipeWire stream active state.
+    ///
+    /// Called by the display handler when the PipeWire stream transitions
+    /// between Streaming and Paused. When false, input injection methods
+    /// return early instead of attempting D-Bus calls that would fail.
+    pub fn set_stream_active(&self, active: bool) {
+        self.stream_active.store(active, Ordering::Release);
+    }
+
     /// Handle an input injection error: if the session is destroyed, mark it
     /// invalid and return a clear error. Otherwise propagate the original error.
     fn handle_input_error<E: std::fmt::Display>(&self, error: E, operation: &str) -> anyhow::Error {
@@ -233,6 +242,10 @@ impl SessionHandle for PortalSessionHandleImpl {
         let _ = self.health_reporter.set(reporter);
     }
 
+    fn stream_active_flag(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.stream_active))
+    }
+
     fn pipewire_access(&self) -> PipeWireAccess {
         PipeWireAccess::FileDescriptor(self.pipewire_fd)
     }
@@ -251,6 +264,9 @@ impl SessionHandle for PortalSessionHandleImpl {
                 "Portal session invalid — cannot send keyboard event"
             ));
         }
+        if !self.stream_active.load(Ordering::Acquire) {
+            return Err(anyhow!("Portal stream paused — input suspended"));
+        }
 
         let session = self.session.read().await;
         self.remote_desktop
@@ -259,11 +275,29 @@ impl SessionHandle for PortalSessionHandleImpl {
             .map_err(|e| self.handle_input_error(e, "keyboard keycode"))
     }
 
+    async fn notify_keyboard_keysym(&self, keysym: u32, pressed: bool) -> Result<()> {
+        if !self.session_valid.load(Ordering::Acquire) {
+            return Err(anyhow!("Portal session invalid — cannot send keysym event"));
+        }
+        if !self.stream_active.load(Ordering::Acquire) {
+            return Err(anyhow!("Portal stream paused — input suspended"));
+        }
+
+        let session = self.session.read().await;
+        self.remote_desktop
+            .notify_keyboard_keysym(&session, keysym as i32, pressed)
+            .await
+            .map_err(|e| self.handle_input_error(e, "keyboard keysym"))
+    }
+
     async fn notify_pointer_motion_absolute(&self, stream_id: u32, x: f64, y: f64) -> Result<()> {
         if !self.session_valid.load(Ordering::Acquire) {
             return Err(anyhow!(
                 "Portal session invalid — cannot send pointer motion"
             ));
+        }
+        if !self.stream_active.load(Ordering::Acquire) {
+            return Err(anyhow!("Portal stream paused — input suspended"));
         }
 
         let session = self.session.read().await;
@@ -279,6 +313,9 @@ impl SessionHandle for PortalSessionHandleImpl {
                 "Portal session invalid — cannot send pointer button"
             ));
         }
+        if !self.stream_active.load(Ordering::Acquire) {
+            return Err(anyhow!("Portal stream paused — input suspended"));
+        }
 
         let session = self.session.read().await;
         self.remote_desktop
@@ -290,6 +327,9 @@ impl SessionHandle for PortalSessionHandleImpl {
     async fn notify_pointer_axis(&self, dx: f64, dy: f64) -> Result<()> {
         if !self.session_valid.load(Ordering::Acquire) {
             return Err(anyhow!("Portal session invalid — cannot send pointer axis"));
+        }
+        if !self.stream_active.load(Ordering::Acquire) {
+            return Err(anyhow!("Portal stream paused — input suspended"));
         }
 
         let session = self.session.read().await;

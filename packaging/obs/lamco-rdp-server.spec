@@ -6,13 +6,16 @@
 #
 
 Name:           lamco-rdp-server
-Version:        1.4.2
-Release:        1%{?dist}
+Version:        1.4.4
+Release:        3%{?dist}
 Summary:        Wayland RDP server for Linux desktop sharing with GUI
 
 License:        BUSL-1.1
 URL:            https://www.lamco.ai/products/lamco-rdp-server/
 Source0:        %{name}-%{version}.tar.xz
+
+# Vendored cros-libva 0.0.13 missing fields added in libva >= 2.22
+Patch0:         cros-libva-vp9-compat.patch
 
 # Disable debuginfo — we override RUSTFLAGS to strip symbols (OOM workaround)
 %global debug_package %{nil}
@@ -56,15 +59,20 @@ BuildRequires:  pkgconfig(fuse3)
 BuildRequires:  clang
 BuildRequires:  clang-devel
 
+# Icon/desktop integration (OBS check-filelist requires directory ownership)
+BuildRequires:  hicolor-icon-theme
+
 # Runtime dependencies
 Requires:       pipewire
 Requires:       xdg-desktop-portal
 Requires:       pam
+Requires:       hicolor-icon-theme
 
 # Weak dependencies for hardware encoding
 Recommends:     libva
 Recommends:     intel-media-driver
 Recommends:     mesa-va-drivers
+
 
 %description
 lamco-rdp-server is a high-performance RDP server for Wayland-based Linux
@@ -82,7 +90,7 @@ Features:
 - Graceful shutdown with explicit PipeWire cleanup
 
 %prep
-%setup -q
+%autosetup -p1
 
 %build
 # Use vendored dependencies
@@ -96,8 +104,11 @@ export CARGO_PROFILE_RELEASE_LTO=off
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 export RUSTFLAGS="-Copt-level=3 -Ccodegen-units=16 -Cstrip=symbols"
 
-# Build release binaries (server + GUI)
-cargo build --release --offline --features "default,vaapi,gui"
+# Build release binaries (server + GUI).
+# vsock + websocket activate the AF_VSOCK (Hyper-V Enhanced
+# Session Mode) and WebSocket+RDCleanPath transport listeners introduced
+# in v1.4.4 — pure Rust additions, no extra system-library BuildRequires.
+cargo build --release --offline --features "default,vaapi,gui,vsock,websocket"
 
 %install
 install -Dm755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
@@ -120,6 +131,7 @@ done
 
 %files
 %license LICENSE
+%license licenses/OpenH264-BINARY_LICENSE.txt
 %doc README.md
 %{_bindir}/%{name}
 %{_bindir}/%{name}-gui
@@ -131,6 +143,20 @@ done
 %{_datadir}/icons/hicolor/*/apps/io.lamco.rdp-server.png
 
 %changelog
+* Fri Jul 03 2026 Greg Lamberson <greg@lamco.io> - 1.4.4-1
+- New upstream release 1.4.4
+- Unified multi-transport: AF_VSOCK (Hyper-V) and experimental WebSocket/RDCleanPath
+- Vulkan Video H.264 encoder; HTTP metrics and health server
+- Per-connection session lifecycle on GNOME; KDE, sway, and COSMIC fixes; many GUI fixes
+- Linux-to-Windows clipboard file copy; systemd unit hardening fix for PAM
+- MSRV 1.89, Rust edition 2024; Licensor Lamco Development LLC, Change Date 2029-06-01
+
+* Wed Mar 12 2026 Greg Lamberson <greg@lamco.io> - 1.4.2-3
+- Add hicolor-icon-theme dep for OBS directory ownership check
+
+* Wed Mar 12 2026 Greg Lamberson <greg@lamco.io> - 1.4.2-2
+- Add cros-libva VP9 compat patch for libva >= 2.22
+
 * Mon Mar 10 2026 Greg Lamberson <greg@lamco.io> - 1.4.2-1
 - Fix Unicode keyboard mapping: map Unicode events to evdev keycodes
 - PipeWire stream DRIVER flag: ensure frames at negotiated framerate

@@ -102,6 +102,31 @@ impl ClipboardProvider for DataControlClipboardProvider {
         .map_err(|e| ClipboardError::PortalError(format!("announce_formats task panicked: {e}")))?
     }
 
+    async fn on_remote_gone(&self) -> Result<()> {
+        // Best-effort release: the ClipboardBackend trait exposes no
+        // set_selection(None) lever, so we can only install an empty owned
+        // source. That stops us serving stale remote data but does NOT fully
+        // relinquish the selection — a true release needs a clear primitive on
+        // the upstream trait (tracked follow-up). Non-active path on GNOME.
+        let backend = Arc::clone(&self.backend);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = backend
+                .lock()
+                .map_err(|e| ClipboardError::PortalError(format!("Backend lock poisoned: {e}")))?;
+
+            let empty = xdg_desktop_portal_generic::types::ClipboardData {
+                mime_types: Vec::new(),
+                data: std::collections::HashMap::new(),
+            };
+            guard.set_clipboard(empty).map_err(|e| {
+                ClipboardError::PortalError(format!("release set_clipboard failed: {e}"))
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ClipboardError::PortalError(format!("on_remote_gone task panicked: {e}")))?
+    }
+
     async fn read_data(&self, mime_type: &str) -> Result<Vec<u8>> {
         let backend = Arc::clone(&self.backend);
         let mime_owned = mime_type.to_string();

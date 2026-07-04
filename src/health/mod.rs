@@ -28,8 +28,12 @@
 //! - `tokio::sync::mpsc<HealthEvent>` — subsystems report events to monitor
 //! - `Arc<AtomicBool>` — backwards-compatible `session_valid` mirror
 
+pub mod compositor_health;
 pub mod compositor_watcher;
 mod monitor;
+pub mod performance;
+pub mod sensors;
+pub mod snapshot_collector;
 
 use std::{
     fmt,
@@ -195,8 +199,19 @@ pub enum HealthEvent {
     /// EIS event stream ended (device loss)
     EisStreamEnded { reason: String },
 
+    /// EIS session recovered after socket death (compositor idle timeout)
+    EisStreamRecovered,
+
     /// A subsystem is not available in this session configuration
     SubsystemNotAvailable { subsystem: String },
+
+    /// EGFX DVC channel closed — H.264 delivery interrupted.
+    /// The client may fall back to V8 bitmap mode if supported.
+    EgfxChannelClosed { reason: String },
+
+    /// EGFX DVC channel ready — H.264 delivery can begin.
+    /// Fired when capabilities are negotiated AND a surface exists.
+    EgfxChannelReady { version: String },
 }
 
 /// PipeWire stream states relevant to health monitoring
@@ -404,7 +419,10 @@ mod tests {
     #[tokio::test]
     async fn test_health_dbus_bridge_emits_on_change() {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-        let (monitor, reporter, subscriber) = SessionHealthMonitor::new(shutdown_tx.subscribe());
+        let (monitor, reporter, subscriber) = SessionHealthMonitor::new(
+            shutdown_tx.subscribe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
 
         let monitor_handle = tokio::spawn(monitor.run());
 

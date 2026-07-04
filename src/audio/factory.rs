@@ -24,7 +24,7 @@
 //!                                              └── rdpsnd.wave()
 //! ```
 
-use ironrdp_rdpsnd::server::RdpsndServerHandler;
+use ironrdp_rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler};
 use ironrdp_server::{ServerEvent, ServerEventSender, SoundServerFactory};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -127,8 +127,17 @@ impl RdpsndServerHandler for NoOpAudioHandler {
         &[]
     }
 
-    fn start(&mut self, _client_format: &ironrdp_rdpsnd::pdu::ClientAudioFormatPdu) -> Option<u16> {
+    fn choose_format<'a>(
+        &mut self,
+        _common: &'a [NegotiatedFormat],
+    ) -> Option<&'a NegotiatedFormat> {
+        // get_formats() returns an empty list, so the crate never has a
+        // non-empty `common` to offer here in practice.
         None
+    }
+
+    fn start(&mut self, _format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        Ok(())
     }
 
     fn stop(&mut self) {}

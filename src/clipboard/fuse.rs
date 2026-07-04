@@ -34,9 +34,9 @@ use std::{
 };
 
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
-    Request, SessionACL,
+    AccessFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyXattr, Request, SessionACL,
 };
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
@@ -140,6 +140,19 @@ struct ClipboardFs {
 }
 
 impl Filesystem for ClipboardFs {
+    // No-op: our files are read-only on-demand, so there is nothing buffered to
+    // sync on close. Implementing flush silences fuser's "[Not Implemented]" warn.
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent.0 != ROOT_INODE {
             reply.error(Errno::ENOENT);
@@ -180,6 +193,42 @@ impl Filesystem for ClipboardFs {
             reply.attr(&TTL, &file.to_attr());
         } else {
             reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn access(&self, _req: &Request, ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        // Read-only clipboard filesystem: permit access to the root and to any
+        // file we expose (these are the user's own pasted files). Overriding
+        // access() also silences fuser's default "Not Implemented" warning,
+        // which the kernel otherwise triggers on every access() probe.
+        if ino.0 == ROOT_INODE || self.files.read().contains_key(&ino.0) {
+            reply.ok();
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        // Read-only clipboard files carry no extended attributes. ENODATA is the
+        // POSIX "no such attribute" answer; file managers probing security.* /
+        // SELinux contexts handle it gracefully (and it silences fuser's default
+        // "Not Implemented" warning).
+        reply.error(Errno::ENODATA);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+        // No extended attributes: report an empty list (size query -> 0 bytes).
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
         }
     }
 
@@ -329,6 +378,23 @@ pub struct FuseMount {
 impl FuseMount {
     pub fn new(request_tx: mpsc::Sender<FileContentsRequest>) -> Result<Self> {
         let mount_point = get_mount_point();
+        Ok(Self {
+            mount_point,
+            session: None,
+            files: Arc::new(RwLock::new(HashMap::new())),
+            name_to_inode: Arc::new(RwLock::new(HashMap::new())),
+            next_inode: Arc::new(AtomicU64::new(FIRST_FILE_INODE)),
+            request_tx,
+        })
+    }
+
+    /// Create a FuseMount with a specific mount point path.
+    ///
+    /// Used by the FUSE file transfer backend to inject PID-unique paths.
+    pub fn with_mount_point(
+        mount_point: PathBuf,
+        request_tx: mpsc::Sender<FileContentsRequest>,
+    ) -> Result<Self> {
         Ok(Self {
             mount_point,
             session: None,
@@ -548,32 +614,6 @@ impl FileDescriptor {
     }
 }
 
-/// Generate gnome-copied-files format content from file paths
-///
-/// Format: `copy\nfile:///path/to/file1\nfile:///path/to/file2\0`
-pub fn generate_gnome_copied_files_content(paths: &[PathBuf]) -> String {
-    let mut content = String::from("copy\n");
-    for path in paths {
-        content.push_str(&format!("file://{}\n", path.display()));
-    }
-    if content.ends_with('\n') {
-        content.pop();
-    }
-    content.push('\0');
-    content
-}
-
-/// Generate text/uri-list format content from file paths
-///
-/// Format: `file:///path/to/file1\r\nfile:///path/to/file2\r\n`
-pub fn generate_uri_list_content(paths: &[PathBuf]) -> String {
-    let mut content = String::new();
-    for path in paths {
-        content.push_str(&format!("file://{}\r\n", path.display()));
-    }
-    content
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,26 +629,6 @@ mod tests {
         let desc = FileDescriptor::new("test.txt".to_string(), 1024);
         assert_eq!(desc.filename, "test.txt");
         assert_eq!(desc.size, 1024);
-    }
-
-    #[test]
-    fn test_generate_gnome_copied_files() {
-        let paths = vec![
-            PathBuf::from("/tmp/test/file1.txt"),
-            PathBuf::from("/tmp/test/file2.txt"),
-        ];
-        let content = generate_gnome_copied_files_content(&paths);
-        assert!(content.starts_with("copy\n"));
-        assert!(content.contains("file:///tmp/test/file1.txt"));
-        assert!(content.contains("file:///tmp/test/file2.txt"));
-        assert!(content.ends_with('\0'));
-    }
-
-    #[test]
-    fn test_generate_uri_list() {
-        let paths = vec![PathBuf::from("/tmp/test/file1.txt")];
-        let content = generate_uri_list_content(&paths);
-        assert_eq!(content, "file:///tmp/test/file1.txt\r\n");
     }
 
     #[test]

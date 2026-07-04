@@ -95,11 +95,6 @@ fn translate_damage_tracking(caps: &CompositorCapabilities) -> AdvertisedService
 fn translate_dmabuf(caps: &CompositorCapabilities) -> AdvertisedService {
     let profile = &caps.profile;
 
-    if profile.has_quirk(&Quirk::PoorDmaBufSupport) {
-        return AdvertisedService::unavailable(ServiceId::DmaBufZeroCopy)
-            .with_note("Compositor has unreliable DMA-BUF support");
-    }
-
     match profile.recommended_buffer_type {
         BufferType::DmaBuf => {
             let feature = WaylandFeature::DmaBufZeroCopy {
@@ -347,6 +342,66 @@ fn translate_clipboard_manager(caps: &CompositorCapabilities) -> AdvertisedServi
                     .with_note("GNOME Shell built-in clipboard")
             }
 
+            SystemClipboardManagerKind::GPaste => {
+                let feature = WaylandFeature::ClipboardManager {
+                    manager_type: "gpaste".to_string(),
+                    version: "unknown".to_string(),
+                };
+
+                AdvertisedService::best_effort(ServiceId::ClipboardManager, feature)
+                    .with_note("GPaste GNOME clipboard extension")
+            }
+
+            SystemClipboardManagerKind::Clipcat => {
+                let feature = WaylandFeature::ClipboardManager {
+                    manager_type: "clipcat".to_string(),
+                    version: "unknown".to_string(),
+                };
+
+                AdvertisedService::best_effort(ServiceId::ClipboardManager, feature)
+                    .with_note("clipcat clipboard manager")
+            }
+
+            SystemClipboardManagerKind::Cliphist => {
+                let feature = WaylandFeature::ClipboardManager {
+                    manager_type: "cliphist".to_string(),
+                    version: "unknown".to_string(),
+                };
+
+                AdvertisedService::best_effort(ServiceId::ClipboardManager, feature)
+                    .with_note("cliphist clipboard history (passive)")
+            }
+
+            SystemClipboardManagerKind::WlClipPersist => {
+                let feature = WaylandFeature::ClipboardManager {
+                    manager_type: "wl-clip-persist".to_string(),
+                    version: "unknown".to_string(),
+                };
+
+                AdvertisedService::best_effort(ServiceId::ClipboardManager, feature)
+                    .with_note("wl-clip-persist clipboard persistence daemon")
+            }
+
+            SystemClipboardManagerKind::Clipman => {
+                let feature = WaylandFeature::ClipboardManager {
+                    manager_type: "clipman".to_string(),
+                    version: "unknown".to_string(),
+                };
+
+                AdvertisedService::best_effort(ServiceId::ClipboardManager, feature)
+                    .with_note("clipman clipboard manager (passive)")
+            }
+
+            SystemClipboardManagerKind::CosmicClipboard => {
+                let feature = WaylandFeature::ClipboardManager {
+                    manager_type: "cosmic".to_string(),
+                    version: "built-in".to_string(),
+                };
+
+                AdvertisedService::best_effort(ServiceId::ClipboardManager, feature)
+                    .with_note("COSMIC desktop built-in clipboard")
+            }
+
             SystemClipboardManagerKind::WlClipboard => {
                 let feature = WaylandFeature::ClipboardManager {
                     manager_type: "wl-clipboard".to_string(),
@@ -414,9 +469,26 @@ fn translate_video_capture(caps: &CompositorCapabilities) -> AdvertisedService {
             ..PerformanceHints::default()
         };
 
-        AdvertisedService::guaranteed(ServiceId::VideoCapture, feature)
-            .with_performance(perf)
-            .with_rdp_capability(RdpCapability::egfx_avc420())
+        // Check actual encoding availability from probe results
+        let has_h264 = caps
+            .encoding
+            .as_ref()
+            .is_some_and(|enc| enc.software_available || enc.hardware_available);
+
+        let rdp_cap = if has_h264 {
+            RdpCapability::egfx_avc420()
+        } else {
+            RdpCapability::remotefx_bitmap()
+        };
+
+        // Service level: Guaranteed only if H.264 encoder is verified available
+        let service = if has_h264 {
+            AdvertisedService::guaranteed(ServiceId::VideoCapture, feature)
+        } else {
+            AdvertisedService::best_effort(ServiceId::VideoCapture, feature)
+        };
+
+        service.with_performance(perf).with_rdp_capability(rdp_cap)
     } else {
         AdvertisedService::unavailable(ServiceId::VideoCapture)
     }
@@ -728,6 +800,29 @@ fn translate_libei_input(caps: &CompositorCapabilities) -> AdvertisedService {
 // PHASE 3: Authentication Services Translation
 // ============================================================================
 
+// unix_chkpwd is sgid shadow; once the kernel no_new_privs bit is set
+// (NoNewPrivileges=yes, or implied whenever a user-manager unit uses any
+// seccomp option) it cannot gain the group and every shadow-password check
+// fails, even with correct credentials.
+fn no_new_privs_active() -> bool {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("NoNewPrivs:"))
+        .is_some_and(|value| value.trim() == "1")
+}
+
+// pam_unix reads /etc/shadow directly when the running process is permitted to
+// (e.g. a system service that joins the `shadow` group via SupplementaryGroups=).
+// Only when it cannot does it fall back to the sgid `unix_chkpwd` helper, which
+// no_new_privs blocks. So PAM stays usable under NoNewPrivileges as long as the
+// process can read the shadow database itself.
+fn can_read_shadow() -> bool {
+    std::fs::File::open("/etc/shadow").is_ok()
+}
+
 fn translate_pam_authentication(caps: &CompositorCapabilities) -> AdvertisedService {
     use crate::session::DeploymentContext;
 
@@ -736,6 +831,15 @@ fn translate_pam_authentication(caps: &CompositorCapabilities) -> AdvertisedServ
     if matches!(caps.deployment, DeploymentContext::Flatpak) {
         return AdvertisedService::unavailable(ServiceId::PamAuthentication)
             .with_note("PAM authentication blocked by Flatpak sandbox - use 'none' auth instead");
+    }
+
+    if no_new_privs_active() && !can_read_shadow() {
+        return AdvertisedService::unavailable(ServiceId::PamAuthentication).with_note(
+            "PAM helper (unix_chkpwd) cannot elevate under NoNewPrivileges=yes and the \
+             service cannot read /etc/shadow directly — add the service to the `shadow` \
+             group (SupplementaryGroups=shadow), drop NoNewPrivileges, or use a different \
+             auth_method",
+        );
     }
 
     // PAM is also not available in systemd system services without special setup
@@ -750,7 +854,8 @@ fn translate_pam_authentication(caps: &CompositorCapabilities) -> AdvertisedServ
             .with_note("PAM available - requires PAM service configuration");
     }
 
-    // Native and systemd user services have full PAM access
+    // Native installs and user services that passed the no_new_privs gate
+    // above can run the full PAM conversation
     let feature = WaylandFeature::Authentication {
         method: "pam".to_string(),
         supports_nla: true,

@@ -158,27 +158,32 @@ impl SessionStrategy for ScreenCastOnlyStrategy {
             .context("Failed to connect to ScreenCast portal")?;
 
         let session = screencast
-            .create_session()
+            .create_session(ashpd::desktop::CreateSessionOptions::default())
             .await
             .context("Failed to create ScreenCast session")?;
 
         let cursor_mode = self.best_cursor_mode();
         info!("ScreenCast cursor mode: {:?}", cursor_mode);
 
+        use ashpd::desktop::screencast::SelectSourcesOptions;
         screencast
             .select_sources(
                 &session,
-                cursor_mode,
-                SourceType::Monitor.into(),
-                false, // don't allow multiple sources
-                None,  // no restore token
-                PersistMode::DoNot,
+                SelectSourcesOptions::default()
+                    .set_cursor_mode(cursor_mode)
+                    .set_sources(enumflags2::BitFlags::from(SourceType::Monitor))
+                    .set_multiple(false)
+                    .set_persist_mode(PersistMode::DoNot),
             )
             .await
             .context("Failed to select ScreenCast sources")?;
 
         let response = screencast
-            .start(&session, None)
+            .start(
+                &session,
+                None,
+                ashpd::desktop::screencast::StartCastOptions::default(),
+            )
             .await
             .context("Failed to start ScreenCast")?
             .response()
@@ -213,7 +218,10 @@ impl SessionStrategy for ScreenCastOnlyStrategy {
         }
 
         let fd = screencast
-            .open_pipe_wire_remote(&session)
+            .open_pipe_wire_remote(
+                &session,
+                ashpd::desktop::screencast::OpenPipeWireRemoteOptions::default(),
+            )
             .await
             .context("Failed to open PipeWire remote")?;
 

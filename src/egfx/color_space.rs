@@ -159,6 +159,23 @@ pub struct ColorSpaceConfig {
 }
 
 impl ColorSpaceConfig {
+    /// Auto-select a color space preset from output resolution.
+    ///
+    /// Follows the standard broadcast convention:
+    ///   - SD content (height ≤ 720) → BT.601 limited range
+    ///   - HD/UHD content (height > 720) → BT.709 limited range
+    ///
+    /// Used by hardware encoders (NVENC, VA-API) to fill H.264 VUI signalling
+    /// fields when no explicit color preference has been configured.
+    #[must_use]
+    pub const fn from_resolution(_width: u32, height: u32) -> Self {
+        if height > 720 {
+            Self::BT709_LIMITED
+        } else {
+            Self::BT601_LIMITED
+        }
+    }
+
     /// OpenH264-compatible preset (BT.601 limited range)
     ///
     /// **Use this for AVC444 to match AVC420 output.**

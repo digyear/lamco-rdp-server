@@ -17,11 +17,11 @@ pub fn detect_capabilities() -> Result<DetectedCapabilities, String> {
         .arg("--show-capabilities")
         .arg("--format=json")
         .output()
-        .map_err(|e| format!("Failed to run server binary: {}", e))?;
+        .map_err(|e| format!("Failed to run server binary: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Server binary failed: {}", stderr));
+        return Err(format!("Server binary failed: {stderr}"));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -57,7 +57,7 @@ fn find_server_binary() -> Result<PathBuf, String> {
 /// Parse capabilities JSON output
 fn parse_capabilities_json(json_str: &str) -> Result<DetectedCapabilities, String> {
     let json: serde_json::Value =
-        serde_json::from_str(json_str).map_err(|e| format!("Failed to parse JSON: {}", e))?;
+        serde_json::from_str(json_str).map_err(|e| format!("Failed to parse JSON: {e}"))?;
 
     let system = json
         .get("system")
@@ -88,7 +88,10 @@ fn parse_capabilities_json(json_str: &str) -> Result<DetectedCapabilities, Strin
 
     let portals = json.get("portals").unwrap_or(&serde_json::Value::Null);
 
-    let portal_version = portals.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let portal_version = portals
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
 
     let portal_backend = portals
         .get("backend")
@@ -98,17 +101,17 @@ fn parse_capabilities_json(json_str: &str) -> Result<DetectedCapabilities, Strin
 
     let screencast_version = portals
         .get("screencast_version")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .map(|v| v as u32);
 
     let remote_desktop_version = portals
         .get("remote_desktop_version")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .map(|v| v as u32);
 
     let secret_portal_version = portals
         .get("secret_version")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .map(|v| v as u32);
 
     let deployment = json.get("deployment").unwrap_or(&serde_json::Value::Null);
@@ -118,7 +121,9 @@ fn parse_capabilities_json(json_str: &str) -> Result<DetectedCapabilities, Strin
             .get("context")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown"),
-        deployment.get("linger").and_then(|v| v.as_bool()),
+        deployment
+            .get("linger")
+            .and_then(serde_json::Value::as_bool),
     );
 
     let xdg_runtime_dir = PathBuf::from(
@@ -193,7 +198,7 @@ fn parse_capabilities_json(json_str: &str) -> Result<DetectedCapabilities, Strin
 
     let recommended_fps = hints
         .get("recommended_fps")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .map(|v| v as u32);
 
     let recommended_codec = hints
@@ -203,7 +208,7 @@ fn parse_capabilities_json(json_str: &str) -> Result<DetectedCapabilities, Strin
 
     let zero_copy_available = hints
         .get("zero_copy")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     // Derive available auth methods from services
@@ -328,11 +333,10 @@ pub fn export_capabilities(
     let json = capabilities_to_json(caps)?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create directory: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
 
-    std::fs::write(path, json).map_err(|e| format!("Failed to write file: {}", e))?;
+    std::fs::write(path, json).map_err(|e| format!("Failed to write file: {e}"))?;
 
     Ok(())
 }
@@ -395,7 +399,7 @@ fn capabilities_to_json(caps: &DetectedCapabilities) -> Result<String, String> {
         "detected_at": format!("{:?}", caps.detected_at),
     });
 
-    serde_json::to_string_pretty(&json).map_err(|e| format!("Failed to serialize: {}", e))
+    serde_json::to_string_pretty(&json).map_err(|e| format!("Failed to serialize: {e}"))
 }
 
 /// Detect capabilities without running the binary (mock for testing/demo)

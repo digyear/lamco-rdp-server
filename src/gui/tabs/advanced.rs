@@ -18,6 +18,17 @@ use crate::gui::{
 const DAMAGE_METHODS: &[&str] = &["diff", "pipewire", "hybrid"];
 const HW_QUALITY_PRESETS: &[&str] = &["speed", "balanced", "quality"];
 const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+const TRANSFORM_OPTIONS: &[&str] = &[
+    "auto",
+    "none",
+    "90",
+    "180",
+    "270",
+    "flipped",
+    "flipped-90",
+    "flipped-180",
+    "flipped-270",
+];
 
 /// Superset of video.rs modes: adds "painted" and "predictive" for advanced use.
 const CURSOR_MODES: &[&str] = &["metadata", "painted", "hidden", "predictive"];
@@ -434,11 +445,17 @@ fn view_display_config(state: &AppState) -> Element<'_, Message> {
             "Portal doesn't expose DPI; needs per-monitor DPI detection",
         ),
         space().height(8.0),
-        widgets::toggle_pending_with_note(
-            "Allow Rotation",
-            display.allow_rotation,
-            Message::DisplayAllowRotationToggled,
-            "Rotation transform not yet handled in PipeWire capture pipeline",
+        widgets::labeled_row_with_help(
+            "Frame Transform:",
+            150.0,
+            pick_list(
+                TRANSFORM_OPTIONS.to_vec(),
+                Some(display.frame_transform.as_str()),
+                |s| Message::DisplayFrameTransformChanged(s.to_string()),
+            )
+            .width(Length::Fixed(160.0))
+            .into(),
+            "Auto = read from PipeWire metadata | Others = force specific transform",
         ),
         space().height(12.0),
         text("Allowed Resolutions (empty = all):")

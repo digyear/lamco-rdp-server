@@ -1,10 +1,10 @@
 //! Capability probes for each subsystem.
 
 mod display;
-mod encoding;
+pub(crate) mod encoding;
 mod input;
 mod network;
-mod rendering;
+pub mod rendering;
 mod storage;
 
 use std::{path::Path, process::Command};
@@ -32,8 +32,7 @@ pub mod environment {
         Command::new("which")
             .arg(cmd)
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     pub fn run_command(cmd: &str, args: &[&str]) -> Result<String, std::io::Error> {

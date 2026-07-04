@@ -6,7 +6,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ use crate::{
         error::{ClipboardError, Result},
         provider::{ClipboardProvider, ClipboardProviderEvent},
     },
-    mutter::clipboard::MutterClipboardManager,
+    mutter::clipboard::MutterClipboard,
 };
 
 /// Mutter D-Bus clipboard provider.
@@ -27,7 +27,7 @@ use crate::{
 /// GNOME-specific, zero-dialog clipboard sharing.
 pub struct MutterClipboardProvider {
     /// Mutter clipboard manager
-    clipboard_mgr: Arc<MutterClipboardManager>,
+    clipboard_mgr: Arc<MutterClipboard>,
     /// Channel for sending events to the orchestrator
     event_tx: mpsc::UnboundedSender<ClipboardProviderEvent>,
     /// Receiver end (taken by subscribe())
@@ -38,6 +38,11 @@ pub struct MutterClipboardProvider {
     shutdown_broadcast: tokio::sync::broadcast::Sender<()>,
     /// Task handles for cleanup
     task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Session generation each signal listener last (re)subscribed on. Compared
+    /// against `clipboard_mgr.session_generation()` in `health_check` so a listener
+    /// left on a dead session surfaces as unhealthy instead of silently healthy.
+    owner_gen: Arc<AtomicU64>,
+    transfer_gen: Arc<AtomicU64>,
 }
 
 impl MutterClipboardProvider {
@@ -45,7 +50,7 @@ impl MutterClipboardProvider {
     ///
     /// Enables clipboard and starts signal listeners.
     pub(crate) async fn new(
-        clipboard_mgr: Arc<MutterClipboardManager>,
+        clipboard_mgr: Arc<MutterClipboard>,
     ) -> std::result::Result<Self, anyhow::Error> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (shutdown_broadcast, _) = tokio::sync::broadcast::channel(16);
@@ -63,6 +68,8 @@ impl MutterClipboardProvider {
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_broadcast,
             task_handles: tokio::sync::Mutex::new(Vec::new()),
+            owner_gen: Arc::new(AtomicU64::new(0)),
+            transfer_gen: Arc::new(AtomicU64::new(0)),
         };
 
         provider.start_listeners().await;
@@ -76,92 +83,178 @@ impl MutterClipboardProvider {
     }
 
     async fn start_owner_changed_listener(&self) {
-        use futures_util::StreamExt;
+        let event_tx = self.event_tx.clone();
+        let mut shutdown_rx = self.shutdown_broadcast.subscribe();
+        // Subscribe to rebind BEFORE spawning so no session re-establishment can
+        // slip past between spawn and the first `recv`.
+        let mut rebind_rx = self.clipboard_mgr.subscribe_rebind();
+        let clipboard_mgr = Arc::clone(&self.clipboard_mgr);
+        let owner_gen = Arc::clone(&self.owner_gen);
 
-        match self.clipboard_mgr.subscribe_selection_owner_changed().await {
-            Ok(mut stream) => {
-                let event_tx = self.event_tx.clone();
-                let mut shutdown_rx = self.shutdown_broadcast.subscribe();
-
-                let handle = tokio::spawn(async move {
-                    loop {
+        // The Mutter RemoteDesktop session is re-established on every reconnect
+        // (MutterClipboard::rebind). Re-subscription is driven by the rebind
+        // signal — NOT by stream-end, because destroying the session leaves the
+        // zbus signal-match stream open-but-silent, so `next()` never returns
+        // `None` and a stream-end-only listener would sit on the dead session
+        // forever (Linux→RDP copy silently dead on the 2nd+ connection).
+        let handle = tokio::spawn(async move {
+            use futures_util::StreamExt;
+            'outer: loop {
+                let generation = clipboard_mgr.session_generation();
+                let mut stream = match clipboard_mgr.subscribe_selection_owner_changed().await {
+                    Ok(s) => {
+                        info!(
+                            generation,
+                            "[mutter-clipboard] SelectionOwnerChanged (L→W) listener bound to live session"
+                        );
+                        owner_gen.store(generation, Ordering::Release);
+                        let _ = event_tx.send(ClipboardProviderEvent::ListenerHealth {
+                            healthy: true,
+                            reason: "SelectionOwnerChanged (L→W) listener bound to live session"
+                                .to_string(),
+                        });
+                        s
+                    }
+                    Err(e) => {
+                        warn!(
+                            generation,
+                            "[mutter-clipboard] SelectionOwnerChanged subscribe failed \
+                             (Linux→RDP copy-detect down), retrying: {e}"
+                        );
+                        let _ = event_tx.send(ClipboardProviderEvent::ListenerHealth {
+                            healthy: false,
+                            reason: format!(
+                                "SelectionOwnerChanged (L→W) listener could not bind: {e}"
+                            ),
+                        });
                         tokio::select! {
-                            msg = stream.next() => {
-                                let Some(msg) = msg else { break };
-                                // Parse MIME types from the D-Bus message body
-                                let mime_types = parse_selection_owner_changed(&msg);
-                                if !mime_types.is_empty() {
-                                    debug!(
-                                        "Mutter SelectionOwnerChanged: {} types",
-                                        mime_types.len()
-                                    );
-                                    if event_tx
-                                        .send(ClipboardProviderEvent::SelectionChanged {
-                                            mime_types,
-                                            force: true,
-                                        })
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                            _ = shutdown_rx.recv() => break,
+                            () = tokio::time::sleep(std::time::Duration::from_millis(500)) => continue 'outer,
+                            _ = shutdown_rx.recv() => break 'outer,
                         }
                     }
-                });
+                };
+                loop {
+                    tokio::select! {
+                        // Session re-established — drop the (now-dead) stream and
+                        // re-subscribe on the new session path.
+                        _ = rebind_rx.recv() => {
+                            info!(
+                                "[mutter-clipboard] SelectionOwnerChanged listener: session \
+                                 re-established — re-subscribing on new session"
+                            );
+                            continue 'outer;
+                        }
+                        msg = stream.next() => {
+                            let Some(msg) = msg else {
+                                info!("[mutter-clipboard] SelectionOwnerChanged stream ended — re-subscribing");
+                                tokio::select! {
+                                    () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                                    _ = shutdown_rx.recv() => break 'outer,
+                                }
+                                continue 'outer;
+                            };
+                            let mime_types = parse_selection_owner_changed(&msg);
+                            if !mime_types.is_empty() {
+                                debug!("Mutter SelectionOwnerChanged: {} types", mime_types.len());
+                                if event_tx
+                                    .send(ClipboardProviderEvent::SelectionChanged {
+                                        mime_types,
+                                        force: true,
+                                    })
+                                    .is_err()
+                                {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        _ = shutdown_rx.recv() => break 'outer,
+                    }
+                }
+            }
+        });
 
-                self.task_handles.lock().await.push(handle);
-                info!("Mutter SelectionOwnerChanged listener started");
-            }
-            Err(e) => {
-                warn!("Failed to subscribe to Mutter SelectionOwnerChanged: {e}");
-            }
-        }
+        self.task_handles.lock().await.push(handle);
     }
 
     async fn start_transfer_listener(&self) {
-        use futures_util::StreamExt;
+        let event_tx = self.event_tx.clone();
+        let mut shutdown_rx = self.shutdown_broadcast.subscribe();
+        let mut rebind_rx = self.clipboard_mgr.subscribe_rebind();
+        let clipboard_mgr = Arc::clone(&self.clipboard_mgr);
+        let transfer_gen = Arc::clone(&self.transfer_gen);
 
-        match self.clipboard_mgr.subscribe_selection_transfer().await {
-            Ok(mut stream) => {
-                let event_tx = self.event_tx.clone();
-                let mut shutdown_rx = self.shutdown_broadcast.subscribe();
-
-                let handle = tokio::spawn(async move {
-                    loop {
+        // Mirrors the owner-changed listener: re-subscribe on the rebind signal so
+        // RDP→Linux paste (SelectionTransfer) survives reconnects instead of dying
+        // silently on the destroyed session.
+        let handle = tokio::spawn(async move {
+            use futures_util::StreamExt;
+            'outer: loop {
+                let generation = clipboard_mgr.session_generation();
+                let mut stream = match clipboard_mgr.subscribe_selection_transfer().await {
+                    Ok(s) => {
+                        info!(
+                            generation,
+                            "[mutter-clipboard] SelectionTransfer (W→L) listener bound to live session"
+                        );
+                        transfer_gen.store(generation, Ordering::Release);
+                        let _ = event_tx.send(ClipboardProviderEvent::ListenerHealth {
+                            healthy: true,
+                            reason: "SelectionTransfer (W→L) listener bound to live session"
+                                .to_string(),
+                        });
+                        s
+                    }
+                    Err(e) => {
+                        warn!(
+                            generation,
+                            "[mutter-clipboard] SelectionTransfer subscribe failed \
+                             (RDP→Linux paste down), retrying: {e}"
+                        );
+                        let _ = event_tx.send(ClipboardProviderEvent::ListenerHealth {
+                            healthy: false,
+                            reason: format!("SelectionTransfer (W→L) listener could not bind: {e}"),
+                        });
                         tokio::select! {
-                            msg = stream.next() => {
-                                let Some(msg) = msg else { break };
-                                // Parse serial and MIME type from the D-Bus message
-                                if let Some((serial, mime_type)) = parse_selection_transfer(&msg) {
-                                    debug!(
-                                        "Mutter SelectionTransfer: {} (serial {})",
-                                        mime_type, serial
-                                    );
-                                    if event_tx
-                                        .send(ClipboardProviderEvent::SelectionTransfer {
-                                            serial,
-                                            mime_type,
-                                        })
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                            _ = shutdown_rx.recv() => break,
+                            () = tokio::time::sleep(std::time::Duration::from_millis(500)) => continue 'outer,
+                            _ = shutdown_rx.recv() => break 'outer,
                         }
                     }
-                });
+                };
+                loop {
+                    tokio::select! {
+                        _ = rebind_rx.recv() => {
+                            info!(
+                                "[mutter-clipboard] SelectionTransfer listener: session \
+                                 re-established — re-subscribing on new session"
+                            );
+                            continue 'outer;
+                        }
+                        msg = stream.next() => {
+                            let Some(msg) = msg else {
+                                info!("[mutter-clipboard] SelectionTransfer stream ended — re-subscribing");
+                                tokio::select! {
+                                    () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                                    _ = shutdown_rx.recv() => break 'outer,
+                                }
+                                continue 'outer;
+                            };
+                            if let Some((serial, mime_type)) = parse_selection_transfer(&msg) {
+                                debug!("Mutter SelectionTransfer: {} (serial {})", mime_type, serial);
+                                if event_tx
+                                    .send(ClipboardProviderEvent::SelectionTransfer { serial, mime_type })
+                                    .is_err()
+                                {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        _ = shutdown_rx.recv() => break 'outer,
+                    }
+                }
+            }
+        });
 
-                self.task_handles.lock().await.push(handle);
-                info!("Mutter SelectionTransfer listener started");
-            }
-            Err(e) => {
-                warn!("Failed to subscribe to Mutter SelectionTransfer: {e}");
-            }
-        }
+        self.task_handles.lock().await.push(handle);
     }
 }
 
@@ -264,6 +357,17 @@ impl ClipboardProvider for MutterClipboardProvider {
             .map_err(|e| ClipboardError::PortalError(format!("Mutter SelectionRead failed: {e}")))
     }
 
+    async fn on_remote_gone(&self) -> Result<()> {
+        // Mutter has no "release ownership but keep listening" primitive: an
+        // empty SetSelection is rejected ("Failed to set selection"), and
+        // DisableClipboard would tear down the SelectionOwnerChanged listener the
+        // next client needs. There is nothing safe to call — ownership transfers
+        // naturally when a local app next copies, and the orchestrator's
+        // rdp_ready gate already prevents serving a disconnected remote's
+        // clipboard. So this is intentionally a no-op on the Mutter path.
+        Ok(())
+    }
+
     async fn complete_transfer(
         &self,
         serial: u32,
@@ -293,13 +397,25 @@ impl ClipboardProvider for MutterClipboardProvider {
     }
 
     async fn health_check(&self) -> Result<()> {
-        if self.clipboard_mgr.is_enabled().await {
-            Ok(())
-        } else {
-            Err(ClipboardError::PortalError(
+        if !self.clipboard_mgr.is_enabled().await {
+            return Err(ClipboardError::PortalError(
                 "Mutter clipboard not enabled".to_string(),
-            ))
+            ));
         }
+        // The method path (SetSelection/read/write rebuilds a proxy from the
+        // current path each call) can look healthy while the signal listeners are
+        // stranded on a destroyed session — the silent copy/paste-dead failure.
+        // Verify both listeners are bound to the current session generation.
+        let current = self.clipboard_mgr.session_generation();
+        let owner = self.owner_gen.load(Ordering::Acquire);
+        let transfer = self.transfer_gen.load(Ordering::Acquire);
+        if owner != current || transfer != current {
+            return Err(ClipboardError::PortalError(format!(
+                "clipboard signal listeners stale (session gen {current}; SelectionOwnerChanged \
+                 gen {owner}, SelectionTransfer gen {transfer}) — copy/paste would be silently dead"
+            )));
+        }
+        Ok(())
     }
 
     async fn shutdown(&self) {
@@ -307,7 +423,11 @@ impl ClipboardProvider for MutterClipboardProvider {
         let _ = self.shutdown_broadcast.send(());
 
         if let Err(e) = self.clipboard_mgr.disable().await {
-            warn!("Failed to disable Mutter clipboard on shutdown: {e}");
+            // Expected when the compositor already destroyed the session (e.g.
+            // the user clicked GNOME's "stop sharing"): the RemoteDesktop D-Bus
+            // object is gone, so DisableClipboard cannot succeed. Best-effort
+            // cleanup — not worth a warning.
+            debug!("Mutter clipboard disable skipped (session likely already closed): {e}");
         }
 
         let mut handles = self.task_handles.lock().await;

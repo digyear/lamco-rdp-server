@@ -73,7 +73,7 @@ impl PortalSessionFactory {
     }
 
     fn expects_persistence_rejection(&self) -> bool {
-        self.quirks.contains(&InitQuirk::PersistenceRejected)
+        false // Persistence rejection is handled gracefully in error recovery
     }
 
     /// Attempt to create a session with the given configuration
@@ -157,12 +157,12 @@ impl PortalSessionFactory {
 
         // CRITICAL: Only create ClipboardManager on the retry path (with_persistence=false)
         //
-        // The archive (wrd-server-specs) documents that creating a ClipboardManager on the
-        // first attempt leaves orphaned D-Bus proxy state when that attempt fails. When we
+        // Historical analysis: creating a ClipboardManager on the first attempt
+        // leaves orphaned D-Bus proxy state when that attempt fails. When we
         // then create a second ClipboardManager for the retry, GNOME Shell's Portal backend
         // returns "Invalid state" because it still has state from the first proxy.
         //
-        // The working pattern from the archive:
+        // The working pattern:
         // - First attempt: Pass None for clipboard (don't create ClipboardManager)
         // - Retry attempt: Create ClipboardManager and pass it (only one ever exists)
         // - BUT: If service registry says clipboard is unavailable, NEVER create it
@@ -254,60 +254,8 @@ impl SessionFactory for PortalSessionFactory {
                 .collect::<Vec<_>>()
         );
 
-        // Skip first session if GNOME (always rejects persistence)
-        // This avoids a portal daemon state bug where first failed session
-        // prevents second session's clipboard.request() from working
-        // See: docs/CLIPBOARD-FINAL-ANALYSIS.md
-        if self.quirks.contains(&InitQuirk::PersistenceRejected) {
-            info!("Skipping persistence attempt (portal backend rejects it)");
-            trace!("Going directly to session without persistence");
-            let (portal_handle, new_token, active_manager, clipboard_mgr) =
-                self.attempt_session(false).await?;
-
-            // Save token and build handle (same as retry path)
-            if let Some(ref token) = new_token {
-                info!("Received restore token, saving...");
-                self.token_manager
-                    .save_token("default", token)
-                    .await
-                    .context("Failed to save restore token")?;
-                info!("Restore token saved");
-            }
-
-            let pipewire_fd = portal_handle.pipewire_fd();
-            let streams: Vec<StreamInfo> = portal_handle
-                .streams()
-                .iter()
-                .map(|s| StreamInfo {
-                    node_id: s.node_id,
-                    width: s.size.0,
-                    height: s.size.1,
-                    position_x: s.position.0,
-                    position_y: s.position.1,
-                })
-                .collect();
-
-            let session = portal_handle.session;
-            let handle = PortalSessionHandleImpl {
-                pipewire_fd,
-                streams,
-                remote_desktop: active_manager.remote_desktop().clone(),
-                session: Arc::new(tokio::sync::RwLock::new(session)),
-                clipboard_manager: clipboard_mgr,
-                session_type: SessionType::Portal,
-                session_valid: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                health_reporter: Arc::new(std::sync::OnceLock::new()),
-            };
-
-            // Start listening for Portal Closed signal (proactive session death detection)
-            handle.start_closed_listener().await;
-
-            info!("Session created successfully via PortalSessionFactory");
-            return Ok(Arc::new(handle));
-        }
-
-        // Standard two-attempt flow for non-GNOME compositors
-        // First attempt: with persistence
+        // Two-attempt flow: try with persistence first, retry without on rejection.
+        // Persistence rejection is handled gracefully in error recovery.
         // Clipboard is created inside attempt_session, in the same D-Bus context
         let first_result = self.attempt_session(true).await;
 
@@ -321,10 +269,7 @@ impl SessionFactory for PortalSessionFactory {
                     return Err(e).context("Session creation failed");
                 }
 
-                info!(
-                    quirk = "PersistenceRejected",
-                    "Retrying without persistence"
-                );
+                info!("Retrying without persistence");
 
                 // Wait for Portal backend to clean up the failed session
                 // The AsyncSessionCleanup quirk indicates sessions need time to release resources
@@ -382,6 +327,7 @@ impl SessionFactory for PortalSessionFactory {
             clipboard_manager: clipboard_mgr,
             session_type: SessionType::Portal,
             session_valid: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            stream_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             health_reporter: Arc::new(std::sync::OnceLock::new()),
         };
 
@@ -438,10 +384,7 @@ impl PortalSessionHandleImpl {
         pipewire_fd: i32,
         streams: Vec<StreamInfo>,
         remote_desktop: Arc<lamco_portal::RemoteDesktopManager>,
-        session: ashpd::desktop::Session<
-            'static,
-            ashpd::desktop::remote_desktop::RemoteDesktop<'static>,
-        >,
+        session: ashpd::desktop::Session<ashpd::desktop::remote_desktop::RemoteDesktop>,
         clipboard_manager: Option<Arc<lamco_portal::ClipboardManager>>,
     ) -> Self {
         Self {
@@ -452,6 +395,7 @@ impl PortalSessionHandleImpl {
             clipboard_manager,
             session_type: SessionType::Portal,
             session_valid: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            stream_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             health_reporter: Arc::new(std::sync::OnceLock::new()),
         }
     }

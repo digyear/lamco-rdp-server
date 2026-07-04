@@ -30,14 +30,7 @@ pub struct PortalClipboardProvider {
     /// Portal clipboard manager from lamco-portal
     portal: Arc<crate::portal::PortalClipboardManager>,
     /// Portal RemoteDesktop session (shared with input handler)
-    session: Arc<
-        RwLock<
-            ashpd::desktop::Session<
-                'static,
-                ashpd::desktop::remote_desktop::RemoteDesktop<'static>,
-            >,
-        >,
-    >,
+    session: Arc<RwLock<ashpd::desktop::Session<ashpd::desktop::remote_desktop::RemoteDesktop>>>,
     /// Session validity — mirrors the flag on PortalSessionHandleImpl.
     /// When false, the compositor has destroyed the session and all
     /// Portal D-Bus calls will fail with "Invalid session".
@@ -68,12 +61,7 @@ impl PortalClipboardProvider {
     pub async fn new(
         portal: Arc<crate::portal::PortalClipboardManager>,
         session: Arc<
-            RwLock<
-                ashpd::desktop::Session<
-                    'static,
-                    ashpd::desktop::remote_desktop::RemoteDesktop<'static>,
-                >,
-            >,
+            RwLock<ashpd::desktop::Session<ashpd::desktop::remote_desktop::RemoteDesktop>>,
         >,
         session_valid: Arc<AtomicBool>,
         rate_limit_ms: u64,
@@ -363,6 +351,20 @@ impl ClipboardProvider for PortalClipboardProvider {
             .await
             .map_err(|e| ClipboardError::PortalError(format!("Failed to read clipboard: {e}")))?;
         Ok(data)
+    }
+
+    async fn on_remote_gone(&self) -> Result<()> {
+        // If the compositor already tore down the session there is nothing left
+        // to release. Otherwise announce an empty format set to drop ownership.
+        if !self.session_valid.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let session_guard = self.session.read().await;
+        self.portal
+            .announce_rdp_formats(&session_guard, Vec::new())
+            .await
+            .map_err(|e| ClipboardError::PortalError(format!("Portal release failed: {e}")))?;
+        Ok(())
     }
 
     async fn complete_transfer(

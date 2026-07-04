@@ -338,28 +338,51 @@ impl EncodingProbe {
 
         #[cfg(feature = "h264")]
         {
-            debug!("OpenH264 software encoder available (h264 feature enabled)");
-            (
-                Some(EncoderBackend {
-                    backend_type: EncoderBackendType::OpenH264,
-                    device: None,
-                    capabilities: EncoderCapabilities {
-                        h264: true,
-                        h264_profiles: vec!["baseline".into(), "main".into(), "high".into()],
-                        hevc: false,
-                        av1: false,
-                        max_resolution: (4096, 4096),
-                        max_fps: 60,
-                    },
-                    service_level: ServiceLevel::Fallback,
-                }),
-                AttemptResult {
-                    strategy_name: "OpenH264".into(),
-                    success: true,
-                    error: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                },
-            )
+            // Runtime verification: actually load the library, don't just check the feature flag.
+            // The library is cached in OnceLock for reuse at encoder creation time.
+            match crate::egfx::encoder::load_openh264_api() {
+                Ok(api) => {
+                    let caps_str = format!("{}", api.capabilities);
+                    info!("OpenH264 runtime library verified: {caps_str}");
+                    (
+                        Some(EncoderBackend {
+                            backend_type: EncoderBackendType::OpenH264,
+                            device: Some(caps_str),
+                            capabilities: EncoderCapabilities {
+                                h264: true,
+                                h264_profiles: vec![
+                                    "baseline".into(),
+                                    "main".into(),
+                                    "high".into(),
+                                ],
+                                hevc: false,
+                                av1: false,
+                                max_resolution: (4096, 4096),
+                                max_fps: 60,
+                            },
+                            service_level: ServiceLevel::Fallback,
+                        }),
+                        AttemptResult {
+                            strategy_name: "OpenH264".into(),
+                            success: true,
+                            error: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                    )
+                }
+                Err(e) => {
+                    info!("OpenH264 runtime library not available: {e}");
+                    (
+                        None,
+                        AttemptResult {
+                            strategy_name: "OpenH264".into(),
+                            success: false,
+                            error: Some(format!("{e}")),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                    )
+                }
+            }
         }
 
         #[cfg(not(feature = "h264"))]

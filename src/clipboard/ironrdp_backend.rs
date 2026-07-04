@@ -216,6 +216,22 @@ impl LamcoCliprdrFactory {
                                 .await;
                         }
 
+                        ClipboardEvent::RemoteFileList {
+                            files,
+                            clip_data_id,
+                        } => {
+                            info!(
+                                "🔗 Bridge: RDP RemoteFileList ({} files) → ClipboardManager",
+                                files.len()
+                            );
+                            let _ = manager_tx
+                                .send(crate::clipboard::ClipboardEvent::RdpRemoteFileList {
+                                    files,
+                                    clip_data_id,
+                                })
+                                .await;
+                        }
+
                         _ => {
                             // Other events (NegotiatedCapabilities, Lock, Unlock) not critical yet
                         }

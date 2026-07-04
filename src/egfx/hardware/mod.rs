@@ -55,11 +55,16 @@ pub mod vaapi;
 #[cfg(feature = "nvenc")]
 pub mod nvenc;
 
+#[cfg(feature = "vulkan-video")]
+pub mod vulkan;
+
 // Re-exports
 #[cfg(feature = "nvenc")]
 pub use error::NvencError;
 #[cfg(feature = "vaapi")]
 pub use error::VaapiError;
+#[cfg(feature = "vulkan-video")]
+pub use error::VulkanVideoError;
 pub use error::{HardwareEncoderError, HardwareEncoderResult};
 pub use factory::create_hardware_encoder;
 pub use stats::{EncodeTimer, HardwareEncoderStats};
@@ -190,6 +195,76 @@ pub trait HardwareEncoder {
         None
     }
 
+    /// Encode directly from a DMA-BUF descriptor (zero-copy path).
+    ///
+    /// When the PipeWire capture delivers DMA-BUF frames and this encoder
+    /// supports direct GPU import, this method avoids CPU pixel copies entirely.
+    ///
+    /// Default implementation falls back to mmap + encode_bgra.
+    #[expect(
+        unsafe_code,
+        reason = "mmap/munmap required for DMA-BUF CPU fallback access"
+    )]
+    fn encode_dmabuf(
+        &mut self,
+        desc: &lamco_pipewire::DmaBufDescriptor,
+        timestamp_ms: u64,
+    ) -> HardwareEncoderResult<Option<H264Frame>> {
+        // Default: mmap the DMA-BUF to CPU memory and use the BGRA path.
+        // Backends that support GPU import override this.
+        use std::os::fd::AsRawFd;
+
+        if desc.planes.is_empty() {
+            return Err(HardwareEncoderError::EncodeFailed(
+                "DmaBufDescriptor has no planes".into(),
+            ));
+        }
+
+        let plane = &desc.planes[0];
+        let size = (desc.height * plane.stride) as usize;
+
+        // SAFETY: plane.fd is a valid OwnedFd from the PipeWire dup path.
+        // mmap is read-only and we copy into a Vec immediately.
+        let data = unsafe {
+            use std::{num::NonZeroUsize, os::fd::BorrowedFd};
+
+            use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
+
+            let nz_size = NonZeroUsize::new(size).ok_or_else(|| {
+                HardwareEncoderError::EncodeFailed("DMA-BUF plane has zero size".into())
+            })?;
+
+            let borrowed = BorrowedFd::borrow_raw(plane.fd.as_raw_fd());
+            let ptr = mmap(
+                None,
+                nz_size,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                borrowed,
+                plane.offset as i64,
+            )
+            .map_err(|e| HardwareEncoderError::EncodeFailed(format!("DMA-BUF mmap failed: {e}")))?;
+
+            let mut vec = Vec::with_capacity(size);
+            std::ptr::copy_nonoverlapping(ptr.as_ptr() as *const u8, vec.as_mut_ptr(), size);
+            vec.set_len(size);
+
+            let _ = munmap(ptr, size);
+            vec
+        };
+
+        self.encode_bgra(&data, desc.width, desc.height, timestamp_ms)
+    }
+
+    /// Whether this encoder supports direct DMA-BUF import (zero-copy).
+    ///
+    /// When true, `encode_dmabuf` imports the GPU buffer directly without
+    /// CPU-side pixel copies. When false, `encode_dmabuf` falls back to
+    /// mmap + `encode_bgra`.
+    fn supports_dmabuf_import(&self) -> bool {
+        false
+    }
+
     /// Flush pending frames from encoder
     ///
     /// Called before encoder destruction or when switching modes.
@@ -260,7 +335,11 @@ impl std::fmt::Display for QualityPreset {
 
 #[inline]
 pub const fn is_hardware_encoding_available() -> bool {
-    cfg!(any(feature = "vaapi", feature = "nvenc"))
+    cfg!(any(
+        feature = "vaapi",
+        feature = "nvenc",
+        feature = "vulkan-video"
+    ))
 }
 
 pub fn available_backends() -> Vec<&'static str> {
@@ -271,6 +350,9 @@ pub fn available_backends() -> Vec<&'static str> {
 
     #[cfg(feature = "nvenc")]
     backends.push("nvenc");
+
+    #[cfg(feature = "vulkan-video")]
+    backends.push("vulkan-video");
 
     backends
 }

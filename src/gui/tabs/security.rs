@@ -22,7 +22,7 @@ fn get_auth_methods(state: &AppState) -> Vec<&str> {
         // Use dynamic list from service registry
         caps.available_auth_methods
             .iter()
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
             .collect()
     } else {
         // Fall back to defaults until capabilities detected
@@ -215,9 +215,10 @@ fn view_cert_gen_dialog(cert_state: &crate::gui::state::CertGenState) -> Element
         ]
         .spacing(8)
         .padding(20)
-        .width(Length::Fixed(450.0)),
+        .width(Length::Fill),
     )
     .padding(2)
+    .max_width(500.0)
     .style(theme::section_container_style)
     .into()
 }

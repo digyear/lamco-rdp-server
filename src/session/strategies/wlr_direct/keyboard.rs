@@ -313,10 +313,7 @@ mod tests {
             }
             Err(e) => {
                 // This may fail in minimal test environments without XKB installed
-                println!(
-                    "XKB keymap generation failed (expected in some test envs): {}",
-                    e
-                );
+                println!("XKB keymap generation failed (expected in some test envs): {e}");
             }
         }
 
@@ -328,10 +325,7 @@ mod tests {
                 println!("Generated keymap (us): {} bytes", keymap.len());
             }
             Err(e) => {
-                println!(
-                    "XKB keymap generation for 'us' failed (expected in some test envs): {}",
-                    e
-                );
+                println!("XKB keymap generation for 'us' failed (expected in some test envs): {e}");
             }
         }
     }
@@ -355,7 +349,7 @@ mod tests {
             }
             Err(e) => {
                 // This may fail on very old kernels (< 3.17)
-                println!("memfd creation failed (expected on old kernels): {}", e);
+                println!("memfd creation failed (expected on old kernels): {e}");
             }
         }
     }
@@ -372,7 +366,7 @@ mod tests {
                 assert_eq!(metadata.st_size as usize, large_keymap.len());
             }
             Err(e) => {
-                println!("memfd creation failed: {}", e);
+                println!("memfd creation failed: {e}");
             }
         }
     }

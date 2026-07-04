@@ -2,9 +2,12 @@
     unsafe_code,
     reason = "C FFI types: mem::zeroed for POD structs, raw pointer access for encoded frame extraction"
 )]
-// Field names match the OpenH264 C API exactly — renaming would break FFI layout.
-// Dead code allowed: complete API binding — constants/fields used on demand.
-#![allow(non_snake_case, non_camel_case_types, dead_code)]
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    dead_code,
+    reason = "field names mirror the OpenH264 C API verbatim (renaming breaks FFI layout); the binding is complete, so some constants/fields are used only on demand"
+)]
 
 //! Version-specific FFI struct definitions for OpenH264.
 //!
@@ -71,8 +74,16 @@ pub(crate) const WELS_LOG_WARNING: c_int = 2;
 pub(crate) const RC_QUALITY_MODE: RC_MODES = 0;
 pub(crate) const RC_BITRATE_MODE: RC_MODES = 1;
 
-// SPS/PPS ID strategy constants
-pub(crate) const CONSTANT_ID: EParameterSetStrategy = 1;
+// SPS/PPS ID strategy constants (from OpenH264 EParameterSetStrategy enum)
+// CRITICAL: These values must match the OpenH264 API exactly.
+// Previous bug: CONSTANT_ID was incorrectly set to 1 (INCREASING_ID),
+// causing different SPS bytes between Main and Aux AVC444 IDR encodes,
+// which made MSTSC close the EGFX DVC channel.
+pub(crate) const CONSTANT_ID: EParameterSetStrategy = 0;
+#[expect(dead_code, reason = "defined for reference and future use")]
+pub(crate) const INCREASING_ID: EParameterSetStrategy = 1;
+#[expect(dead_code, reason = "defined for reference and future use")]
+pub(crate) const SPS_LISTING: EParameterSetStrategy = 2;
 
 /// OpenH264 version struct. Stable across all versions.
 #[repr(C)]
@@ -96,6 +107,7 @@ pub(crate) struct SSliceArgument {
 
 impl Default for SSliceArgument {
     fn default() -> Self {
+        // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
         unsafe { std::mem::zeroed() }
     }
 }
@@ -128,6 +140,7 @@ pub(crate) struct SSpatialLayerConfig {
 
 impl Default for SSpatialLayerConfig {
     fn default() -> Self {
+        // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
         unsafe { std::mem::zeroed() }
     }
 }
@@ -181,6 +194,7 @@ pub(crate) struct ISVCEncoderVtbl {
 
 impl Default for ISVCEncoderVtbl {
     fn default() -> Self {
+        // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
         unsafe { std::mem::zeroed() }
     }
 }
@@ -211,6 +225,7 @@ pub(crate) mod abi7 {
 
     impl Default for SLayerBSInfo {
         fn default() -> Self {
+            // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
             unsafe { std::mem::zeroed() }
         }
     }
@@ -227,6 +242,7 @@ pub(crate) mod abi7 {
 
     impl Default for SFrameBSInfo {
         fn default() -> Self {
+            // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
             unsafe { std::mem::zeroed() }
         }
     }
@@ -244,6 +260,7 @@ pub(crate) mod abi7 {
 
     impl Default for SSourcePicture {
         fn default() -> Self {
+            // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
             unsafe { std::mem::zeroed() }
         }
     }
@@ -295,6 +312,7 @@ pub(crate) mod abi7 {
 
     impl Default for SEncParamExt {
         fn default() -> Self {
+            // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
             unsafe { std::mem::zeroed() }
         }
     }
@@ -327,6 +345,7 @@ pub(crate) mod abi8 {
 
     impl Default for SLayerBSInfo {
         fn default() -> Self {
+            // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
             unsafe { std::mem::zeroed() }
         }
     }
@@ -343,6 +362,7 @@ pub(crate) mod abi8 {
 
     impl Default for SFrameBSInfo {
         fn default() -> Self {
+            // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
             unsafe { std::mem::zeroed() }
         }
     }
@@ -363,6 +383,7 @@ pub(crate) mod abi8 {
 
     impl Default for SSourcePicture {
         fn default() -> Self {
+            // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
             unsafe { std::mem::zeroed() }
         }
     }
@@ -417,6 +438,7 @@ pub(crate) mod abi8 {
 
     impl Default for SEncParamExt {
         fn default() -> Self {
+            // SAFETY: a `#[repr(C)]` FFI aggregate of integers, raw pointers, bools, fixed arrays, and `Option<unsafe extern "C" fn>` — every field has a valid all-zero representation (null pointers, zero counts, `false`, `None`). OpenH264 requires these structs zero-initialized before the library fills them.
             unsafe { std::mem::zeroed() }
         }
     }

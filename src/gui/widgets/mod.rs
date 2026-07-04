@@ -33,7 +33,7 @@ pub fn labeled_row_with_help<'a>(
             .align_y(Alignment::Center),
         row![
             space().width(label_width),
-            text(format!("ⓘ {}", help_text))
+            text(format!("ⓘ {help_text}"))
                 .size(12)
                 .style(|_theme| text::Style {
                     color: Some(theme::colors::TEXT_MUTED),
@@ -44,7 +44,7 @@ pub fn labeled_row_with_help<'a>(
     .into()
 }
 
-pub fn section_header<'a>(title: &'a str) -> Element<'a, Message> {
+pub fn section_header(title: &str) -> Element<'_, Message> {
     text(title)
         .size(20)
         .style(|_theme| text::Style {
@@ -53,7 +53,7 @@ pub fn section_header<'a>(title: &'a str) -> Element<'a, Message> {
         .into()
 }
 
-pub fn subsection_header<'a>(title: &'a str) -> Element<'a, Message> {
+pub fn subsection_header(title: &str) -> Element<'_, Message> {
     text(title)
         .size(16)
         .style(|_theme| text::Style {
@@ -62,11 +62,7 @@ pub fn subsection_header<'a>(title: &'a str) -> Element<'a, Message> {
         .into()
 }
 
-pub fn collapsible_header<'a>(
-    title: &'a str,
-    expanded: bool,
-    on_toggle: Message,
-) -> Element<'a, Message> {
+pub fn collapsible_header(title: &str, expanded: bool, on_toggle: Message) -> Element<'_, Message> {
     let icon = if expanded { "▼" } else { "▶" };
 
     button(
@@ -120,7 +116,7 @@ pub fn toggle_with_help<'a>(
         ]
         .spacing(10)
         .align_y(Alignment::Center),
-        text(format!("ⓘ {}", help_text))
+        text(format!("ⓘ {help_text}"))
             .size(12)
             .style(|_theme| text::Style {
                 color: Some(theme::colors::TEXT_MUTED),
@@ -152,7 +148,7 @@ pub fn slider_with_value<'a>(
 ) -> Element<'a, Message> {
     row![
         slider(min..=max, value, on_change).width(Length::FillPortion(3)),
-        text(format!("{} {}", value, unit))
+        text(format!("{value} {unit}"))
             .width(Length::FillPortion(1))
             .align_x(iced::alignment::Horizontal::Right),
     ]
@@ -171,7 +167,7 @@ pub fn float_slider<'a>(
     row![
         slider(0..=100, int_value, move |v| on_change(v as f32 / 100.0))
             .width(Length::FillPortion(3)),
-        text(format!("{:.2}", value))
+        text(format!("{value:.2}"))
             .width(Length::FillPortion(1))
             .align_x(iced::alignment::Horizontal::Right),
     ]
@@ -263,8 +259,8 @@ where
 }
 
 /// Simple help text displayed in muted style
-pub fn help_text<'a>(text_content: &'a str) -> Element<'a, Message> {
-    text(format!("ⓘ {}", text_content))
+pub fn help_text(text_content: &str) -> Element<'_, Message> {
+    text(format!("ⓘ {text_content}"))
         .size(12)
         .style(|_theme| text::Style {
             color: Some(theme::colors::TEXT_MUTED),
@@ -272,7 +268,7 @@ pub fn help_text<'a>(text_content: &'a str) -> Element<'a, Message> {
         .into()
 }
 
-pub fn info_box<'a>(text_content: &'a str) -> Element<'a, Message> {
+pub fn info_box(text_content: &str) -> Element<'_, Message> {
     container(
         row![text("ⓘ").size(16), text(text_content).size(13),]
             .spacing(8)
@@ -293,7 +289,7 @@ pub fn info_box<'a>(text_content: &'a str) -> Element<'a, Message> {
     .into()
 }
 
-pub fn warning_box<'a>(text_content: &'a str) -> Element<'a, Message> {
+pub fn warning_box(text_content: &str) -> Element<'_, Message> {
     container(
         row![text("⚠").size(16), text(text_content).size(13),]
             .spacing(8)
@@ -314,7 +310,7 @@ pub fn warning_box<'a>(text_content: &'a str) -> Element<'a, Message> {
     .into()
 }
 
-pub fn error_box<'a>(text_content: &'a str) -> Element<'a, Message> {
+pub fn error_box(text_content: &str) -> Element<'_, Message> {
     container(
         row![text("✗").size(16), text(text_content).size(13),]
             .spacing(8)
@@ -335,7 +331,7 @@ pub fn error_box<'a>(text_content: &'a str) -> Element<'a, Message> {
     .into()
 }
 
-pub fn success_box<'a>(text_content: &'a str) -> Element<'a, Message> {
+pub fn success_box(text_content: &str) -> Element<'_, Message> {
     container(
         row![text("✓").size(16), text(text_content).size(13),]
             .spacing(8)
@@ -356,7 +352,7 @@ pub fn success_box<'a>(text_content: &'a str) -> Element<'a, Message> {
     .into()
 }
 
-pub fn section_container<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
+pub fn section_container(content: Element<'_, Message>) -> Element<'_, Message> {
     container(content)
         .padding(20)
         .width(Length::Fill)
@@ -427,7 +423,7 @@ pub fn labeled_row_pending_with_note<'a>(
         .align_y(Alignment::Center),
         row![
             space().width(label_width),
-            text(format!("⚠ {}", note))
+            text(format!("⚠ {note}"))
                 .size(11)
                 .style(|_theme| text::Style {
                     color: Some(theme::colors::WARNING.scale_alpha(0.7)),
@@ -454,7 +450,7 @@ pub fn toggle_pending_with_note<'a>(
         ]
         .spacing(10)
         .align_y(Alignment::Center),
-        text(format!("⚠ {}", note))
+        text(format!("⚠ {note}"))
             .size(11)
             .style(|_theme| text::Style {
                 color: Some(theme::colors::WARNING.scale_alpha(0.7)),
@@ -485,7 +481,7 @@ pub fn address_input<'a>(
     on_port_change: impl Fn(String) -> Message + 'a,
 ) -> Element<'a, Message> {
     row![
-        text_input("0.0.0.0", ip)
+        text_input("[::]", ip)
             .on_input(on_ip_change)
             .width(Length::Fixed(150.0))
             .style(theme::text_input_style),
@@ -502,7 +498,7 @@ pub fn address_input<'a>(
     .into()
 }
 
-pub fn status_indicator<'a>(running: bool, status_text: &'a str) -> Element<'a, Message> {
+pub fn status_indicator(running: bool, status_text: &str) -> Element<'_, Message> {
     let color = theme::status_indicator_color(running);
     row![
         text("●")

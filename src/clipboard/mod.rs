@@ -53,6 +53,7 @@
 // Server-specific modules (policy and orchestration)
 pub mod cooperation;
 pub mod error;
+pub mod file_transfer;
 pub mod fuse;
 pub mod ironrdp_backend;
 pub mod klipper;
@@ -68,8 +69,7 @@ pub mod sync;
 pub use cooperation::{CooperationEvent, CooperationStats, KlipperCooperationCoordinator};
 pub use error::{ClipboardError, ErrorContext, ErrorType, RecoveryAction, Result, RetryConfig};
 pub use fuse::{
-    FileContentsRequest, FileContentsResponse, FileDescriptor, FuseMount,
-    generate_gnome_copied_files_content, generate_uri_list_content, get_mount_point,
+    FileContentsRequest, FileContentsResponse, FileDescriptor, FuseMount, get_mount_point,
 };
 pub use ironrdp_backend::LamcoCliprdrFactory;
 pub use klipper::{KlipperInfo, KlipperMonitor};

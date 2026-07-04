@@ -154,25 +154,23 @@ impl ServiceRegistry {
     /// Codec names suitable for IronRDP's `server_codecs_capabilities()`.
     /// Order reflects preference based on available services.
     pub fn recommended_codecs(&self) -> Vec<&'static str> {
-        let mut codecs = Vec::new();
-
+        let video_level = self.service_level(ServiceId::VideoCapture);
         let dmabuf_level = self.service_level(ServiceId::DmaBufZeroCopy);
         let damage_level = self.service_level(ServiceId::DamageTracking);
 
-        // If we have guaranteed zero-copy, prefer AVC444 for quality
-        // Otherwise, stick with AVC420 which is more compatible
-        if dmabuf_level >= ServiceLevel::Guaranteed && damage_level >= ServiceLevel::Guaranteed {
-            // Optimal path: zero-copy + good damage tracking
-            // Note: In practice, AVC444 requires both main and aux streams working
-            // For now, always prefer AVC420 as it's more reliable
-            codecs.push("remotefx");
-        } else if damage_level >= ServiceLevel::BestEffort {
-            // Good damage tracking means we can be efficient
-            codecs.push("remotefx");
-        } else {
-            // Fallback: basic RemoteFX
-            codecs.push("remotefx");
+        let mut codecs = Vec::new();
+
+        if video_level >= ServiceLevel::Guaranteed {
+            // H.264 encoder verified available
+            if dmabuf_level >= ServiceLevel::Guaranteed && damage_level >= ServiceLevel::Guaranteed
+            {
+                codecs.push("avc444");
+            }
+            codecs.push("avc420");
         }
+
+        // RemoteFX bitmap is always available as fallback
+        codecs.push("remotefx");
 
         codecs
     }
@@ -352,9 +350,10 @@ mod tests {
         let caps = make_test_caps();
         let registry = ServiceRegistry::from_compositor(caps);
 
-        // Video capture should be guaranteed on GNOME with portal
+        // Video capture: BestEffort without H.264 encoder, Guaranteed with
         let level = registry.service_level(ServiceId::VideoCapture);
-        assert_eq!(level, ServiceLevel::Guaranteed);
+        // Test caps have encoding: None (no OpenH264 in test), so BestEffort
+        assert_eq!(level, ServiceLevel::BestEffort);
     }
 
     #[test]

@@ -21,6 +21,17 @@ fn main() {
     let git_hash = run_command("git", &["rev-parse", "--short", "HEAD"], "unknown");
     println!("cargo:rustc-env=GIT_HASH={git_hash}");
 
-    // Re-run if git HEAD changes
+    // Re-run when HEAD or the resolved ref target changes.
+    //
+    // .git/HEAD is a symbolic ref on a branch (e.g. "ref: refs/heads/main") and
+    // its file contents do not change between commits — only the resolved target
+    // (.git/refs/heads/<branch> for loose refs, .git/packed-refs after gc) does.
+    // Watching only .git/HEAD leaves GIT_HASH stale across same-branch commits.
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD")
+        && let Some(ref_path) = head.trim().strip_prefix("ref: ")
+    {
+        println!("cargo:rerun-if-changed=.git/{ref_path}");
+    }
 }

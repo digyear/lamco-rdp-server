@@ -93,6 +93,9 @@ pub fn view_egfx_tab(state: &AppState) -> Element<'_, Message> {
             .into(),
             "Auto = best available | AVC420 = 4:2:0 | AVC444 = 4:4:4 (best quality)",
         ),
+        // Cisco OpenH264 patent-license attribution, shown where the H.264 codec
+        // is controlled. Software H.264 uses Cisco's separately installed binary.
+        text(crate::third_party::OPENH264_ATTRIBUTION).size(11),
         space().height(12.0),
         widgets::labeled_row_with_help(
             "Periodic Keyframe:",

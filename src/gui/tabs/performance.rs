@@ -17,124 +17,148 @@ use crate::gui::{
 const LATENCY_MODES: &[&str] = &["interactive", "balanced", "quality"];
 
 pub fn view_performance_tab(state: &AppState) -> Element<'_, Message> {
-    column![
+    let mut content = column![
         // Section header
         widgets::section_header("Performance Configuration"),
         space().height(16.0),
-        // Preset buttons
-        text("Preset Profiles:").size(14),
-        space().height(8.0),
-        row![
-            button(text("Interactive"))
-                .on_press(Message::PerformancePresetSelected(
-                    PerformancePreset::Interactive
-                ))
-                .padding([8, 16])
-                .style(theme::preset_button_style(
-                    state.active_preset.as_deref() == Some("interactive")
-                )),
-            button(text("Balanced"))
-                .on_press(Message::PerformancePresetSelected(
-                    PerformancePreset::Balanced
-                ))
-                .padding([8, 16])
-                .style(theme::preset_button_style(
-                    state.active_preset.as_deref() == Some("balanced")
-                )),
-            button(text("Quality"))
-                .on_press(Message::PerformancePresetSelected(
-                    PerformancePreset::Quality
-                ))
-                .padding([8, 16])
-                .style(theme::preset_button_style(
-                    state.active_preset.as_deref() == Some("quality")
-                )),
-        ]
-        .spacing(8),
-        space().height(8.0),
-        text("Interactive: <50ms latency | Balanced: <100ms | Quality: Best image quality")
-            .size(12)
-            .style(|_theme: &iced::Theme| text::Style {
-                color: Some(theme::colors::TEXT_MUTED),
-            }),
-        space().height(20.0),
-        // Threading section
-        widgets::collapsible_header(
-            "Threading",
-            true,                                          // Always expanded for this section
-            Message::PerformanceAdaptiveFpsToggleExpanded, // Placeholder
-        ),
-        space().height(8.0),
-        widgets::labeled_row_with_help(
-            "Encoder Threads:",
-            150.0,
-            widgets::number_input(
-                &state.edit_strings.encoder_threads,
-                "0",
-                80.0,
-                Message::PerformanceEncoderThreadsChanged,
-            ),
-            "0 = Auto-detect CPU cores, or specify 1-16",
-        ),
-        space().height(12.0),
-        widgets::labeled_row_pending_with_note(
-            "Network Threads:",
-            150.0,
-            widgets::number_input(
-                &state.edit_strings.network_threads,
-                "0",
-                80.0,
-                Message::PerformanceNetworkThreadsChanged,
-            ),
-            "Tokio runtime uses default multi-threaded executor",
-        ),
-        space().height(12.0),
-        widgets::labeled_row_pending_with_note(
-            "Buffer Pool Size:",
-            150.0,
-            widgets::number_input(
-                &state.edit_strings.buffer_pool_size,
-                "16",
-                80.0,
-                Message::PerformanceBufferPoolSizeChanged,
-            ),
-            "Frame buffer pool not yet implemented",
-        ),
-        space().height(12.0),
-        widgets::toggle_pending_with_note(
-            "Enable Zero-Copy Operations",
-            state.config.performance.zero_copy,
-            Message::PerformanceZeroCopyToggled,
-            "Auto-detected from compositor DMA-BUF support; manual override not yet wired",
-        ),
-        space().height(20.0),
-        // Adaptive FPS section
-        widgets::collapsible_header(
-            "Adaptive FPS",
-            state.adaptive_fps_expanded,
-            Message::PerformanceAdaptiveFpsToggleExpanded,
-        ),
-        if state.adaptive_fps_expanded {
-            view_adaptive_fps_config(state)
-        } else {
-            column![].into()
-        },
-        space().height(16.0),
-        // Latency Governor section
-        widgets::collapsible_header(
-            "Latency Governor",
-            state.latency_expanded,
-            Message::PerformanceLatencyToggleExpanded,
-        ),
-        if state.latency_expanded {
-            view_latency_config(state)
-        } else {
-            column![].into()
-        },
     ]
-    .spacing(4)
-    .padding(20)
-    .into()
+    .spacing(4);
+
+    // Live metrics summary (when available, before config controls)
+    if let Some(ref metrics) = state.live_metrics {
+        content = content
+            .push(row![
+                text(format!(
+                    "Live: {} FPS | {:.0}ms latency | {} ({}) | queue {}",
+                    metrics.fps,
+                    metrics.latency_ms,
+                    metrics.activity_level,
+                    if metrics.damage_source.is_empty() {
+                        "unknown"
+                    } else {
+                        &metrics.damage_source
+                    },
+                    metrics.queue_depth
+                ))
+                .size(13)
+                .color(crate::gui::theme::colors::TEXT_MUTED),
+            ])
+            .push(space().height(12.0));
+    }
+
+    content = content.push(
+        column![
+            // Preset buttons
+            text("Preset Profiles:").size(14),
+            space().height(8.0),
+            row![
+                button(text("Interactive"))
+                    .on_press(Message::PerformancePresetSelected(
+                        PerformancePreset::Interactive
+                    ))
+                    .padding([8, 16])
+                    .style(theme::preset_button_style(
+                        state.active_preset.as_deref() == Some("interactive")
+                    )),
+                button(text("Balanced"))
+                    .on_press(Message::PerformancePresetSelected(
+                        PerformancePreset::Balanced
+                    ))
+                    .padding([8, 16])
+                    .style(theme::preset_button_style(
+                        state.active_preset.as_deref() == Some("balanced")
+                    )),
+                button(text("Quality"))
+                    .on_press(Message::PerformancePresetSelected(
+                        PerformancePreset::Quality
+                    ))
+                    .padding([8, 16])
+                    .style(theme::preset_button_style(
+                        state.active_preset.as_deref() == Some("quality")
+                    )),
+            ]
+            .spacing(8),
+            space().height(8.0),
+            text("Interactive: <50ms latency | Balanced: <100ms | Quality: Best image quality")
+                .size(12)
+                .style(|_theme: &iced::Theme| text::Style {
+                    color: Some(theme::colors::TEXT_MUTED),
+                }),
+            space().height(20.0),
+            // Threading section
+            widgets::subsection_header("Threading"),
+            space().height(8.0),
+            widgets::labeled_row_with_help(
+                "Encoder Threads:",
+                150.0,
+                widgets::number_input(
+                    &state.edit_strings.encoder_threads,
+                    "0",
+                    80.0,
+                    Message::PerformanceEncoderThreadsChanged,
+                ),
+                "0 = Auto-detect CPU cores, or specify 1-16",
+            ),
+            space().height(12.0),
+            widgets::labeled_row_pending_with_note(
+                "Network Threads:",
+                150.0,
+                widgets::number_input(
+                    &state.edit_strings.network_threads,
+                    "0",
+                    80.0,
+                    Message::PerformanceNetworkThreadsChanged,
+                ),
+                "Tokio runtime uses default multi-threaded executor",
+            ),
+            space().height(12.0),
+            widgets::labeled_row_pending_with_note(
+                "Buffer Pool Size:",
+                150.0,
+                widgets::number_input(
+                    &state.edit_strings.buffer_pool_size,
+                    "16",
+                    80.0,
+                    Message::PerformanceBufferPoolSizeChanged,
+                ),
+                "Frame buffer pool not yet implemented",
+            ),
+            space().height(12.0),
+            widgets::toggle_pending_with_note(
+                "Enable Zero-Copy Operations",
+                state.config.performance.zero_copy,
+                Message::PerformanceZeroCopyToggled,
+                "Auto-detected from compositor DMA-BUF support; manual override not yet wired",
+            ),
+            space().height(20.0),
+            // Adaptive FPS section
+            widgets::collapsible_header(
+                "Adaptive FPS",
+                state.adaptive_fps_expanded,
+                Message::PerformanceAdaptiveFpsToggleExpanded,
+            ),
+            if state.adaptive_fps_expanded {
+                view_adaptive_fps_config(state)
+            } else {
+                column![].into()
+            },
+            space().height(16.0),
+            // Latency Governor section
+            widgets::collapsible_header(
+                "Latency Governor",
+                state.latency_expanded,
+                Message::PerformanceLatencyToggleExpanded,
+            ),
+            if state.latency_expanded {
+                view_latency_config(state)
+            } else {
+                column![].into()
+            },
+        ]
+        .spacing(4),
+    );
+
+    content.padding(20).into()
 }
 
 /// Adaptive FPS configuration view

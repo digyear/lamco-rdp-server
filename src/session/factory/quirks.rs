@@ -39,17 +39,6 @@ pub enum InitQuirk {
     /// Affected: All deployments using ashpd (Drop impl spawns async Close)
     AsyncSessionCleanup,
 
-    /// Portal backend rejects persistence for RemoteDesktop sessions.
-    ///
-    /// Both GNOME and KDE portal backends return:
-    /// "org.freedesktop.portal.Error.InvalidArgument: Remote desktop sessions cannot persist"
-    ///
-    /// When this quirk is present, the factory skips the persistence attempt entirely
-    /// to avoid a failed session that can interfere with clipboard initialization.
-    ///
-    /// Affected: GNOME (all versions), KDE (Plasma 6.x)
-    PersistenceRejected,
-
     /// Clipboard manager must be created BEFORE first create_session() call.
     ///
     /// The XDG Portal spec requires that clipboard be requested during session
@@ -126,7 +115,6 @@ impl InitQuirk {
         match self {
             Self::SingleClipboardProxy => "Single Clipboard Proxy",
             Self::AsyncSessionCleanup => "Async Session Cleanup",
-            Self::PersistenceRejected => "Persistence Rejected",
             Self::ClipboardBeforeSession => "Clipboard Before Session",
             Self::MutterEisAvailable => "Mutter EIS Available",
             Self::MutterClipboardAvailable => "Mutter Clipboard Available",
@@ -141,7 +129,6 @@ impl InitQuirk {
         match self {
             Self::SingleClipboardProxy => "Don't create multiple Clipboard D-Bus proxies",
             Self::AsyncSessionCleanup => "Session Close() is asynchronous",
-            Self::PersistenceRejected => "Portal rejects RemoteDesktop persistence (GNOME, KDE)",
             Self::ClipboardBeforeSession => "Create clipboard before session creation",
             Self::MutterEisAvailable => "EIS input available (GNOME 46+)",
             Self::MutterClipboardAvailable => "Native clipboard via Mutter",
@@ -193,13 +180,6 @@ impl InitQuirkRegistry {
 
         // === Compositor-based quirks ===
 
-        if matches!(
-            compositor,
-            CompositorType::Gnome { .. } | CompositorType::Kde { .. }
-        ) {
-            quirks.push(InitQuirk::PersistenceRejected);
-        }
-
         if matches!(compositor, CompositorType::Kde { .. }) {
             // Check for Portal Clipboard threading bug (KDE Bug 515465)
             // Affected: ALL current KDE versions with Portal Clipboard (v6.3.90-6.5.x)
@@ -211,10 +191,11 @@ impl InitQuirkRegistry {
             // - Better to be safe (disable) than crash
             // - Can refine when proper version detection available
             match compositor {
-                CompositorType::Kde { version: Some(v) } => {
-                    if Self::is_affected_kde_version(v) {
-                        quirks.push(InitQuirk::KdePortalClipboardThreadingBug);
-                    }
+                CompositorType::Kde { version: Some(v) } if Self::is_affected_kde_version(v) => {
+                    quirks.push(InitQuirk::KdePortalClipboardThreadingBug);
+                }
+                CompositorType::Kde { version: Some(_) } => {
+                    // Detected version, but it's not in the affected range.
                 }
                 CompositorType::Kde { version: None } => {
                     // No version info - assume affected (all current KDE has bug)
@@ -294,9 +275,7 @@ impl InitQuirkRegistry {
             .filter(|q| {
                 matches!(
                     q,
-                    InitQuirk::SingleClipboardProxy
-                        | InitQuirk::AsyncSessionCleanup
-                        | InitQuirk::PersistenceRejected
+                    InitQuirk::SingleClipboardProxy | InitQuirk::AsyncSessionCleanup
                 )
             })
             .collect()
@@ -353,7 +332,6 @@ mod tests {
         );
 
         assert!(quirks.contains(&InitQuirk::SingleClipboardProxy));
-        assert!(quirks.contains(&InitQuirk::PersistenceRejected));
         assert!(quirks.contains(&InitQuirk::ClipboardBeforeSession));
         assert!(quirks.contains(&InitQuirk::PamBlockedBySandbox));
     }
@@ -370,8 +348,8 @@ mod tests {
 
         // Native doesn't have SingleClipboardProxy
         assert!(!quirks.contains(&InitQuirk::SingleClipboardProxy));
-        // But still has persistence quirk
-        assert!(quirks.contains(&InitQuirk::PersistenceRejected));
+        // Has portal quirks
+        assert!(quirks.contains(&InitQuirk::ClipboardBeforeSession));
     }
 
     #[test]
@@ -384,8 +362,8 @@ mod tests {
             SessionStrategyType::PortalToken,
         );
 
-        // KDE also rejects persistence
-        assert!(quirks.contains(&InitQuirk::PersistenceRejected));
+        // KDE 6.5 has clipboard threading bug quirk
+        assert!(quirks.contains(&InitQuirk::KdePortalClipboardThreadingBug));
         assert!(quirks.contains(&InitQuirk::ClipboardBeforeSession));
     }
 
@@ -399,9 +377,7 @@ mod tests {
             SessionStrategyType::PortalToken,
         );
 
-        // wlroots doesn't have persistence quirk (no RemoteDesktop portal)
-        assert!(!quirks.contains(&InitQuirk::PersistenceRejected));
-        // But still has portal quirks
+        // wlroots has portal quirks
         assert!(quirks.contains(&InitQuirk::ClipboardBeforeSession));
     }
 }

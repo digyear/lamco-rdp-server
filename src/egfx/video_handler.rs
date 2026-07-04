@@ -1,35 +1,11 @@
 //! EGFX Video Handler
 //!
-//! Bridges PipeWire video frames to the EGFX H.264 encoding pipeline.
-//!
-//! # Architecture
-//!
-//! ```text
-//! PipeWire Frames
-//!        │
-//!        ├─> VideoFrame (BGRA data)
-//!        │
-//!        ▼
-//! EgfxVideoHandler
-//!        │
-//!        ├─> H264Encoder (BGRA → H.264)
-//!        │
-//!        ▼
-//! EGFX PDUs (WireToSurface)
-//!        │
-//!        ├─> DVC Channel Queue
-//!        │
-//!        ▼
-//! RDP Client (H.264 decode)
-//! ```
-//!
-//! # Integration
-//!
-//! This handler receives frames from PipeWire and encodes them for EGFX delivery.
-//! It can run in parallel with the RemoteFX path, with the server choosing
-//! which encoding to use based on client capabilities and frame characteristics.
+//! Bridges raw framebuffer data to the EGFX H.264 encoding pipeline. The frame
+//! source is pluggable via [`RawFrame`]: the QEMU console feeds it from the
+//! D-Bus SharedFramebuffer, and any future desktop path can feed it from a
+//! PipeWire capture without a second copy of this handler.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 #[cfg(feature = "h264")]
 use tokio::sync::Mutex;
@@ -38,27 +14,24 @@ use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "h264")]
 use crate::egfx::encoder::{Avc420Encoder, EncoderConfig};
-use crate::{
-    egfx::encoder::{EncoderError, EncoderResult},
-    pipewire::VideoFrame,
-};
+use crate::egfx::encoder::{EncoderError, EncoderResult};
+
+/// Source-agnostic raw frame — produced by QEMU D-Bus framebuffer or any capture backend.
+#[derive(Debug, Clone)]
+pub struct RawFrame {
+    pub data: Arc<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+}
 
 /// Configuration for EGFX video handling
 #[derive(Debug, Clone)]
 pub struct EgfxVideoConfig {
-    /// Target bitrate in kbps
     pub bitrate_kbps: u32,
-
-    /// Maximum frames per second
     pub max_fps: u32,
-
-    /// Enable frame skipping under load
     pub enable_frame_skip: bool,
-
-    /// Quality vs speed tradeoff (0=fastest, 100=best quality)
     pub quality_preset: u32,
-
-    /// Enable AVC 444 mode (full chroma)
     pub avc_444_mode: bool,
 }
 
@@ -77,70 +50,39 @@ impl Default for EgfxVideoConfig {
 /// Encoded frame ready for EGFX transmission
 #[derive(Debug)]
 pub struct EncodedFrame {
-    /// H.264 NAL units
     pub h264_data: Vec<u8>,
-
-    /// Frame timestamp (milliseconds since session start)
     pub timestamp_ms: u64,
-
-    /// Is this a keyframe (IDR)
     pub is_keyframe: bool,
-
-    /// Frame dimensions
     pub width: u32,
     pub height: u32,
-
-    /// Encoding time in microseconds
     pub encode_time_us: u64,
 }
 
 /// Statistics for video encoding
 #[derive(Debug, Default, Clone)]
 pub struct EncodingStats {
-    /// Frames encoded
     pub frames_encoded: u64,
-
-    /// Frames dropped due to backpressure
     pub frames_dropped: u64,
-
-    /// Keyframes generated
     pub keyframes: u64,
-
-    /// Total bytes encoded
     pub total_bytes: u64,
-
-    /// Average encode time in microseconds
     pub avg_encode_time_us: u64,
-
-    /// Peak encode time in microseconds
     pub peak_encode_time_us: u64,
 }
 
 /// EGFX Video Handler
 ///
-/// Receives video frames and produces H.264 encoded data for EGFX transmission.
+/// Receives raw frames and produces H.264 encoded data for EGFX transmission.
 pub struct EgfxVideoHandler {
-    /// Encoder configuration
     #[expect(dead_code, reason = "used for runtime reconfiguration")]
     config: EgfxVideoConfig,
 
-    /// H.264 encoder instance (behind feature flag)
     #[cfg(feature = "h264")]
     encoder: Mutex<Avc420Encoder>,
 
-    /// Encoding statistics
     stats: RwLock<EncodingStats>,
-
-    /// Session start time for timestamps
     session_start: Instant,
-
-    /// Output channel for encoded frames
     output_tx: mpsc::Sender<EncodedFrame>,
-
-    /// Current surface dimensions
     surface_size: RwLock<(u32, u32)>,
-
-    /// Frame counter for sequence tracking
     frame_counter: std::sync::atomic::AtomicU64,
 }
 
@@ -152,15 +94,14 @@ impl EgfxVideoHandler {
         initial_height: u32,
         output_tx: mpsc::Sender<EncodedFrame>,
     ) -> EncoderResult<Self> {
-        // Configure encoder from video config
         let encoder_config = EncoderConfig {
             bitrate_kbps: config.bitrate_kbps,
             max_fps: config.max_fps as f32,
             enable_skip_frame: config.enable_frame_skip,
             width: Some(initial_width as u16),
             height: Some(initial_height as u16),
-            color_space: None,    // Auto-select based on resolution
-            ..Default::default()  // QP defaults
+            color_space: None,
+            ..Default::default()
         };
 
         let encoder = Avc420Encoder::new(encoder_config)?;
@@ -176,7 +117,6 @@ impl EgfxVideoHandler {
         })
     }
 
-    /// Stub implementation when H.264 feature is disabled
     #[cfg(not(feature = "h264"))]
     pub fn new(
         _config: EgfxVideoConfig,
@@ -190,7 +130,7 @@ impl EgfxVideoHandler {
     }
 
     #[cfg(feature = "h264")]
-    pub async fn process_frame(&self, frame: VideoFrame) -> EncoderResult<bool> {
+    pub async fn process_frame(&self, frame: RawFrame) -> EncoderResult<bool> {
         let frame_num = self
             .frame_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -203,7 +143,6 @@ impl EgfxVideoHandler {
                 current_w, current_h, frame.width, frame.height
             );
             *self.surface_size.write().await = (frame.width, frame.height);
-            // Encoder will handle resize internally
         }
 
         let encode_start = Instant::now();
@@ -220,7 +159,6 @@ impl EgfxVideoHandler {
             stats.frames_encoded += 1;
             stats.peak_encode_time_us = stats.peak_encode_time_us.max(encode_time_us);
 
-            // Running average
             let n = stats.frames_encoded as f64;
             stats.avg_encode_time_us =
                 ((stats.avg_encode_time_us as f64 * (n - 1.0) + encode_time_us as f64) / n) as u64;
@@ -234,7 +172,6 @@ impl EgfxVideoHandler {
             }
         };
 
-        // Update stats for keyframes and bytes
         {
             let mut stats = self.stats.write().await;
             if h264_frame.is_keyframe {
@@ -252,12 +189,11 @@ impl EgfxVideoHandler {
             encode_time_us,
         };
 
-        // Send to output channel (non-blocking)
         match self.output_tx.try_send(encoded_frame) {
             Ok(()) => {
                 if frame_num.is_multiple_of(30) {
                     debug!(
-                        "📹 Encoded frame {} in {}us, keyframe={}",
+                        "Encoded frame {} in {}us, keyframe={}",
                         frame_num, encode_time_us, h264_frame.is_keyframe
                     );
                 }
@@ -278,15 +214,13 @@ impl EgfxVideoHandler {
         }
     }
 
-    /// Stub when H.264 feature disabled
     #[cfg(not(feature = "h264"))]
-    pub async fn process_frame(&self, _frame: VideoFrame) -> EncoderResult<bool> {
+    pub async fn process_frame(&self, _frame: RawFrame) -> EncoderResult<bool> {
         Err(EncoderError::InitFailed(
             "H.264 support not compiled in".to_string(),
         ))
     }
 
-    /// Request a keyframe (IDR frame) on next encode
     #[cfg(feature = "h264")]
     pub async fn force_keyframe(&self) {
         let mut encoder = self.encoder.lock().await;
@@ -294,7 +228,6 @@ impl EgfxVideoHandler {
         debug!("Keyframe requested");
     }
 
-    /// Stub when H.264 feature disabled
     #[cfg(not(feature = "h264"))]
     pub async fn force_keyframe(&self) {}
 
@@ -375,7 +308,6 @@ mod tests {
     #[test]
     fn test_factory_availability() {
         let factory = EgfxVideoHandlerFactory::new(EgfxVideoConfig::default());
-        // Availability depends on feature flag
         #[cfg(feature = "h264")]
         assert!(factory.is_available());
         #[cfg(not(feature = "h264"))]
@@ -390,7 +322,6 @@ mod tests {
 
         let handler = EgfxVideoHandler::new(config, 1920, 1080, tx);
 
-        // May fail if OpenH264 not available
         if let Ok(handler) = handler {
             let size = handler.surface_size().await;
             assert_eq!(size, (1920, 1080));

@@ -86,7 +86,7 @@ impl OpenH264Api {
 
 /// Directories to scan for `libopenh264.so*` at runtime.
 const SEARCH_DIRS: &[&str] = &[
-    // Flatpak app extension (org.freedesktop.Platform.openh264)
+    // Flatpak mount path (used only if the user provides a Cisco OpenH264 binary here)
     "/app/lib/openh264/extra",
     "/app/lib/openh264/extra/lib",
     // Flatpak runtime extension (older runtimes)
@@ -151,11 +151,17 @@ pub(crate) fn load_openh264() -> Result<OpenH264Api, String> {
 
     let is_flatpak = std::path::Path::new("/.flatpak-info").exists();
     let hint = if is_flatpak {
-        "Install the OpenH264 Flatpak extension: \
-         flatpak install flathub org.freedesktop.Platform.openh264"
+        // Cisco's license requires its OpenH264 binary to be downloaded
+        // separately by the user, so it is never bundled here; the freedesktop
+        // openh264 extension is retired and absent on current runtimes.
+        "software H.264 is unavailable in this Flatpak: Cisco's OpenH264 must be \
+         installed separately and the freedesktop openh264 extension is retired. \
+         Use hardware encoding (VA-API/Vulkan), or a native package where you can \
+         install Cisco's OpenH264. See https://github.com/cisco/openh264/releases"
     } else {
-        "Install the Cisco OpenH264 binary: \
-         libopenh264-7 (Debian/Ubuntu), openh264 (Fedora), or openh264 (Arch)"
+        "install Cisco's OpenH264 binary separately: libopenh264 (Debian/Ubuntu \
+         non-free), openh264 from the fedora-cisco-openh264 repo (Fedora/RHEL), or \
+         openh264 (Arch). See https://github.com/cisco/openh264/releases"
     };
     Err(format!("OpenH264 library not found. {hint}"))
 }
@@ -219,7 +225,7 @@ fn try_load(path: &str) -> Result<OpenH264Api, String> {
         "Loaded OpenH264 {}.{}.{} ({abi}) from {path}",
         version.uMajor, version.uMinor, version.uRevision
     );
-    info!("OpenH264 Video Codec provided by Cisco Systems, Inc.");
+    info!("{}", crate::third_party::OPENH264_ATTRIBUTION);
 
     // Resolve encoder creation/destruction symbols
     let create_encoder: libloading::Symbol<

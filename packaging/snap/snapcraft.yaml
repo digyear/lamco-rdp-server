@@ -1,6 +1,6 @@
 name: lamco-rdp-server
 title: Lamco RDP Server
-version: '1.4.2'
+version: '1.4.4'
 summary: Native Wayland RDP server — Community Edition
 description: |
   Lamco RDP Server — Community Edition
@@ -45,6 +45,8 @@ apps:
       RUST_LOG: info
   gui:
     command: bin/lamco-rdp-server-gui
+    command-chain:
+      - bin/gui-launch
     plugs:
       - network
       - network-bind
@@ -56,11 +58,25 @@ apps:
       - screen-inhibit-control
     environment:
       RUST_LOG: info
+      WINIT_UNIX_BACKEND: wayland
 
 parts:
+  # Minimal desktop-launch wrapper (command-chain) that symlinks the host
+  # Wayland socket into the per-snap XDG_RUNTIME_DIR and points libxkbcommon at
+  # the staged XKB data. This is what the gnome extension does internally, minus
+  # the several-hundred-MB GTK/GNOME platform runtime.
+  launcher:
+    plugin: dump
+    source: snap/local/
+    organize:
+      gui-launch: bin/gui-launch
+    override-prime: |
+      craftctl default
+      chmod +x $CRAFT_PRIME/bin/gui-launch
+
   lamco-rdp-server:
     plugin: rust
-    source: https://github.com/lamco-admin/lamco-rdp-server/releases/download/v1.4.2/lamco-rdp-server-1.4.2.tar.xz
+    source: https://github.com/lamco-admin/lamco-rdp-server/releases/download/v1.4.4/lamco-rdp-server-1.4.4.tar.xz
     # Vendored tarball includes .cargo/config.toml + vendor/
     rust-cargo-parameters:
       - --frozen
@@ -68,6 +84,7 @@ parts:
       - --features
       - h264,libei,gui
     build-packages:
+      - build-essential
       - pkg-config
       - clang
       - cmake
@@ -90,3 +107,7 @@ parts:
       - libwayland-client0
       - libwayland-egl1
       - libfontconfig1
+      - xkb-data            # /usr/share/X11/xkb keymap data (fixes XKBNotFound)
+      - fonts-dejavu-core   # fallback font so text renders under strict confinement
+      - mesa-vulkan-drivers # wgpu Vulkan ICD
+      - libgl1-mesa-dri     # GL/GLES fallback ICD

@@ -42,9 +42,13 @@
 //!     }
 //! }
 //! ```
-// allow (not expect): SIMD unsafe blocks are behind #[cfg(target_arch, target_feature)]
-// gates, so the lint is only triggered on specific compile targets.
-#![allow(unsafe_code)]
+// `allow`, not `expect`: the SIMD unsafe blocks are behind
+// #[cfg(target_arch, target_feature)] gates, so on targets without AVX2/NEON
+// the lint never fires and an `expect` would be reported as unfulfilled.
+#![allow(
+    unsafe_code,
+    reason = "SIMD intrinsics gated by cfg(target_feature); expect would be unfulfilled on scalar targets"
+)]
 
 use std::time::Instant;
 
@@ -59,6 +63,17 @@ pub struct DamageRegion {
     pub width: u32,
     /// Height of the region in pixels
     pub height: u32,
+}
+
+impl From<lamco_pipewire::ffi::DamageRegion> for DamageRegion {
+    fn from(pw: lamco_pipewire::ffi::DamageRegion) -> Self {
+        Self {
+            x: pw.x.max(0) as u32,
+            y: pw.y.max(0) as u32,
+            width: pw.width,
+            height: pw.height,
+        }
+    }
 }
 
 impl DamageRegion {
@@ -222,7 +237,7 @@ impl DamageStats {
         (1.0 - ratio) * 100.0
     }
 
-    fn update_averages(&mut self) {
+    pub(crate) fn update_averages(&mut self) {
         if self.frames_processed > 0 {
             self.avg_damage_ratio =
                 self.total_damage_area as f32 / self.total_frame_area.max(1) as f32;
@@ -253,9 +268,19 @@ fn count_different_pixels_scalar(prev: &[u8], curr: &[u8], threshold: u8) -> u32
     count
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-fn count_different_pixels_avx2(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
-    use std::arch::x86_64::*;
+// The SIMD kernels below count one result per BGRA pixel (not per byte): a pixel
+// differs when any of its B/G/R channels exceeds `threshold`, with alpha ignored,
+// matching count_different_pixels_scalar exactly. Reducing per pixel keeps the
+// horizontal sum small (at most one per 4-byte lane), so it cannot overflow the
+// way an 8-bit byte-sum would.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn count_different_pixels_avx2(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256,
+        _mm256_movemask_ps, _mm256_or_si256, _mm256_set1_epi8, _mm256_set1_epi32,
+        _mm256_setzero_si256, _mm256_subs_epu8,
+    };
 
     // Fall back to scalar for small buffers
     if prev.len() < 32 || curr.len() < 32 {
@@ -263,7 +288,11 @@ fn count_different_pixels_avx2(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
     }
 
     unsafe {
+        // 0x00FFFFFF per 32-bit lane keeps B/G/R and zeroes alpha (lane byte order
+        // is B, G, R, A on little-endian).
+        let bgr_mask = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);
         let threshold_vec = _mm256_set1_epi8(threshold as i8);
+        let zero = _mm256_setzero_si256();
         let mut diff_count = 0u32;
 
         // Process 32 bytes (8 BGRA pixels) at a time
@@ -271,23 +300,25 @@ fn count_different_pixels_avx2(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
 
         for i in 0..chunks {
             let offset = i * 32;
-            let prev_ptr = prev.as_ptr().add(offset) as *const __m256i;
-            let curr_ptr = curr.as_ptr().add(offset) as *const __m256i;
+            let prev_data = _mm256_loadu_si256(prev.as_ptr().add(offset) as *const __m256i);
+            let curr_data = _mm256_loadu_si256(curr.as_ptr().add(offset) as *const __m256i);
 
-            let prev_data = _mm256_loadu_si256(prev_ptr);
-            let curr_data = _mm256_loadu_si256(curr_ptr);
-
-            // Compute absolute difference
+            // Per-byte absolute difference.
             let diff = _mm256_or_si256(
                 _mm256_subs_epu8(prev_data, curr_data),
                 _mm256_subs_epu8(curr_data, prev_data),
             );
+            // Unsigned ">threshold": saturating-subtract leaves a non-zero byte
+            // exactly where the difference exceeded it (a direct cmpgt_epi8 is
+            // signed and wrong once a difference passes 127).
+            let over = _mm256_subs_epu8(diff, threshold_vec);
 
-            // Compare against threshold
-            let exceeds = _mm256_cmpgt_epi8(diff, threshold_vec);
-
-            let mask = _mm256_movemask_epi8(exceeds) as u32;
-            diff_count += mask.count_ones();
+            // Drop alpha, then a 32-bit lane is zero only when the whole pixel is
+            // within threshold; count the lanes that are not.
+            let over_bgr = _mm256_and_si256(over, bgr_mask);
+            let unchanged = _mm256_cmpeq_epi32(over_bgr, zero);
+            let unchanged_bits = _mm256_movemask_ps(_mm256_castsi256_ps(unchanged)) as u32;
+            diff_count += 8 - unchanged_bits.count_ones();
         }
 
         let remaining_start = chunks * 32;
@@ -299,9 +330,7 @@ fn count_different_pixels_avx2(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
             );
         }
 
-        // The mask gives us byte-level differences; divide by 3 for approximate pixel count
-        // (checking R, G, B channels only)
-        diff_count / 3
+        diff_count
     }
 }
 
@@ -315,7 +344,16 @@ fn count_different_pixels_neon(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
     }
 
     unsafe {
+        // [0xFF, 0xFF, 0xFF, 0x00] per pixel keeps B/G/R and zeroes alpha.
+        let bgr_mask = vld1q_u8(
+            [
+                0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF,
+                0xFF, 0x00,
+            ]
+            .as_ptr(),
+        );
         let threshold_vec = vdupq_n_u8(threshold);
+        let zero = vdupq_n_u32(0);
         let mut diff_count = 0u32;
 
         // Process 16 bytes (4 BGRA pixels) at a time
@@ -326,16 +364,17 @@ fn count_different_pixels_neon(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
             let prev_data = vld1q_u8(prev.as_ptr().add(offset));
             let curr_data = vld1q_u8(curr.as_ptr().add(offset));
 
-            // Compute absolute difference
+            // Per-byte |prev - curr|, then a per-byte ">threshold" mask (0xFF/0x00).
             let diff = vabdq_u8(prev_data, curr_data);
-
-            // Compare against threshold
             let exceeds = vcgtq_u8(diff, threshold_vec);
 
-            // Horizontal sum of comparison results (count lanes that exceed)
-            // Each lane is 0xFF if exceeds, 0x00 if not
-            let sum = vaddvq_u8(exceeds);
-            diff_count += (sum / 255) as u32;
+            // Drop alpha, reinterpret each pixel as one 32-bit lane (non-zero iff
+            // any B/G/R byte exceeded), and sum the set lanes. The widened 32-bit
+            // horizontal add tops out at 4 per chunk, so it cannot overflow.
+            let exceeds_bgr = vandq_u8(exceeds, bgr_mask);
+            let lanes = vreinterpretq_u32_u8(exceeds_bgr);
+            let changed = vcgtq_u32(lanes, zero);
+            diff_count += vaddvq_u32(vshrq_n_u32(changed, 31));
         }
 
         let remaining_start = chunks * 16;
@@ -347,32 +386,35 @@ fn count_different_pixels_neon(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
             );
         }
 
-        diff_count / 3
+        diff_count
     }
 }
 
 #[inline]
-fn count_different_pixels(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
-        count_different_pixels_avx2(prev, curr, threshold)
+pub(crate) fn count_different_pixels(prev: &[u8], curr: &[u8], threshold: u8) -> u32 {
+    // Runtime dispatch (like src/egfx/color_convert.rs): the AVX2 kernel is
+    // compiled on every x86_64 build and selected when the CPU advertises AVX2,
+    // so stock baseline-x86_64 packages (Debian/RPM) actually use it instead of
+    // falling back to scalar — which compile-time `target_feature` gating did.
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: count_different_pixels_avx2 requires AVX2, guaranteed present
+        // by the runtime feature check above.
+        return unsafe { count_different_pixels_avx2(prev, curr, threshold) };
     }
 
+    // NEON is in the aarch64 baseline, so this path is already live there.
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    {
-        count_different_pixels_neon(prev, curr, threshold)
-    }
+    return count_different_pixels_neon(prev, curr, threshold);
 
-    #[cfg(not(any(
-        all(target_arch = "x86_64", target_feature = "avx2"),
-        all(target_arch = "aarch64", target_feature = "neon")
-    )))]
-    {
-        count_different_pixels_scalar(prev, curr, threshold)
-    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    count_different_pixels_scalar(prev, curr, threshold)
 }
 
-fn merge_regions(mut regions: Vec<DamageRegion>, merge_distance: u32) -> Vec<DamageRegion> {
+pub(crate) fn merge_regions(
+    mut regions: Vec<DamageRegion>,
+    merge_distance: u32,
+) -> Vec<DamageRegion> {
     if regions.len() <= 1 {
         return regions;
     }
@@ -412,7 +454,7 @@ fn merge_regions(mut regions: Vec<DamageRegion>, merge_distance: u32) -> Vec<Dam
     regions
 }
 
-fn tiles_to_regions(
+pub(crate) fn tiles_to_regions(
     dirty_tiles: &[bool],
     tiles_x: usize,
     tiles_y: usize,
@@ -547,6 +589,19 @@ impl DamageDetector {
         self.previous_frame = Some(prev_frame);
 
         regions
+    }
+
+    /// Update the reference frame without running damage detection.
+    ///
+    /// Call this when compositor-provided damage is used instead of pixel diff,
+    /// so the fallback detector stays synchronized if compositor damage stops.
+    pub fn update_reference(&mut self, frame: &[u8]) {
+        if let Some(ref mut prev) = self.previous_frame {
+            prev.clear();
+            prev.extend_from_slice(frame);
+        } else {
+            self.previous_frame = Some(frame.to_vec());
+        }
     }
 
     /// Call after resolution changes, keyframe requests,
@@ -821,6 +876,47 @@ mod tests {
         curr[0] = 110; // Diff of 10
         let count = count_different_pixels_scalar(&prev, &curr, 4);
         assert_eq!(count, 1); // Above threshold
+    }
+
+    // Whichever SIMD kernel the build selects must agree with the scalar
+    // reference exactly, including ignoring alpha. Exercises the active dispatch
+    // (AVX2 with target-feature=+avx2, NEON on aarch64, scalar otherwise) over
+    // varied buffer lengths (covering the chunk tail and sub-chunk fast path).
+    #[test]
+    fn test_simd_matches_scalar_random() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+
+        for &pixels in &[1usize, 3, 4, 7, 8, 15, 16, 17, 33, 64, 100, 256] {
+            let len = pixels * 4;
+            let mut prev = vec![0u8; len];
+            let mut curr = vec![0u8; len];
+            for b in prev.iter_mut() {
+                *b = (next() & 0xFF) as u8;
+            }
+            // Perturb a quarter of bytes (alpha included on purpose, so a
+            // divergence in alpha handling is caught).
+            for i in 0..len {
+                curr[i] = if next() % 4 == 0 {
+                    (next() & 0xFF) as u8
+                } else {
+                    prev[i]
+                };
+            }
+            for &threshold in &[0u8, 1, 4, 16, 64, 200, 255] {
+                let simd = count_different_pixels(&prev, &curr, threshold);
+                let scalar = count_different_pixels_scalar(&prev, &curr, threshold);
+                assert_eq!(
+                    simd, scalar,
+                    "pixels={pixels} threshold={threshold}: simd={simd} scalar={scalar}"
+                );
+            }
+        }
     }
 
     #[test]

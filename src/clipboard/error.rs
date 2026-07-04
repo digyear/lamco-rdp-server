@@ -57,6 +57,14 @@ pub enum ClipboardError {
     #[error("File I/O error: {0}")]
     FileIoError(String),
 
+    /// FUSE mount/unmount error
+    #[error("FUSE error: {0}")]
+    FuseError(String),
+
+    /// File transfer backend error
+    #[error("File transfer error: {0}")]
+    FileTransferError(String),
+
     /// Component not initialized
     #[error("Component not initialized")]
     NotInitialized,
@@ -102,6 +110,8 @@ pub fn classify_error(error: &ClipboardError) -> ErrorType {
         ClipboardError::LoopDetected => ErrorType::Loop,
         ClipboardError::RdpConnectionError(_) => ErrorType::Transfer,
         ClipboardError::FileIoError(_) => ErrorType::Transfer,
+        ClipboardError::FuseError(_) => ErrorType::Transfer,
+        ClipboardError::FileTransferError(_) => ErrorType::Transfer,
         ClipboardError::NotInitialized => ErrorType::State,
         ClipboardError::Unknown(_) => ErrorType::Unknown,
 

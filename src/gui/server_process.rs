@@ -70,10 +70,14 @@ impl ServerProcess {
 
         let address = config.server.listen_addr.clone();
 
+        // Do not pass -v here: main.rs treats CLI verbose as an override of
+        // config.logging.level, so a hardcoded -v silently clamps the level
+        // to "debug" regardless of what the GUI just wrote to config.toml.
+        // The GUI owns the config; let config drive the level end to end.
         let mut child = Command::new(&server_binary)
             .arg("--config")
             .arg(&config_path)
-            .arg("-v") // Verbose for better log output
+            .arg("--dbus-service") // Register D-Bus name so GUI can reconnect
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -84,7 +88,12 @@ impl ServerProcess {
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-        // Capture stderr (where tracing logs go)
+        // tracing_subscriber's fmt layer writes to stdout by default (init_logging
+        // in main.rs never overrides this), so the leveled "INFO"/"WARN"/"ERROR"
+        // lines parse_log_line() is built to classify arrive on stdout. stderr
+        // carries only pre-subscriber-init failures and raw panics/library
+        // output, which may or may not carry a level tag. Both streams get the
+        // same classification treatment rather than assuming one is unlabeled.
         if let Some(stderr) = child.stderr.take() {
             let sender = log_sender.clone();
             let flag = shutdown_flag.clone();
@@ -102,7 +111,6 @@ impl ServerProcess {
             });
         }
 
-        // Capture stdout (less common, but just in case)
         if let Some(stdout) = child.stdout.take() {
             let sender = log_sender;
             let flag = shutdown_flag.clone();
@@ -113,11 +121,7 @@ impl ServerProcess {
                         break;
                     }
                     if let Ok(line) = line {
-                        let log_line = ServerLogLine {
-                            level: LogLevel::Info,
-                            message: line,
-                            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
-                        };
+                        let log_line = parse_log_line(&line);
                         let _ = sender.send(log_line);
                     }
                 }
@@ -138,12 +142,14 @@ impl ServerProcess {
     /// Detach the server process so it keeps running when GUI exits
     ///
     /// After calling this, the server will NOT be stopped when the GUI closes.
+    /// Writes a PID file so the GUI can reconnect on next launch.
     pub fn detach(&mut self) {
         info!(
             "Detaching server process (PID: {}) - will continue running",
             self.pid
         );
         self.detached = true;
+        write_pid_file(self.pid);
     }
 
     pub fn pid(&self) -> u32 {
@@ -234,13 +240,14 @@ impl ServerProcess {
         Ok(())
     }
 
-    /// Clean up temporary files
+    /// Clean up temporary files and PID file
     fn cleanup(&self) {
-        if self.config_path.exists() {
-            if let Err(e) = std::fs::remove_file(&self.config_path) {
-                debug!("Failed to remove temp config: {}", e);
-            }
+        if self.config_path.exists()
+            && let Err(e) = std::fs::remove_file(&self.config_path)
+        {
+            debug!("Failed to remove temp config: {}", e);
         }
+        remove_pid_file();
     }
 }
 
@@ -260,6 +267,62 @@ impl Drop for ServerProcess {
     }
 }
 
+/// Get the PID file path
+fn pid_file_path() -> PathBuf {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(runtime_dir).join("lamco-rdp-server.pid")
+}
+
+/// Write PID to file so the GUI can find a detached server on restart
+fn write_pid_file(pid: u32) {
+    let path = pid_file_path();
+    if let Err(e) = std::fs::write(&path, pid.to_string()) {
+        warn!("Failed to write PID file {:?}: {}", path, e);
+    } else {
+        debug!("PID file written: {:?} (PID: {})", path, pid);
+    }
+}
+
+/// Remove PID file on shutdown
+fn remove_pid_file() {
+    let path = pid_file_path();
+    if path.exists()
+        && let Err(e) = std::fs::remove_file(&path)
+    {
+        debug!("Failed to remove PID file: {}", e);
+    }
+}
+
+/// Check for a running server via PID file.
+///
+/// Returns the PID if the file exists and the process is still alive.
+/// Removes stale PID files (process no longer running).
+pub fn check_pid_file() -> Option<u32> {
+    let path = pid_file_path();
+    let content = std::fs::read_to_string(&path).ok()?;
+    let pid: u32 = content.trim().parse().ok()?;
+
+    // Verify process is actually alive via kill(pid, 0)
+    use nix::{sys::signal::kill, unistd::Pid};
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => {
+            debug!("PID file: process {} is alive", pid);
+            Some(pid)
+        }
+        Err(nix::errno::Errno::EPERM) => {
+            // Process exists but we lack permission (unlikely for our own server)
+            debug!("PID file: process {} exists (EPERM)", pid);
+            Some(pid)
+        }
+        Err(_) => {
+            // Process doesn't exist - stale PID file
+            debug!("PID file: process {} is gone, removing stale file", pid);
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+}
+
 /// Find the server binary in standard locations
 fn find_server_binary() -> Result<PathBuf> {
     use crate::config::is_flatpak;
@@ -275,12 +338,12 @@ fn find_server_binary() -> Result<PathBuf> {
     }
 
     // 2. Same directory as GUI binary
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(dir) = current_exe.parent() {
-            let server_path = dir.join("lamco-rdp-server");
-            if server_path.exists() {
-                return Ok(server_path);
-            }
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        let server_path = dir.join("lamco-rdp-server");
+        if server_path.exists() {
+            return Ok(server_path);
         }
     }
 
@@ -302,12 +365,12 @@ fn find_server_binary() -> Result<PathBuf> {
     }
 
     // 4. System PATH
-    if let Ok(output) = Command::new("which").arg("lamco-rdp-server").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
+    if let Ok(output) = Command::new("which").arg("lamco-rdp-server").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
         }
     }
 
@@ -334,8 +397,7 @@ fn find_server_binary() -> Result<PathBuf> {
     };
 
     Err(anyhow!(
-        "Could not find lamco-rdp-server binary. Searched: {}",
-        context
+        "Could not find lamco-rdp-server binary. Searched: {context}"
     ))
 }
 
@@ -391,7 +453,9 @@ pub async fn update_background_status(message: &str) {
 
     match BackgroundProxy::new().await {
         Ok(proxy) => {
-            if let Err(e) = proxy.set_status(truncated).await {
+            let opts =
+                ashpd::desktop::background::SetStatusOptions::default().set_message(truncated);
+            if let Err(e) = proxy.set_status(opts).await {
                 debug!("Background SetStatus failed: {}", e);
             }
         }

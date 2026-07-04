@@ -182,6 +182,7 @@ impl SessionStrategy for WlrDirectStrategy {
             pointer,
             streams: std::sync::RwLock::new(vec![]),
             health_reporter: std::sync::OnceLock::new(),
+            liveness_started: std::sync::atomic::AtomicBool::new(false),
         };
 
         Ok(Arc::new(handle))
@@ -215,6 +216,12 @@ pub struct WlrSessionHandleImpl {
     /// devices before video streams are known).
     streams: std::sync::RwLock<Vec<StreamInfo>>,
     health_reporter: std::sync::OnceLock<HealthReporter>,
+    /// Tracks whether the connection liveness monitor has been started
+    #[expect(
+        dead_code,
+        reason = "WIP: periodic liveness check not yet wired into server startup"
+    )]
+    liveness_started: std::sync::atomic::AtomicBool,
 }
 
 impl WlrSessionHandleImpl {
@@ -260,6 +267,32 @@ impl WlrSessionHandleImpl {
             .iter()
             .find(|s| s.node_id == stream_id)
             .map(|s| (s.width, s.height))
+    }
+}
+
+impl WlrSessionHandleImpl {
+    /// Check Wayland connection liveness by attempting a roundtrip.
+    ///
+    /// Returns false if the compositor is gone (connection broken).
+    /// This detects compositor crashes that would otherwise go unnoticed
+    /// when no input events are being sent.
+    #[expect(
+        dead_code,
+        reason = "WIP: periodic liveness check not yet wired into server startup"
+    )]
+    fn is_connection_alive(&self) -> bool {
+        let mut queue = match self.event_queue.lock() {
+            Ok(q) => q,
+            Err(_) => return false,
+        };
+
+        // Sync + dispatch: if the compositor is gone, this fails.
+        match self.connection.flush() {
+            Ok(()) => {}
+            Err(_) => return false,
+        }
+
+        queue.dispatch_pending(&mut WlrState::new()).is_ok()
     }
 }
 
@@ -395,9 +428,22 @@ impl SessionHandle for WlrSessionHandleImpl {
     }
 
     fn clipboard_source(&self) -> crate::session::strategy::ClipboardSource {
-        // wlr-direct does not provide clipboard support.
-        // Caller must use FUSE approach or create separate Portal session.
+        // wlr-direct has no native (Portal/Mutter) clipboard source; it uses
+        // Wayland data-control via build_clipboard() instead.
         crate::session::strategy::ClipboardSource::None
+    }
+
+    #[cfg(feature = "wl-clipboard")]
+    async fn build_clipboard(
+        &self,
+        _portal_fallback: Option<crate::session::strategy::ClipboardComponents>,
+        _rate_limit_ms: u64,
+    ) -> Option<std::sync::Arc<dyn crate::clipboard::provider::ClipboardProvider>> {
+        // Wayland data-control clipboard (wl-clipboard-rs) — wlroots compositors
+        // expose wlr/ext-data-control, so no Portal session is needed.
+        Some(std::sync::Arc::new(
+            crate::clipboard::providers::WlClipboardProvider::new(),
+        ))
     }
 }
 
@@ -583,7 +629,7 @@ mod tests {
     #[ignore = "Requires wlroots compositor running"]
     async fn test_wlr_direct_availability() {
         let available = WlrDirectStrategy::is_available().await;
-        println!("wlr-direct available: {}", available);
+        println!("wlr-direct available: {available}");
         // This will be true on Sway/Hyprland, false on GNOME
     }
 
@@ -608,6 +654,6 @@ mod tests {
     fn test_current_time_millis() {
         let time = current_time_millis();
         assert!(time > 0);
-        println!("Current time: {} ms", time);
+        println!("Current time: {time} ms");
     }
 }

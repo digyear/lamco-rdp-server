@@ -206,7 +206,7 @@ impl InputProbe {
 
         // INVOCATION_ID is set by systemd for service units
         if std::env::var("INVOCATION_ID").is_ok() {
-            if std::env::var("USER").map(|u| u == "root").unwrap_or(false) {
+            if std::env::var("USER").is_ok_and(|u| u == "root") {
                 return DeploymentType::SystemdSystem;
             }
             return DeploymentType::SystemdUser;

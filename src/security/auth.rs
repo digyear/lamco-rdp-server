@@ -16,10 +16,12 @@ use std::{
 };
 
 use anyhow::Result;
-use ironrdp_server::{CredentialValidator, Credentials};
+use ironrdp_server::{
+    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
+};
 #[cfg(feature = "pam-auth")]
 use nonstick::{AuthnFlags, ConversationAdapter, Transaction, TransactionBuilder};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
 /// PAM conversation handler that provides pre-set credentials.
@@ -200,14 +202,16 @@ impl PamValidator {
         self.rate_limiter.prune_stale();
     }
 
+    // Associated fn (not a method): runs inside `spawn_blocking`, which needs
+    // owned captures rather than a borrow of the validator.
     #[cfg(feature = "pam-auth")]
-    fn do_pam_auth(&self, username: &str, password: &str) -> Result<bool> {
+    fn do_pam_auth(service_name: &str, username: &str, password: &str) -> Result<bool> {
         let convo = PasswordConvo {
             username: username.to_string(),
             password: password.to_string(),
         };
 
-        let mut txn = TransactionBuilder::new_with_service(&self.service_name)
+        let mut txn = TransactionBuilder::new_with_service(service_name)
             .username(username)
             .build(convo.into_conversation())
             .map_err(|e| anyhow::anyhow!("Failed to start PAM transaction: {e}"))?;
@@ -230,7 +234,7 @@ impl PamValidator {
     }
 
     #[cfg(not(feature = "pam-auth"))]
-    fn do_pam_auth(&self, username: &str, _password: &str) -> Result<bool> {
+    fn do_pam_auth(_service_name: &str, username: &str, _password: &str) -> Result<bool> {
         warn!(
             "PAM authentication requested but pam-auth feature not enabled (user: '{}')",
             username
@@ -239,14 +243,21 @@ impl PamValidator {
     }
 }
 
+#[async_trait::async_trait]
 impl CredentialValidator for PamValidator {
-    fn validate(&self, credentials: &Credentials) -> Result<bool> {
-        let username = &credentials.username;
+    async fn validate(
+        &self,
+        credentials: &Credentials,
+    ) -> Result<CredentialDecision, CredentialValidationError> {
+        let username = credentials.username.clone();
 
-        // Validate username format before touching PAM
-        validate_username(username)?;
+        // A malformed username is rejected credentials, not a backend failure —
+        // an Err here would leak validation policy to unauthenticated clients.
+        if let Err(e) = validate_username(&username) {
+            warn!("Rejecting credentials: {}", e);
+            return Ok(CredentialDecision::Reject);
+        }
 
-        // Check rate limiter
         let peer_ip = self
             .peer_ip
             .lock()
@@ -260,21 +271,57 @@ impl CredentialValidator for PamValidator {
                 remaining.as_secs(),
                 username
             );
-            return Ok(false);
+            return Ok(CredentialDecision::Reject);
         }
 
-        // Extract password, do PAM auth, then zeroize the copy
+        debug!(
+            "Client Info credentials: username_len={} password_len={} domain={:?}",
+            username.len(),
+            credentials.password.len(),
+            credentials.domain.as_deref()
+        );
+        if credentials.password.is_empty() {
+            // TLS-mode mstsc omits the password from the Client Info PDU unless
+            // autologon/"remember me" is active; PAM then correctly rejects the
+            // empty password. Surface this loudly so it isn't misread as a
+            // server-side auth bug.
+            warn!(
+                "Client sent an empty password for '{}' — without NLA, mstsc only \
+                 transmits the password when autologon is set",
+                username
+            );
+        }
+
+        // libpam blocks (and pam_unix forks unix_chkpwd); keep it off the async
+        // runtime. The rate-limiter mutex is taken before and after the await,
+        // never held across it.
+        let service_name = self.service_name.clone();
+        let auth_username = username.clone();
         let mut password = credentials.password.clone();
-        let result = self.do_pam_auth(username, &password);
-        password.zeroize();
+        let result = tokio::task::spawn_blocking(move || {
+            let outcome = Self::do_pam_auth(&service_name, &auth_username, &password);
+            password.zeroize();
+            outcome
+        })
+        .await
+        .map_err(CredentialValidationError::new)?;
 
-        match &result {
-            Ok(true) => self.rate_limiter.clear(peer_ip),
-            Ok(false) => self.rate_limiter.record_failure(peer_ip),
-            Err(_) => self.rate_limiter.record_failure(peer_ip),
+        match result {
+            Ok(true) => {
+                self.rate_limiter.clear(peer_ip);
+                Ok(CredentialDecision::Accept)
+            }
+            Ok(false) => {
+                self.rate_limiter.record_failure(peer_ip);
+                Ok(CredentialDecision::Reject)
+            }
+            Err(e) => {
+                // PAM transaction setup failed — the auth stack itself is
+                // broken, not the credentials.
+                self.rate_limiter.record_failure(peer_ip);
+                Err(CredentialValidationError::new(std::io::Error::other(e)))
+            }
         }
-
-        result
     }
 }
 

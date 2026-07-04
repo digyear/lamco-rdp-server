@@ -6,7 +6,7 @@
 #
 
 Name:           lamco-rdp-server
-Version:        1.4.2
+Version:        1.4.4
 Release:        1%{?dist}
 Summary:        Wayland RDP server for Linux desktop sharing with GUI
 
@@ -20,9 +20,13 @@ License:        0BSD AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-1
 URL:            https://www.lamco.ai/products/lamco-rdp-server/
 Source0:        https://github.com/lamco-admin/lamco-rdp-server/releases/download/v%{version}/%{name}-%{version}.tar.xz
 
-# No Wayland desktop use case on ppc64le; also OOM during Rust compilation
-# on ppc64le builders (cargo-rpm-macros overrides codegen-units settings)
-ExcludeArch:    ppc64le
+# Reduce debuginfo on ppc64le to avoid OOM during linking.
+# ppc64le Koji builders have less memory; full debuginfo with codegen-units=1
+# (from cargo-rpm-macros) exceeds available RAM at link time.
+# Standard Fedora pattern (used by Thunderbird, uv, etc.)
+%ifarch ppc64le
+%global rustflags_debuginfo 1
+%endif
 
 # Disable Fedora's system-level LTO flags to prevent double-LTO interaction
 # with Cargo's own LTO (we use CARGO_PROFILE_RELEASE_LTO=thin below)
@@ -93,6 +97,7 @@ Requires:       pam
 Recommends:     libva
 Recommends:     intel-media-driver
 Recommends:     mesa-va-drivers
+
 
 # Bundled crate provides (920 vendored Rust crates)
 Provides:       bundled(crate(ab_glyph)) = 0.2.32
@@ -1049,8 +1054,11 @@ export CARGO_TARGET_DIR="$PWD/target"
 export CARGO_PROFILE_RELEASE_LTO=thin
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
 
-# Build release binaries (server + GUI)
-cargo build --release --offline --features "default,vaapi,gui"
+# Build release binaries (server + GUI).
+# vsock + websocket activate the AF_VSOCK (Hyper-V Enhanced
+# Session Mode) and WebSocket+RDCleanPath transport listeners introduced
+# in v1.4.4 — pure Rust additions, no extra system-library BuildRequires.
+cargo build --release --offline --features "default,vaapi,gui,vsock,websocket"
 
 %install
 install -Dm755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
@@ -1089,6 +1097,7 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/io.lamco.rdp-s
 
 %files
 %license LICENSE
+%license licenses/OpenH264-BINARY_LICENSE.txt
 %doc README.md
 %{_bindir}/%{name}
 %{_bindir}/%{name}-gui
@@ -1100,6 +1109,14 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/io.lamco.rdp-s
 %{_datadir}/icons/hicolor/*/apps/io.lamco.rdp-server.png
 
 %changelog
+* Fri Jul 03 2026 Greg Lamberson <greg@lamco.io> - 1.4.4-1
+- New upstream release 1.4.4
+- Unified multi-transport: AF_VSOCK (Hyper-V) and experimental WebSocket/RDCleanPath
+- Vulkan Video H.264 encoder; HTTP metrics and health server
+- Per-connection session lifecycle on GNOME; KDE, sway, and COSMIC fixes; many GUI fixes
+- Linux-to-Windows clipboard file copy; systemd unit hardening fix for PAM
+- MSRV 1.89, Rust edition 2024; Licensor Lamco Development LLC, Change Date 2029-06-01
+
 * Tue Mar 10 2026 Greg Lamberson <greg@lamco.io> - 1.4.2-1
 - Map Unicode keyboard events to evdev keycodes (rdpdo utype support)
 - Add PipeWire DRIVER stream flag for static desktop frame delivery

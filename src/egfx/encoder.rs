@@ -5,9 +5,9 @@
 //!
 //! # MS-RDPEGFX Compliance
 //!
-//! MS-RDPEGFX requires length-prefixed NAL units (AVC format per ISO/IEC 14496-15),
-//! not Annex B format. OpenH264 outputs Annex B by default, so this module
-//! automatically converts the bitstream to length-prefixed format.
+//! MS-RDPEGFX Section 2.2.4.4 requires H.264 data "conforming to the byte stream
+//! format specified in [ITU-H.264-201201] Annex B" (start code prefixed NAL units).
+//! OpenH264 outputs Annex B natively, so no format conversion is needed.
 //!
 //! # OpenH264 Licensing
 //!
@@ -257,7 +257,7 @@ pub(super) fn annex_b_to_avc(annex_b_data: &[u8]) -> Vec<u8> {
 /// Encoded H.264 frame
 #[derive(Debug)]
 pub struct H264Frame {
-    /// Encoded NAL units (in AVC length-prefixed format)
+    /// Encoded NAL units in Annex B format (start code prefixed)
     pub data: Vec<u8>,
 
     /// Whether this is a keyframe (IDR)
@@ -292,84 +292,41 @@ pub struct Avc420Encoder {
     encoder: openh264_compat::VersionedEncoder,
     config: EncoderConfig,
     frame_count: u64,
-    /// Cached SPS/PPS from last IDR frame (for prepending to P-slices)
-    cached_sps_pps: Option<Vec<u8>>,
     /// Current H.264 level (determined from resolution)
     #[expect(dead_code, reason = "used when level-based bitrate scaling is enabled")]
     current_level: Option<super::h264_level::H264Level>,
+    /// Optional diagnostics — None when both diagnostics flags are off (zero cost).
+    diagnostics: Option<std::sync::Arc<super::encode_diagnostics::EncodeDiagnostics>>,
 }
 
-/// Load the OpenH264 library with version detection.
+/// Cached OpenH264 API handle, populated at probe time and reused by encoder creation.
+#[cfg(feature = "h264")]
+static OPENH264_API_CACHE: std::sync::OnceLock<
+    Result<std::sync::Arc<openh264_compat::OpenH264Api>, String>,
+> = std::sync::OnceLock::new();
+
+/// Load the OpenH264 library with version detection and caching.
 ///
-/// Delegates to `openh264_compat::load_openh264()` which:
-/// 1. Detects the runtime version via `WelsGetCodecVersion()`
-/// 2. Selects the correct ABI generation (7 or 8)
-/// 3. Returns an API handle with version-appropriate struct layouts
+/// First call loads the library via `openh264_compat::load_openh264()`,
+/// detects the runtime version, selects the correct ABI generation,
+/// and caches the result. Subsequent calls return the cached handle.
 #[cfg(feature = "h264")]
 pub(crate) fn load_openh264_api() -> EncoderResult<std::sync::Arc<openh264_compat::OpenH264Api>> {
-    openh264_compat::load_openh264()
-        .map(std::sync::Arc::new)
-        .map_err(EncoderError::InitFailed)
+    let result = OPENH264_API_CACHE
+        .get_or_init(|| openh264_compat::load_openh264().map(std::sync::Arc::new));
+
+    match result {
+        Ok(api) => Ok(api.clone()),
+        Err(e) => Err(EncoderError::InitFailed(e.clone())),
+    }
 }
 
 #[cfg(feature = "h264")]
 impl Avc420Encoder {
-    /// Extract SPS and PPS NAL units from Annex B bitstream
-    ///
-    /// Returns concatenated SPS+PPS with start codes, or None if not found
-    fn extract_sps_pps(data: &[u8]) -> Option<Vec<u8>> {
-        let mut sps_pps = Vec::new();
-        let mut i = 0;
-
-        while i < data.len() {
-            // Find start code
-            let start_code_len =
-                if i + 4 <= data.len() && data[i..i + 4] == [0x00, 0x00, 0x00, 0x01] {
-                    4
-                } else if i + 3 <= data.len() && data[i..i + 3] == [0x00, 0x00, 0x01] {
-                    3
-                } else {
-                    i += 1;
-                    continue;
-                };
-
-            let nal_start = i + start_code_len;
-            if nal_start >= data.len() {
-                break;
-            }
-
-            let nal_type = data[nal_start] & 0x1F;
-
-            // Find next start code
-            let mut nal_end = data.len();
-            let mut j = nal_start + 1;
-            while j + 2 < data.len() {
-                if (data[j..j + 3] == [0x00, 0x00, 0x01])
-                    || (j + 3 < data.len() && data[j..j + 4] == [0x00, 0x00, 0x00, 0x01])
-                {
-                    nal_end = j;
-                    break;
-                }
-                j += 1;
-            }
-
-            // NAL type 7 = SPS, NAL type 8 = PPS
-            if nal_type == 7 || nal_type == 8 {
-                sps_pps.extend_from_slice(&data[i..nal_end]);
-            }
-
-            i = nal_end;
-            if i == data.len() {
-                break;
-            }
-        }
-
-        if sps_pps.is_empty() {
-            None
-        } else {
-            Some(sps_pps)
-        }
-    }
+    // extract_sps_pps and SPS/PPS prepending REMOVED.
+    // SPS/PPS is part of IDR frames in Annex B bitstream.
+    // Prepending to P-frames caused MSTSC DVC Close.
+    // See docs/bugs/AVC444-V140-REGRESSION.md.
 
     /// Log detailed NAL unit structure for debugging
     fn log_nal_structure(data: &[u8], frame_num: u64, is_keyframe: bool) {
@@ -480,9 +437,19 @@ impl Avc420Encoder {
             encoder,
             config,
             frame_count: 0,
-            cached_sps_pps: None,
             current_level: level,
+            diagnostics: None,
         })
+    }
+
+    /// Attach encoder diagnostics (TRACE NAL hex dump, H.264 file dump, decode
+    /// self-test). Called once after construction by the display handler when
+    /// the operator has enabled diagnostics in config.
+    pub fn set_diagnostics(
+        &mut self,
+        diagnostics: Option<std::sync::Arc<super::encode_diagnostics::EncodeDiagnostics>>,
+    ) {
+        self.diagnostics = diagnostics;
     }
 
     pub fn encode_bgra(
@@ -538,45 +505,33 @@ impl Avc420Encoder {
         // MS-RDPEGFX requires Annex B format (ITU-H.264 Annex B with start codes)
         // OpenH264 outputs Annex B format directly - use it as-is!
         // CRITICAL: Do NOT convert to AVC format - Windows MFT decoder expects Annex B
-        let mut data = annex_b_data;
+        let data = annex_b_data;
 
         if data.is_empty() {
             warn!("Encoded bitstream is empty");
             return Ok(None);
         }
 
-        // HYPOTHESIS 1 TEST: Extract and cache SPS/PPS from IDR frames, prepend to P-slices
-        if is_keyframe {
-            // IDR frame: Extract SPS/PPS for caching
-            let sps_pps = Self::extract_sps_pps(&data);
-            if let Some(ref headers) = sps_pps {
-                debug!(
-                    "🔑 IDR frame: Cached {} bytes of SPS/PPS headers",
-                    headers.len()
-                );
-                self.cached_sps_pps = sps_pps;
-            } else {
-                warn!("⚠️ IDR frame without SPS/PPS headers!");
-            }
-        } else {
-            // P-slice: Prepend cached SPS/PPS if available
-            if let Some(ref sps_pps) = self.cached_sps_pps {
-                debug!(
-                    "📎 P-slice: Prepending {} bytes of cached SPS/PPS",
-                    sps_pps.len()
-                );
-                let mut combined = sps_pps.clone();
-                combined.extend_from_slice(&data);
-                data = combined;
-            } else {
-                warn!("⚠️ P-slice without cached SPS/PPS - may fail on client!");
-            }
-        }
+        // SPS/PPS are part of IDR frames in Annex B format.
+        // Do NOT prepend SPS/PPS to P-frames: MSTSC's MFT decoder interprets
+        // unexpected SPS/PPS as parameter changes, causing decoder reinitialization
+        // and eventual DVC Close during rapid frame sequences (window drag).
+        // See docs/bugs/AVC444-V140-REGRESSION.md for full analysis.
 
         self.frame_count += 1;
 
-        // Log detailed NAL structure
+        // Log detailed NAL structure (size-only summary at DEBUG)
         Self::log_nal_structure(&data, self.frame_count, is_keyframe);
+
+        // Option A — always-on per-NAL hex dump at TRACE. Short-circuits cheaply
+        // when TRACE is not enabled.
+        super::encode_diagnostics::log_nal_hex_dump(&data, self.frame_count, "AVC420");
+
+        // Options B + D — diagnostics dump + decoder self-test (config-gated).
+        if let Some(d) = &self.diagnostics {
+            d.dump_frame(&data);
+            d.self_test(&data, "AVC420");
+        }
 
         trace!(
             "Encoded frame {}: {} bytes (Annex B format), keyframe={}",
@@ -591,6 +546,60 @@ impl Avc420Encoder {
             is_keyframe,
             timestamp_ms,
         }))
+    }
+
+    /// Encode from DMA-BUF descriptor by mmapping to CPU and delegating to encode_bgra.
+    /// The software encoder doesn't support GPU import, so this always copies.
+    #[expect(
+        unsafe_code,
+        reason = "mmap/munmap required for DMA-BUF CPU fallback access"
+    )]
+    pub fn encode_dmabuf(
+        &mut self,
+        desc: &lamco_pipewire::DmaBufDescriptor,
+        timestamp_ms: u64,
+    ) -> EncoderResult<Option<H264Frame>> {
+        use std::os::fd::AsRawFd;
+
+        if desc.planes.is_empty() {
+            return Err(EncoderError::EncodeFailed(
+                "DmaBufDescriptor has no planes".into(),
+            ));
+        }
+
+        let plane = &desc.planes[0];
+        let size = (desc.height * plane.stride) as usize;
+
+        // SAFETY: plane.fd is a valid OwnedFd from the PipeWire dup path.
+        // mmap is read-only, we copy into a Vec immediately, then munmap.
+        let data = unsafe {
+            use std::{num::NonZeroUsize, os::fd::BorrowedFd};
+
+            use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
+
+            let nz_size = NonZeroUsize::new(size)
+                .ok_or_else(|| EncoderError::EncodeFailed("DMA-BUF plane has zero size".into()))?;
+
+            let borrowed = BorrowedFd::borrow_raw(plane.fd.as_raw_fd());
+            let ptr = mmap(
+                None,
+                nz_size,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                borrowed,
+                plane.offset as i64,
+            )
+            .map_err(|e| EncoderError::EncodeFailed(format!("DMA-BUF mmap failed: {e}")))?;
+
+            let mut vec = Vec::with_capacity(size);
+            std::ptr::copy_nonoverlapping(ptr.as_ptr() as *const u8, vec.as_mut_ptr(), size);
+            vec.set_len(size);
+
+            let _ = munmap(ptr, size);
+            vec
+        };
+
+        self.encode_bgra(&data, desc.width, desc.height, timestamp_ms)
     }
 
     pub fn force_keyframe(&mut self) {
@@ -635,6 +644,14 @@ impl Avc420Encoder {
         _bgra_data: &[u8],
         _width: u32,
         _height: u32,
+        _timestamp_ms: u64,
+    ) -> EncoderResult<Option<H264Frame>> {
+        Err(EncoderError::FeatureDisabled)
+    }
+
+    pub fn encode_dmabuf(
+        &mut self,
+        _desc: &lamco_pipewire::DmaBufDescriptor,
         _timestamp_ms: u64,
     ) -> EncoderResult<Option<H264Frame>> {
         Err(EncoderError::FeatureDisabled)
@@ -722,7 +739,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
+    #[expect(
+        deprecated,
+        reason = "tests cover the deprecated annex_b_to_avc shim until callers migrate"
+    )]
     fn test_annex_b_to_avc_4byte_start_code() {
         // Single NAL with 4-byte start code: 0x00 0x00 0x00 0x01 + NAL data
         let annex_b = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e];
@@ -737,7 +757,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
+    #[expect(
+        deprecated,
+        reason = "tests cover the deprecated annex_b_to_avc shim until callers migrate"
+    )]
     fn test_annex_b_to_avc_3byte_start_code() {
         // Single NAL with 3-byte start code: 0x00 0x00 0x01 + NAL data
         let annex_b = vec![0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80];
@@ -750,7 +773,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
+    #[expect(
+        deprecated,
+        reason = "tests cover the deprecated annex_b_to_avc shim until callers migrate"
+    )]
     fn test_annex_b_to_avc_multiple_nals() {
         // Two NALs: SPS + PPS typical pattern
         // Note: NAL data must not contain sequences that look like start codes
@@ -772,7 +798,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
+    #[expect(
+        deprecated,
+        reason = "tests cover the deprecated annex_b_to_avc shim until callers migrate"
+    )]
     fn test_annex_b_to_avc_empty() {
         let annex_b: Vec<u8> = vec![];
         let avc = annex_b_to_avc(&annex_b);
@@ -780,7 +809,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
+    #[expect(
+        deprecated,
+        reason = "tests cover the deprecated annex_b_to_avc shim until callers migrate"
+    )]
     fn test_annex_b_to_avc_no_start_code() {
         // Data without start code should produce empty output
         let annex_b = vec![0x67, 0x42, 0x00, 0x1e];

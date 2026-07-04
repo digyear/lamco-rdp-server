@@ -73,6 +73,37 @@ pub enum SystemClipboardManagerKind {
     /// GNOME Shell built-in clipboard (no separate manager)
     GnomeShell,
 
+    /// GPaste (GNOME clipboard manager extension)
+    ///
+    /// Takes ownership of clipboard like Klipper. Detectable via
+    /// org.gnome.GPaste3 or org.gnome.GPaste D-Bus service.
+    GPaste,
+
+    /// clipcat (Rust clipboard manager with D-Bus interface)
+    ///
+    /// Detectable via org.clipcat.Clipcat D-Bus service.
+    Clipcat,
+
+    /// cliphist (Wayland clipboard history, common with Hyprland/Sway)
+    ///
+    /// Watches clipboard via wl-paste --watch, stores history in SQLite.
+    /// Passive watcher — doesn't take ownership.
+    Cliphist,
+
+    /// wl-clip-persist (clipboard persistence daemon)
+    ///
+    /// Keeps clipboard content after source app closes. Uses data-control.
+    /// Passive — doesn't modify clipboard content.
+    WlClipPersist,
+
+    /// Clipman (lightweight Wayland clipboard manager)
+    ///
+    /// Often used with Sway. Passive history watcher.
+    Clipman,
+
+    /// COSMIC built-in clipboard (System76 desktop)
+    CosmicClipboard,
+
     /// wl-clipboard tools (wl-copy/wl-paste) - not persistent
     WlClipboard,
 
@@ -135,6 +166,34 @@ impl DetectedSystemClipboardManager {
 
         if Self::probe_dbus_service(&connection, "org.diodon.Diodon").await {
             return Ok(Self::detect_diodon(&connection).await);
+        }
+
+        // GPaste (GNOME clipboard extension) — check both v3 and legacy names
+        if Self::probe_dbus_service(&connection, "org.gnome.GPaste3").await
+            || Self::probe_dbus_service(&connection, "org.gnome.GPaste").await
+        {
+            return Ok(Self {
+                manager_type: SystemClipboardManagerKind::GPaste,
+                version: None,
+                dbus_responsive: true,
+                takeover_delay_ms: Some(500),
+                mime_signatures: vec![],
+                lock_api_available: false,
+                notes: vec!["GNOME clipboard extension — persists and takes ownership".to_string()],
+            });
+        }
+
+        // clipcat (Rust clipboard manager)
+        if Self::probe_dbus_service(&connection, "org.clipcat.Clipcat").await {
+            return Ok(Self {
+                manager_type: SystemClipboardManagerKind::Clipcat,
+                version: None,
+                dbus_responsive: true,
+                takeover_delay_ms: None,
+                mime_signatures: vec![],
+                lock_api_available: false,
+                notes: vec!["Rust clipboard manager with D-Bus interface".to_string()],
+            });
         }
 
         Ok(Self::none())
@@ -325,7 +384,47 @@ impl DetectedSystemClipboardManager {
     async fn detect_via_process() -> Option<Self> {
         debug!("  Checking for clipboard manager processes...");
 
-        // Check for running clipboard manager processes
+        // Check for dedicated clipboard manager processes (more specific first)
+        if Self::check_process_running("cliphist").await {
+            debug!("    cliphist process running");
+            return Some(Self {
+                manager_type: SystemClipboardManagerKind::Cliphist,
+                version: None,
+                dbus_responsive: false,
+                takeover_delay_ms: None,
+                mime_signatures: vec![],
+                lock_api_available: false,
+                notes: vec!["Wayland clipboard history (passive watcher)".to_string()],
+            });
+        }
+
+        if Self::check_process_running("wl-clip-persist").await {
+            debug!("    wl-clip-persist process running");
+            return Some(Self {
+                manager_type: SystemClipboardManagerKind::WlClipPersist,
+                version: None,
+                dbus_responsive: false,
+                takeover_delay_ms: None,
+                mime_signatures: vec![],
+                lock_api_available: false,
+                notes: vec!["Clipboard persistence daemon (passive)".to_string()],
+            });
+        }
+
+        if Self::check_process_running("clipman").await {
+            debug!("    clipman process running");
+            return Some(Self {
+                manager_type: SystemClipboardManagerKind::Clipman,
+                version: None,
+                dbus_responsive: false,
+                takeover_delay_ms: None,
+                mime_signatures: vec![],
+                lock_api_available: false,
+                notes: vec!["Lightweight Wayland clipboard manager (passive)".to_string()],
+            });
+        }
+
+        // wl-clipboard tools (less specific, checked last)
         if Self::check_process_running("wl-copy").await {
             debug!("    wl-clipboard process running");
             return Some(Self {
@@ -423,6 +522,16 @@ impl DetectedSystemClipboardManager {
                 notes: vec![
                     "Inferred from wlroots compositor (uses data-control protocol)".to_string(),
                 ],
+            },
+
+            CompositorType::Cosmic => Self {
+                manager_type: SystemClipboardManagerKind::CosmicClipboard,
+                version: None,
+                dbus_responsive: false,
+                takeover_delay_ms: None,
+                mime_signatures: vec![],
+                lock_api_available: false,
+                notes: vec!["COSMIC desktop built-in clipboard".to_string()],
             },
 
             _ => Self::none(),

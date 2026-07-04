@@ -17,12 +17,17 @@ use std::sync::{
 };
 
 use ironrdp_egfx::{
-    pdu::{CapabilitiesAdvertisePdu, CapabilitiesV81Flags, CapabilitySet},
+    pdu::{CapabilitiesAdvertisePdu, CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet},
     server::{GraphicsPipelineHandler, QoeMetrics, Surface},
 };
+use parking_lot::RwLock;
 use tracing::{debug, info, trace, warn};
 
-use crate::server::{HandlerState, SharedHandlerState};
+use crate::{
+    health::performance::EgfxSnapshot,
+    runtime::metrics::{MetricsCollector, metric_names},
+    server::SharedHandlerState,
+};
 
 /// Handler for EGFX graphics pipeline events
 ///
@@ -77,7 +82,7 @@ pub struct LamcoGraphicsHandler {
     ///
     /// When set, callbacks update this state so the display handler can
     /// check EGFX readiness without locking the GraphicsPipelineServer.
-    shared_state: Option<SharedHandlerState>,
+    shared_state: Option<Arc<SharedHandlerState>>,
 
     /// Force AVC420-only mode due to platform quirks
     ///
@@ -91,6 +96,20 @@ pub struct LamcoGraphicsHandler {
     /// Higher values improve throughput but increase latency under congestion.
     /// Default: 3 frames
     max_frames_in_flight: u32,
+
+    /// Metrics collector for recording EGFX pipeline performance.
+    /// When set, on_frame_ack and on_qoe_metrics record data
+    /// instead of discarding it.
+    metrics: Option<Arc<MetricsCollector>>,
+
+    /// Shared EGFX snapshot state for the SnapshotCollector.
+    /// Updated on state changes so performance snapshots reflect
+    /// current EGFX pipeline state.
+    egfx_snapshot: Option<Arc<RwLock<EgfxSnapshot>>>,
+
+    /// Health reporter for EGFX channel state events.
+    /// Fires EgfxChannelReady on negotiation + surface, EgfxChannelClosed on close.
+    health_reporter: Option<crate::health::HealthReporter>,
 }
 
 impl LamcoGraphicsHandler {
@@ -106,7 +125,10 @@ impl LamcoGraphicsHandler {
             negotiated_caps: std::sync::RwLock::new(None),
             shared_state: None,
             force_avc420_only: false,
-            max_frames_in_flight: 3, // Default
+            max_frames_in_flight: 3,
+            metrics: None,
+            egfx_snapshot: None,
+            health_reporter: None,
         }
     }
 
@@ -122,7 +144,10 @@ impl LamcoGraphicsHandler {
             negotiated_caps: std::sync::RwLock::new(None),
             shared_state: None,
             force_avc420_only,
-            max_frames_in_flight: 3, // Default
+            max_frames_in_flight: 3,
+            metrics: None,
+            egfx_snapshot: None,
+            health_reporter: None,
         }
     }
 
@@ -137,15 +162,18 @@ impl LamcoGraphicsHandler {
             primary_surface_id: AtomicU16::new(0),
             force_avc420_only: false,
             negotiated_caps: std::sync::RwLock::new(None),
-            shared_state: Some(shared_state),
-            max_frames_in_flight: 3, // Default
+            shared_state: Some(Arc::new(shared_state)),
+            max_frames_in_flight: 3,
+            metrics: None,
+            egfx_snapshot: None,
+            health_reporter: None,
         }
     }
 
     pub fn with_shared_state_and_quirks(
         width: u16,
         height: u16,
-        shared_state: SharedHandlerState,
+        shared_state: Arc<SharedHandlerState>,
         force_avc420_only: bool,
     ) -> Self {
         Self::with_config(width, height, shared_state, force_avc420_only, 3)
@@ -154,7 +182,7 @@ impl LamcoGraphicsHandler {
     pub fn with_config(
         width: u16,
         height: u16,
-        shared_state: SharedHandlerState,
+        shared_state: Arc<SharedHandlerState>,
         force_avc420_only: bool,
         max_frames_in_flight: u32,
     ) -> Self {
@@ -177,47 +205,54 @@ impl LamcoGraphicsHandler {
             negotiated_caps: std::sync::RwLock::new(None),
             shared_state: Some(shared_state),
             max_frames_in_flight,
+            metrics: None,
+            egfx_snapshot: None,
+            health_reporter: None,
         }
+    }
+
+    /// Attach a MetricsCollector for recording EGFX pipeline data.
+    pub fn set_metrics(&mut self, metrics: Arc<MetricsCollector>) {
+        self.metrics = Some(metrics);
+    }
+
+    /// Attach an EGFX snapshot handle for the SnapshotCollector.
+    pub fn set_egfx_snapshot(&mut self, snapshot: Arc<RwLock<EgfxSnapshot>>) {
+        self.egfx_snapshot = Some(snapshot);
+    }
+
+    /// Attach a health reporter for EGFX channel state events.
+    pub fn set_health_reporter(&mut self, reporter: crate::health::HealthReporter) {
+        self.health_reporter = Some(reporter);
     }
 
     /// Synchronize current state to the shared HandlerState
     ///
-    /// Called internally after state changes. Uses try_write to avoid
-    /// blocking in callback contexts (sync callback with async state).
+    /// Propagate local atomic state to the shared state.
+    ///
+    /// Uses atomic stores (no locks) so it never fails, even when called
+    /// from synchronous DVC callbacks while the async pipeline loop is
+    /// reading the same fields.
     fn sync_shared_state(&self) {
         if let Some(ref shared) = self.shared_state {
-            // Note: We use try_write because callbacks are synchronous but
-            // SharedHandlerState uses tokio::sync::RwLock. This is safe because
-            // we initialize the state in the same thread before callbacks start.
-            match shared.try_write() {
-                Ok(mut guard) => {
-                    // Preserve existing channel_id if we had one.
-                    // NOTE: channel_id is stored in GraphicsPipelineServer (set by DvcProcessor::start),
-                    // and EgfxFrameSender queries it directly via server.channel_id() when sending frames.
-                    // We preserve it here for diagnostic purposes only - it's not used for frame sending.
-                    let existing_channel_id: u32 = guard
-                        .as_ref()
-                        .map_or(0, |s: &HandlerState| s.dvc_channel_id);
-
-                    let state = HandlerState {
-                        is_ready: self.ready.load(Ordering::Acquire),
-                        is_avc420_enabled: self.avc420_enabled.load(Ordering::Acquire),
-                        is_avc444_enabled: self.avc444_enabled.load(Ordering::Acquire),
-                        // Convert has_surface + surface_id to Option<u16>
-                        // Surface ID 0 is valid in EGFX, so we use Option instead of sentinel
-                        primary_surface_id: if self.has_surface.load(Ordering::Acquire) {
-                            Some(self.primary_surface_id.load(Ordering::Acquire))
-                        } else {
-                            None
-                        },
-                        dvc_channel_id: existing_channel_id,
-                    };
-                    *guard = Some(state);
-                }
-                _ => {
-                    warn!("Failed to sync EGFX handler state (lock contention)");
-                }
-            }
+            shared
+                .is_ready
+                .store(self.ready.load(Ordering::Acquire), Ordering::Release);
+            shared.client_supports_avc420.store(
+                self.avc420_enabled.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            shared.is_avc444_enabled.store(
+                self.avc444_enabled.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            shared
+                .has_surface
+                .store(self.has_surface.load(Ordering::Acquire), Ordering::Release);
+            shared.primary_surface_id.store(
+                self.primary_surface_id.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
     }
 
@@ -225,7 +260,7 @@ impl LamcoGraphicsHandler {
         self.ready.load(Ordering::Acquire)
     }
 
-    pub fn is_avc420_enabled(&self) -> bool {
+    pub fn client_supports_avc420(&self) -> bool {
         self.avc420_enabled.load(Ordering::Acquire)
     }
 
@@ -245,7 +280,47 @@ impl LamcoGraphicsHandler {
 
 impl GraphicsPipelineHandler for LamcoGraphicsHandler {
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu) {
-        info!("EGFX: Client advertised {} capability sets", pdu.0.len());
+        let already_ready = self.ready.load(Ordering::Acquire);
+        if already_ready {
+            // mstsc has re-emitted RDPGFX_CAPSADVERTISE mid-session. This is
+            // its decoder-recovery sequence: it expects the server to do a
+            // full re-init (ResetGraphics + CreateSurface + MapSurfaceToOutput
+            // + IDR). If we only send CapsConfirm and keep emitting P-slices
+            // referencing the old decoder state, mstsc closes the Graphics
+            // DVC channel and RSTs the TCP connection within milliseconds.
+            //
+            // Set the shared-state flag so the display loop runs the re-init
+            // sequence before encoding the next frame.
+            warn!(
+                "EGFX: Client RE-ADVERTISED capabilities mid-session — triggering full re-init \
+                 (decoder recovery sequence; common under load when long P-slice chain desyncs)"
+            );
+
+            // Reset LOCAL surface tracking. Without this, on_surface_created()
+            // for the freshly-created post-reinit surface will see the OLD
+            // has_surface=true, skip the "first surface" branch, and never
+            // sync the new state to SharedHandlerState — causing send_frame()
+            // to fail forever with NoSurface ("black screen post-reinit" bug
+            // observed in round 4 testing).
+            self.has_surface.store(false, Ordering::Release);
+            self.primary_surface_id.store(0, Ordering::Release);
+
+            if let Some(ref shared) = self.shared_state {
+                shared.needs_full_reinit.store(true, Ordering::Release);
+                // Also propagate the local reset to SharedHandlerState now,
+                // before on_ready's sync_shared_state runs — otherwise that
+                // sync would copy STALE local has_surface=true downward.
+                shared.has_surface.store(false, Ordering::Release);
+                shared.primary_surface_id.store(0, Ordering::Release);
+            } else {
+                warn!(
+                    "EGFX: re-advertise detected but no shared_state — re-init NOT triggered. \
+                     Client will likely disconnect."
+                );
+            }
+        } else {
+            info!("EGFX: Client advertised {} capability sets", pdu.0.len());
+        }
         for (i, cap) in pdu.0.iter().enumerate() {
             debug!("EGFX CAP-ADV[{}]: {:?}", i, cap);
         }
@@ -309,6 +384,28 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         // Sync to shared state for EgfxFrameSender visibility
         self.sync_shared_state();
 
+        // Sync EGFX snapshot for SnapshotCollector
+        if let Some(ref snap) = self.egfx_snapshot {
+            let version_str = match negotiated {
+                CapabilitySet::V8 { .. } => "V8.0",
+                CapabilitySet::V8_1 { .. } => "V8.1",
+                CapabilitySet::V10 { .. } => "V10.0",
+                CapabilitySet::V10_1 => "V10.1",
+                CapabilitySet::V10_2 { .. } => "V10.2",
+                CapabilitySet::V10_3 { .. } => "V10.3",
+                CapabilitySet::V10_4 { .. } => "V10.4",
+                CapabilitySet::V10_5 { .. } => "V10.5",
+                CapabilitySet::V10_6 { .. } => "V10.6",
+                CapabilitySet::V10_7 { .. } => "V10.7",
+                _ => "Unknown",
+            };
+            let mut s = snap.write();
+            s.channel_ready = true;
+            s.avc420_enabled = avc420;
+            s.avc444_enabled = effective_avc444;
+            s.negotiated_version = Some(version_str.into());
+        }
+
         // Log codec capabilities
         match (avc420, effective_avc444) {
             (true, true) => {
@@ -326,19 +423,57 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         }
     }
 
-    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
+    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32, total_frames_decoded: u32) {
         trace!(
             "EGFX: frame_ack id={}, queue_depth={}",
             frame_id, queue_depth
         );
+
+        // Persist the client's decoded-frame counter + queue depth to shared
+        // state so display_handler / flow-control logic can compute frame_delay
+        // = encoded_frames_total - total_frames_decoded. See gfx_factory.rs.
+        if let Some(ref shared) = self.shared_state {
+            shared
+                .last_total_frames_decoded
+                .store(total_frames_decoded, Ordering::Release);
+            shared
+                .last_client_queue_depth
+                .store(queue_depth, Ordering::Release);
+            // Feed the closed-loop flow controller. ack_frame computes RTT
+            // (encode→ack latency) and may transition the controller out of
+            // Active/LoweringLatency once unacked frames drain.
+            if let Ok(mut fc) = shared.flow_controller.lock() {
+                fc.ack_frame(frame_id);
+            }
+        }
+
+        if let Some(ref m) = self.metrics {
+            m.set_gauge(metric_names::EGFX_QUEUE_DEPTH, f64::from(queue_depth));
+            m.increment_counter(metric_names::EGFX_FRAME_ACKS, 1);
+        }
+        if let Some(ref snap) = self.egfx_snapshot {
+            let mut s = snap.write();
+            s.queue_depth = queue_depth;
+            s.frame_acks += 1;
+        }
     }
 
-    fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
+    fn on_qoe_metrics(&mut self, qoe: QoeMetrics) {
         debug!(
             "EGFX: QoE metrics - frame {}, decode+render: {}μs",
-            metrics.frame_id, metrics.time_diff_dr
+            qoe.frame_id, qoe.time_diff_dr
         );
-        // Future: Use metrics to adjust encoding quality dynamically
+
+        if let Some(ref m) = self.metrics {
+            m.record_histogram(
+                metric_names::CLIENT_DECODE_RENDER_US,
+                f64::from(qoe.time_diff_dr),
+            );
+        }
+        if let Some(ref snap) = self.egfx_snapshot {
+            let mut s = snap.write();
+            s.client_decode_render_us = Some(u64::from(qoe.time_diff_dr));
+        }
     }
 
     fn on_surface_created(&mut self, surface: &Surface) {
@@ -351,9 +486,20 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         if !self.has_surface.load(Ordering::Acquire) {
             self.primary_surface_id.store(surface.id, Ordering::Release);
             self.has_surface.store(true, Ordering::Release);
-            // Sync to shared state - surface is now available
             self.sync_shared_state();
             info!("EGFX: Surface {} set as primary", surface.id);
+
+            // EGFX is fully ready when capabilities are negotiated AND a surface exists
+            if self.ready.load(Ordering::Acquire)
+                && let Some(ref reporter) = self.health_reporter
+            {
+                let version = self
+                    .egfx_snapshot
+                    .as_ref()
+                    .and_then(|s| s.read().negotiated_version.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                reporter.report(crate::health::HealthEvent::EgfxChannelReady { version });
+            }
         }
     }
 
@@ -384,6 +530,17 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         self.has_surface.store(false, Ordering::Release);
         // Sync to shared state - channel closed
         self.sync_shared_state();
+
+        if let Some(ref snap) = self.egfx_snapshot {
+            let mut s = snap.write();
+            s.channel_ready = false;
+        }
+
+        if let Some(ref reporter) = self.health_reporter {
+            reporter.report(crate::health::HealthEvent::EgfxChannelClosed {
+                reason: "DVC channel closed".into(),
+            });
+        }
     }
 
     fn max_frames_in_flight(&self) -> u32 {
@@ -424,6 +581,11 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
             CapabilitySet::V8_1 {
                 flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
             },
+            // V8: clients without AVC support (rdpdo, ironrdp-web, minimal clients).
+            // EGFX frames are sent via WireToSurface1 with Codec1Type::Uncompressed.
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            },
         ]
     }
 }
@@ -450,13 +612,10 @@ impl SharedGraphicsHandler {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.inner.read().map(|h| h.is_ready()).unwrap_or(false)
+        self.inner.read().is_ok_and(|h| h.is_ready())
     }
 
-    pub fn is_avc420_enabled(&self) -> bool {
-        self.inner
-            .read()
-            .map(|h| h.is_avc420_enabled())
-            .unwrap_or(false)
+    pub fn client_supports_avc420(&self) -> bool {
+        self.inner.read().is_ok_and(|h| h.client_supports_avc420())
     }
 }

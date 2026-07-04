@@ -158,6 +158,7 @@ unsafe impl Send for VersionedEncoder {}
 impl VersionedEncoder {
     /// Create a new versioned encoder from a loaded API.
     pub(crate) fn new(api: Arc<OpenH264Api>, config: EncoderConfig) -> Result<Self, String> {
+        // SAFETY: `api` wraps a successfully loaded OpenH264 library; `create_encoder_instance` is its C factory entry, returning a valid `ISVCEncoder*` or an error we propagate.
         let encoder_ptr = unsafe { api.create_encoder_instance()? };
         let abi = api.capabilities.abi;
 
@@ -269,6 +270,7 @@ impl VersionedEncoder {
             .as_mut()
             .expect("ABI 7 frame info must exist for ABI 7 encoder");
 
+        // SAFETY: `encoder_ptr` is a live `ISVCEncoder` from `new()`; `encode_fn` is its vtable `EncodeFrame` (non-null checked). `source` borrows the caller's I420 plane slices and `frame_info` is the owned output buffer — both valid for the call.
         let ret = unsafe {
             encode_fn(
                 self.encoder_ptr,
@@ -281,6 +283,7 @@ impl VersionedEncoder {
             return Err(format!("EncodeFrame returned {ret}"));
         }
 
+        // SAFETY: `EncodeFrame` returned 0, so `frame_info` is populated; `from_abi7` reads its layer/NAL pointers, valid until the next encode or `Uninitialize`.
         Ok(unsafe { EncodedFrameData::from_abi7(frame_info) })
     }
 
@@ -330,6 +333,7 @@ impl VersionedEncoder {
             .as_mut()
             .expect("ABI 8 frame info must exist for ABI 8 encoder");
 
+        // SAFETY: `encoder_ptr` is a live `ISVCEncoder` from `new()`; `encode_fn` is its vtable `EncodeFrame` (non-null checked). `source` borrows the caller's I420 plane slices and `frame_info` is the owned output buffer — both valid for the call.
         let ret = unsafe {
             encode_fn(
                 self.encoder_ptr,
@@ -342,6 +346,7 @@ impl VersionedEncoder {
             return Err(format!("EncodeFrame returned {ret}"));
         }
 
+        // SAFETY: `EncodeFrame` returned 0, so `frame_info` is populated; `from_abi8` reads its layer/NAL pointers, valid until the next encode or `Uninitialize`.
         Ok(unsafe { EncodedFrameData::from_abi8(frame_info) })
     }
 
@@ -350,6 +355,7 @@ impl VersionedEncoder {
         if let Ok(vtbl) = self.vtable()
             && let Some(force_fn) = vtbl.ForceIntraFrame
         {
+            // SAFETY: `encoder_ptr` is live; `force_fn` is its vtable `ForceIntraFrame` (non-null checked).
             unsafe { force_fn(self.encoder_ptr, true) };
         }
     }
@@ -378,6 +384,7 @@ impl VersionedEncoder {
         let get_defaults = vtbl
             .GetDefaultParams
             .ok_or("GetDefaultParams not in vtable")?;
+        // SAFETY: `encoder_ptr` is live; `get_defaults` is its vtable `GetDefaultParams` (non-null checked); `params` is a live, ABI-7-sized `SEncParamExt` the library fills in place.
         let ret = unsafe { get_defaults(self.encoder_ptr, &mut params as *mut _ as *mut c_void) };
         if ret != 0 {
             return Err(format!("GetDefaultParams failed: {ret}"));
@@ -387,6 +394,7 @@ impl VersionedEncoder {
 
         if self.previous_dimensions.is_none() {
             let init_fn = vtbl.InitializeExt.ok_or("InitializeExt not in vtable")?;
+            // SAFETY: `encoder_ptr` is live; `init_fn` is its vtable `InitializeExt`; `params` is a fully-populated `SEncParamExt` valid for the call.
             let ret = unsafe { init_fn(self.encoder_ptr, &params as *const _ as *const c_void) };
             if ret != 0 {
                 return Err(format!("InitializeExt failed: {ret}"));
@@ -396,6 +404,7 @@ impl VersionedEncoder {
             self.set_data_format(vtbl)?;
         } else {
             let set_opt = vtbl.SetOption.ok_or("SetOption not in vtable")?;
+            // SAFETY: `encoder_ptr` is live; `set_opt` is its vtable `SetOption`; `SVC_ENCODE_PARAM_EXT` expects an `SEncParamExt`, which `params` is.
             let ret = unsafe {
                 set_opt(
                     self.encoder_ptr,
@@ -439,6 +448,7 @@ impl VersionedEncoder {
         let get_defaults = vtbl
             .GetDefaultParams
             .ok_or("GetDefaultParams not in vtable")?;
+        // SAFETY: `encoder_ptr` is live; `get_defaults` is its vtable `GetDefaultParams` (non-null checked); `params` is a live, ABI-8-sized `SEncParamExt` the library fills in place.
         let ret = unsafe { get_defaults(self.encoder_ptr, &mut params as *mut _ as *mut c_void) };
         if ret != 0 {
             return Err(format!("GetDefaultParams failed: {ret}"));
@@ -448,6 +458,7 @@ impl VersionedEncoder {
 
         if self.previous_dimensions.is_none() {
             let init_fn = vtbl.InitializeExt.ok_or("InitializeExt not in vtable")?;
+            // SAFETY: `encoder_ptr` is live; `init_fn` is its vtable `InitializeExt`; `params` is a fully-populated `SEncParamExt` valid for the call.
             let ret = unsafe { init_fn(self.encoder_ptr, &params as *const _ as *const c_void) };
             if ret != 0 {
                 return Err(format!("InitializeExt failed: {ret}"));
@@ -457,6 +468,7 @@ impl VersionedEncoder {
             self.set_data_format(vtbl)?;
         } else {
             let set_opt = vtbl.SetOption.ok_or("SetOption not in vtable")?;
+            // SAFETY: `encoder_ptr` is live; `set_opt` is its vtable `SetOption`; `SVC_ENCODE_PARAM_EXT` expects an `SEncParamExt`, which `params` is.
             let ret = unsafe {
                 set_opt(
                     self.encoder_ptr,
@@ -598,6 +610,7 @@ impl VersionedEncoder {
         if self.encoder_ptr.is_null() {
             return Err("Encoder pointer is null".to_string());
         }
+        // SAFETY: `encoder_ptr` is non-null (checked above) and points to a C++ object whose first word is its vtable pointer; we read that pointer, null-check it, then reborrow the vtable, which outlives the encoder.
         unsafe {
             let vtbl_ptr = *(self.encoder_ptr as *const *const ISVCEncoderVtbl);
             if vtbl_ptr.is_null() {
@@ -614,6 +627,7 @@ impl VersionedEncoder {
         } else {
             WELS_LOG_QUIET
         };
+        // SAFETY: `encoder_ptr` is live; `set_opt` is its vtable `SetOption`; `TRACE_LEVEL` expects a `c_int`, which `level` is.
         let ret = unsafe {
             set_opt(
                 self.encoder_ptr,
@@ -630,6 +644,7 @@ impl VersionedEncoder {
     fn set_data_format(&self, vtbl: &ISVCEncoderVtbl) -> Result<(), String> {
         let set_opt = vtbl.SetOption.ok_or("SetOption not in vtable")?;
         let mut format: c_int = VIDEO_FORMAT_I420;
+        // SAFETY: `encoder_ptr` is live; `set_opt` is its vtable `SetOption`; `DATAFORMAT` expects a `c_int`, which `format` is.
         let ret = unsafe {
             set_opt(
                 self.encoder_ptr,
@@ -655,8 +670,10 @@ impl Drop for VersionedEncoder {
             if let Ok(vtbl) = self.vtable()
                 && let Some(uninit) = vtbl.Uninitialize
             {
+                // SAFETY: `encoder_ptr` is non-null (checked); `uninit` is its vtable `Uninitialize`, called once before destruction.
                 unsafe { uninit(self.encoder_ptr) };
             }
+            // SAFETY: `encoder_ptr` is non-null; `destroy_encoder_instance` is the API destructor matching `create_encoder_instance`, called exactly once in `Drop`.
             unsafe { self.api.destroy_encoder_instance(self.encoder_ptr) };
         }
     }

@@ -8,7 +8,7 @@
 //! # Architecture
 //!
 //! ```text
-//! PipeWire → VideoFrame → EgfxVideoHandler → Avc420/444Encoder → H.264 NAL data
+//! Capture (PipeWire / QEMU D-Bus) → RawFrame → EgfxVideoHandler → Avc420/444Encoder → H.264 NAL data
 //!                              │                                       │
 //!                              └───────────────────────────────────────┘
 //!                                              │
@@ -39,7 +39,7 @@
 //!
 //! - [MS-RDPEGFX](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/)
 
-mod encoder;
+pub(crate) mod encoder;
 
 #[cfg(feature = "h264")]
 mod openh264_compat;
@@ -47,11 +47,13 @@ mod openh264_compat;
 mod avc444_encoder;
 mod color_convert;
 mod color_space;
+pub(crate) mod encode_diagnostics;
 mod yuv444_packing;
 
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
 pub mod hardware;
 
+pub mod flow_controller;
 mod h264_level;
 mod handler;
 mod video_handler;
@@ -73,7 +75,7 @@ pub use hardware::{
     HardwareEncoder, HardwareEncoderError, HardwareEncoderResult, HardwareEncoderStats,
     QualityPreset, create_hardware_encoder,
 };
-pub use video_handler::{EgfxVideoConfig, EgfxVideoHandler, EncodedFrame, EncodingStats};
+pub use video_handler::{EgfxVideoConfig, EgfxVideoHandler, EncodedFrame, EncodingStats, RawFrame};
 pub use yuv444_packing::{
     Yuv420Frame, pack_auxiliary_view, pack_dual_views, pack_main_view, validate_dimensions,
 };

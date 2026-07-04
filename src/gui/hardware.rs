@@ -56,13 +56,41 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
     gpus.extend(detect_vaapi_devices());
     gpus.extend(detect_nvidia_devices());
 
-    if gpus.is_empty() {
+    // Check OpenH264 runtime availability via the cached probe result
+    #[cfg(feature = "h264")]
+    {
+        let openh264_available = crate::egfx::encoder::load_openh264_api().is_ok();
+        let (name, caps) = if openh264_available {
+            let version = crate::egfx::encoder::load_openh264_api()
+                .map(|api| format!("{}", api.capabilities))
+                .unwrap_or_default();
+            (
+                format!("Software Encoding (OpenH264 {version})"),
+                vec!["H.264 (software, verified)".to_string()],
+            )
+        } else {
+            (
+                "Software Encoding (OpenH264 - not installed)".to_string(),
+                vec!["H.264 (not available - install libopenh264)".to_string()],
+            )
+        };
         gpus.push(GpuInfo {
-            name: "Software Encoding (OpenH264)".to_string(),
+            name,
             device_path: None,
             encoder_type: "software".to_string(),
-            is_available: true,
-            capabilities: vec!["H.264 (software)".to_string()],
+            is_available: openh264_available,
+            capabilities: caps,
+        });
+    }
+
+    #[cfg(not(feature = "h264"))]
+    if gpus.is_empty() {
+        gpus.push(GpuInfo {
+            name: "No hardware or software encoders available".to_string(),
+            device_path: None,
+            encoder_type: "none".to_string(),
+            is_available: false,
+            capabilities: vec![],
         });
     }
 
@@ -82,10 +110,10 @@ fn detect_vaapi_devices() -> Vec<GpuInfo> {
 
     for path in &vaapi_paths {
         let device_path = PathBuf::from(path);
-        if device_path.exists() {
-            if let Some(gpu_info) = probe_vaapi_device(&device_path) {
-                devices.push(gpu_info);
-            }
+        if device_path.exists()
+            && let Some(gpu_info) = probe_vaapi_device(&device_path)
+        {
+            devices.push(gpu_info);
         }
     }
 
@@ -138,11 +166,11 @@ fn parse_vaapi_driver_name(output: &str) -> Option<String> {
             if parts.len() > 1 {
                 let driver = parts[1].trim();
                 if driver.contains("Intel") {
-                    return Some(format!("Intel VA-API ({})", driver));
+                    return Some(format!("Intel VA-API ({driver})"));
                 } else if driver.contains("AMD") || driver.contains("radeon") {
-                    return Some(format!("AMD VA-API ({})", driver));
+                    return Some(format!("AMD VA-API ({driver})"));
                 } else {
-                    return Some(format!("VA-API ({})", driver));
+                    return Some(format!("VA-API ({driver})"));
                 }
             }
         }
@@ -154,7 +182,7 @@ fn parse_vaapi_driver_name(output: &str) -> Option<String> {
             // Extract version
             if let Some(version_start) = line.find("version:") {
                 let version = line[version_start + 8..].trim();
-                return Some(format!("VA-API {}", version));
+                return Some(format!("VA-API {version}"));
             }
         }
     }
@@ -222,27 +250,27 @@ fn detect_nvidia_devices() -> Vec<GpuInfo> {
         .arg("--format=csv,noheader,nounits")
         .output();
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
 
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-                if parts.len() >= 3 {
-                    let index = parts[0];
-                    let name = parts[1];
-                    let driver_version = parts[2];
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+            if parts.len() >= 3 {
+                let index = parts[0];
+                let name = parts[1];
+                let driver_version = parts[2];
 
-                    let capabilities = detect_nvenc_capabilities(index);
+                let capabilities = detect_nvenc_capabilities(index);
 
-                    devices.push(GpuInfo {
-                        name: format!("{} (Driver {})", name, driver_version),
-                        device_path: Some(PathBuf::from(format!("/dev/nvidia{}", index))),
-                        encoder_type: "nvenc".to_string(),
-                        is_available: !capabilities.is_empty(),
-                        capabilities,
-                    });
-                }
+                devices.push(GpuInfo {
+                    name: format!("{name} (Driver {driver_version})"),
+                    device_path: Some(PathBuf::from(format!("/dev/nvidia{index}"))),
+                    encoder_type: "nvenc".to_string(),
+                    is_available: !capabilities.is_empty(),
+                    capabilities,
+                });
             }
         }
     }
@@ -261,25 +289,25 @@ fn detect_nvenc_capabilities(gpu_index: &str) -> Vec<String> {
         .arg("--format=csv,noheader,nounits")
         .output();
 
-    if let Ok(output) = output {
-        if output.status.success() {
-            capabilities.push("NVENC H.264".to_string());
-            capabilities.push("NVENC HEVC".to_string());
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        capabilities.push("NVENC H.264".to_string());
+        capabilities.push("NVENC HEVC".to_string());
 
-            // Check for AV1 support (RTX 40 series and newer)
-            // This is a heuristic based on GPU name
-            let name_output = Command::new("nvidia-smi")
-                .arg("-i")
-                .arg(gpu_index)
-                .arg("--query-gpu=name")
-                .arg("--format=csv,noheader")
-                .output();
+        // Check for AV1 support (RTX 40 series and newer)
+        // This is a heuristic based on GPU name
+        let name_output = Command::new("nvidia-smi")
+            .arg("-i")
+            .arg(gpu_index)
+            .arg("--query-gpu=name")
+            .arg("--format=csv,noheader")
+            .output();
 
-            if let Ok(name_output) = name_output {
-                let name = String::from_utf8_lossy(&name_output.stdout);
-                if name.contains("RTX 40") || name.contains("RTX 50") || name.contains("Ada") {
-                    capabilities.push("NVENC AV1".to_string());
-                }
+        if let Ok(name_output) = name_output {
+            let name = String::from_utf8_lossy(&name_output.stdout);
+            if name.contains("RTX 40") || name.contains("RTX 50") || name.contains("Ada") {
+                capabilities.push("NVENC AV1".to_string());
             }
         }
     }
@@ -292,10 +320,10 @@ fn detect_nvenc_capabilities(gpu_index: &str) -> Vec<String> {
             .arg("-q")
             .output();
 
-        if let Ok(output) = basic_check {
-            if output.status.success() {
-                capabilities.push("NVENC (capabilities unknown)".to_string());
-            }
+        if let Ok(output) = basic_check
+            && output.status.success()
+        {
+            capabilities.push("NVENC (capabilities unknown)".to_string());
         }
     }
 
@@ -328,7 +356,7 @@ pub fn validate_vaapi_device(device_path: &str) -> Result<(), String> {
     let path = PathBuf::from(device_path);
 
     if !path.exists() {
-        return Err(format!("Device path does not exist: {}", device_path));
+        return Err(format!("Device path does not exist: {device_path}"));
     }
 
     let output = Command::new("vainfo")
@@ -354,7 +382,7 @@ pub fn validate_vaapi_device(device_path: &str) -> Result<(), String> {
                 Err(format!("vainfo failed: {}", stderr.trim()))
             }
         }
-        Err(e) => Err(format!("Failed to run vainfo: {}", e)),
+        Err(e) => Err(format!("Failed to run vainfo: {e}")),
     }
 }
 

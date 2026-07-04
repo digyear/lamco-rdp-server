@@ -38,6 +38,11 @@ pub struct ConfigGuiApp {
     log_receiver: Option<Arc<Mutex<mpsc::UnboundedReceiver<ServerLogLine>>>>,
     /// Current connection mode
     connection_mode: ConnectionMode,
+    /// Shared slot for async connection tasks to deposit a ServerConnection.
+    /// Needed because ServerConnection isn't Clone (can't pass through iced Messages).
+    pending_connection: Arc<Mutex<Option<ServerConnection>>>,
+    /// Incremented on each D-Bus reconnect to restart the signal subscription
+    dbus_connection_generation: u64,
 }
 
 impl Default for ConfigGuiApp {
@@ -48,8 +53,31 @@ impl Default for ConfigGuiApp {
             server_connection: None,
             log_receiver: None,
             connection_mode: ConnectionMode::Disconnected,
+            pending_connection: Arc::new(Mutex::new(None)),
+            dbus_connection_generation: 0,
         }
     }
+}
+
+/// Probe whether the desktop exposes an `org.freedesktop.portal.FileChooser`
+/// portal, i.e. whether `rfd` file-browse dialogs can actually open. On wlroots
+/// compositors that ship only `xdg-desktop-portal-wlr` (ScreenCast-only), the
+/// interface is absent and browse buttons would silently do nothing — the GUI
+/// uses this to fall back to manual path entry with a clear message.
+async fn file_chooser_portal_available() -> bool {
+    async fn probe() -> zbus::Result<bool> {
+        let conn = zbus::Connection::session().await?;
+        let proxy = zbus::fdo::IntrospectableProxy::builder(&conn)
+            .destination("org.freedesktop.portal.Desktop")?
+            .path("/org/freedesktop/portal/desktop")?
+            .build()
+            .await?;
+        Ok(proxy
+            .introspect()
+            .await?
+            .contains("org.freedesktop.portal.FileChooser"))
+    }
+    probe().await.unwrap_or(false)
 }
 
 impl ConfigGuiApp {
@@ -57,11 +85,16 @@ impl ConfigGuiApp {
         let app = Self::default();
 
         let tasks = Task::batch([
-            Task::perform(async {}, |_| Message::RefreshCapabilities),
-            Task::perform(async {}, |_| Message::VideoDetectGpus),
-            Task::perform(async {}, |_| Message::CheckCertificates),
+            Task::perform(async {}, |()| Message::RefreshCapabilities),
+            Task::perform(async {}, |()| Message::VideoDetectGpus),
+            Task::perform(async {}, |()| Message::CheckCertificates),
             // Try to detect existing D-Bus server on startup
-            Task::perform(async {}, |_| Message::TryDbusConnect),
+            Task::perform(async {}, |()| Message::TryDbusConnect),
+            // Probe whether a FileChooser portal exists (browse buttons work)
+            Task::perform(
+                file_chooser_portal_available(),
+                Message::FileDialogPortalChecked,
+            ),
         ]);
 
         (app, tasks)
@@ -69,7 +102,7 @@ impl ConfigGuiApp {
 
     pub fn title(&self) -> String {
         let dirty_indicator = if self.state.is_dirty { " *" } else { "" };
-        format!("lamco-rdp-server Configuration{}", dirty_indicator)
+        format!("lamco-rdp-server Configuration{dirty_indicator}")
     }
 
     /// Perform application exit with proper server handling.
@@ -79,16 +112,15 @@ impl ConfigGuiApp {
     /// - If `close_stops_server` is true, server will be stopped by Drop impl
     fn perform_exit(&mut self) -> Task<Message> {
         // If user wants server to keep running, detach it before exit
-        if !self.state.close_stops_server {
-            if let Some(ref mut connection) = self.server_connection {
-                if matches!(
-                    self.state.server_status,
-                    crate::gui::state::ServerStatus::Running { .. }
-                ) {
-                    // Server will continue running after GUI closes
-                    connection.detach();
-                }
-            }
+        if !self.state.close_stops_server
+            && let Some(ref mut connection) = self.server_connection
+            && matches!(
+                self.state.server_status,
+                crate::gui::state::ServerStatus::Running { .. }
+            )
+        {
+            // Server will continue running after GUI closes
+            connection.detach();
         }
 
         iced::exit()
@@ -109,34 +141,27 @@ impl ConfigGuiApp {
             }
 
             Message::ServerListenAddrChanged(addr) => {
-                // Reconstruct full address with existing port
-                let port = self
-                    .state
-                    .config
-                    .server
-                    .listen_addr
-                    .rsplit(':')
-                    .next()
-                    .unwrap_or("3389");
-                self.state.config.server.listen_addr = format!("{}:{}", addr, port);
+                self.state.edit_strings.server_ip = addr;
+                let composed = crate::gui::state::compose_listen_addr(
+                    &self.state.edit_strings.server_ip,
+                    &self.state.edit_strings.server_port,
+                );
+                self.state.config.server.listen_addr = composed;
                 self.state.mark_dirty();
                 Task::none()
             }
             Message::ServerPortChanged(port) => {
-                // Reconstruct full address with existing IP
-                let ip = self
-                    .state
-                    .config
-                    .server
-                    .listen_addr
-                    .rsplit_once(':')
-                    .map(|(ip, _)| ip)
-                    .unwrap_or("0.0.0.0");
-                self.state.config.server.listen_addr = format!("{}:{}", ip, port);
+                self.state.edit_strings.server_port = port;
+                let composed = crate::gui::state::compose_listen_addr(
+                    &self.state.edit_strings.server_ip,
+                    &self.state.edit_strings.server_port,
+                );
+                self.state.config.server.listen_addr = composed;
                 self.state.mark_dirty();
                 Task::none()
             }
             Message::ServerMaxConnectionsChanged(val) => {
+                self.state.edit_strings.max_connections.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.server.max_connections = v;
                     self.state.mark_dirty();
@@ -144,6 +169,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::ServerSessionTimeoutChanged(val) => {
+                self.state.edit_strings.session_timeout.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.server.session_timeout = v;
                     self.state.mark_dirty();
@@ -162,20 +188,32 @@ impl ConfigGuiApp {
             }
 
             Message::SecurityCertPathChanged(path) => {
+                self.state.edit_strings.cert_path.clone_from(&path);
                 self.state.config.security.cert_path = PathBuf::from(path);
                 self.state.mark_dirty();
                 Task::none()
             }
-            Message::SecurityBrowseCert => Task::perform(
-                async {
-                    let file = rfd::AsyncFileDialog::new()
-                        .add_filter("Certificate", &["pem", "crt", "cert"])
-                        .pick_file()
-                        .await;
-                    file.map(|f| f.path().to_path_buf())
-                },
-                Message::SecurityCertSelected,
-            ),
+            Message::SecurityBrowseCert => {
+                if !self.state.file_dialog_available {
+                    self.state.add_message(
+                        MessageLevel::Warning,
+                        "No file-picker portal on this desktop — type the certificate \
+                         path directly, or install xdg-desktop-portal-gtk to browse."
+                            .to_string(),
+                    );
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        let file = rfd::AsyncFileDialog::new()
+                            .add_filter("Certificate", &["pem", "crt", "cert"])
+                            .pick_file()
+                            .await;
+                        file.map(|f| f.path().to_path_buf())
+                    },
+                    Message::SecurityCertSelected,
+                )
+            }
             Message::SecurityCertSelected(path) => {
                 if let Some(p) = path {
                     // Update both config and edit_strings so UI displays the selection
@@ -186,20 +224,32 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::SecurityKeyPathChanged(path) => {
+                self.state.edit_strings.key_path.clone_from(&path);
                 self.state.config.security.key_path = PathBuf::from(path);
                 self.state.mark_dirty();
                 Task::none()
             }
-            Message::SecurityBrowseKey => Task::perform(
-                async {
-                    let file = rfd::AsyncFileDialog::new()
-                        .add_filter("Private Key", &["pem", "key"])
-                        .pick_file()
-                        .await;
-                    file.map(|f| f.path().to_path_buf())
-                },
-                Message::SecurityKeySelected,
-            ),
+            Message::SecurityBrowseKey => {
+                if !self.state.file_dialog_available {
+                    self.state.add_message(
+                        MessageLevel::Warning,
+                        "No file-picker portal on this desktop — type the private key \
+                         path directly, or install xdg-desktop-portal-gtk to browse."
+                            .to_string(),
+                    );
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        let file = rfd::AsyncFileDialog::new()
+                            .add_filter("Private Key", &["pem", "key"])
+                            .pick_file()
+                            .await;
+                        file.map(|f| f.path().to_path_buf())
+                    },
+                    Message::SecurityKeySelected,
+                )
+            }
             Message::SecurityKeySelected(path) => {
                 if let Some(p) = path {
                     // Update both config and edit_strings so UI displays the selection
@@ -227,7 +277,7 @@ impl ConfigGuiApp {
             }
             Message::CertGenValidDaysChanged(days) => {
                 if let Some(ref mut dialog) = self.state.cert_gen_dialog {
-                    dialog.valid_days_str = days.clone();
+                    dialog.valid_days_str.clone_from(&days);
                     if let Ok(d) = days.parse() {
                         dialog.valid_days = d;
                     }
@@ -325,6 +375,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::ProcessorMaxQueueDepthChanged(val) => {
+                self.state.edit_strings.max_queue_depth.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.video_pipeline.processor.max_queue_depth = v;
                     self.state.mark_dirty();
@@ -357,6 +408,7 @@ impl ConfigGuiApp {
             }
 
             Message::DispatcherChannelSizeChanged(val) => {
+                self.state.edit_strings.channel_size.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.video_pipeline.dispatcher.channel_size = v;
                     self.state.mark_dirty();
@@ -373,6 +425,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::DispatcherMaxFrameAgeChanged(val) => {
+                self.state.edit_strings.max_frame_age.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.video_pipeline.dispatcher.max_frame_age_ms = v;
                     self.state.mark_dirty();
@@ -405,6 +458,10 @@ impl ConfigGuiApp {
             }
 
             Message::ConverterBufferPoolSizeChanged(val) => {
+                self.state
+                    .edit_strings
+                    .converter_buffer_pool_size
+                    .clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.video_pipeline.converter.buffer_pool_size = v;
                     self.state.mark_dirty();
@@ -449,13 +506,15 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::ClipboardMaxSizeChanged(val) => {
-                if let Ok(v) = val.parse() {
-                    self.state.config.clipboard.max_size = v;
+                self.state.edit_strings.max_size_mb.clone_from(&val);
+                if let Ok(mb) = val.parse::<usize>() {
+                    self.state.config.clipboard.max_size = mb * 1024 * 1024;
                     self.state.mark_dirty();
                 }
                 Task::none()
             }
             Message::ClipboardRateLimitChanged(val) => {
+                self.state.edit_strings.rate_limit.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.clipboard.rate_limit_ms = v;
                     self.state.mark_dirty();
@@ -503,7 +562,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::AudioOpusBitrateChanged(val) => {
-                self.state.edit_strings.audio_opus_bitrate = val.clone();
+                self.state.edit_strings.audio_opus_bitrate.clone_from(&val);
                 if let Ok(kbps) = val.parse::<u32>() {
                     self.state.config.audio.opus_bitrate = kbps * 1000; // Convert kbps to bps
                     self.state.mark_dirty();
@@ -546,6 +605,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::PerformanceEncoderThreadsChanged(val) => {
+                self.state.edit_strings.encoder_threads.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.performance.encoder_threads = v;
                     self.state.mark_dirty();
@@ -553,6 +613,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::PerformanceNetworkThreadsChanged(val) => {
+                self.state.edit_strings.network_threads.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.performance.network_threads = v;
                     self.state.mark_dirty();
@@ -560,6 +621,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::PerformanceBufferPoolSizeChanged(val) => {
+                self.state.edit_strings.buffer_pool_size.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.performance.buffer_pool_size = v;
                     self.state.mark_dirty();
@@ -627,6 +689,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::LatencyInteractiveDelayChanged(val) => {
+                self.state.edit_strings.interactive_delay.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state
                         .config
@@ -638,6 +701,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::LatencyBalancedDelayChanged(val) => {
+                self.state.edit_strings.balanced_delay.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.performance.latency.balanced_max_delay_ms = v;
                     self.state.mark_dirty();
@@ -645,6 +709,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::LatencyQualityDelayChanged(val) => {
+                self.state.edit_strings.quality_delay.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.performance.latency.quality_max_delay_ms = v;
                     self.state.mark_dirty();
@@ -680,6 +745,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::LoggingLogDirChanged(dir) => {
+                self.state.edit_strings.log_dir.clone_from(&dir);
                 self.state.config.logging.log_dir = if dir.is_empty() {
                     None
                 } else {
@@ -688,13 +754,29 @@ impl ConfigGuiApp {
                 self.state.mark_dirty();
                 Task::none()
             }
-            Message::LoggingBrowseLogDir => Task::perform(
-                async {
-                    let folder = rfd::AsyncFileDialog::new().pick_folder().await;
-                    folder.map(|f| f.path().to_path_buf())
-                },
-                Message::LoggingLogDirSelected,
-            ),
+            Message::LoggingBrowseLogDir => {
+                if !self.state.file_dialog_available {
+                    self.state.add_message(
+                        MessageLevel::Warning,
+                        "No file-picker portal on this desktop (e.g. wlroots/sway with \
+                         only portal-wlr). Type the log directory path directly, or \
+                         install xdg-desktop-portal-gtk to enable browsing."
+                            .to_string(),
+                    );
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        let folder = rfd::AsyncFileDialog::new().pick_folder().await;
+                        folder.map(|f| f.path().to_path_buf())
+                    },
+                    Message::LoggingLogDirSelected,
+                )
+            }
+            Message::FileDialogPortalChecked(available) => {
+                self.state.file_dialog_available = available;
+                Task::none()
+            }
             Message::LoggingLogDirSelected(path) => {
                 if let Some(p) = path {
                     // Update both config and edit_strings so UI displays the selection
@@ -739,6 +821,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::EgfxH264BitrateChanged(val) => {
+                self.state.edit_strings.h264_bitrate.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.egfx.h264_bitrate = v;
                     self.state.mark_dirty();
@@ -751,6 +834,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::EgfxMaxFramesInFlightChanged(val) => {
+                self.state.edit_strings.max_frames.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.egfx.max_frames_in_flight = v;
                     self.state.mark_dirty();
@@ -758,6 +842,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::EgfxFrameAckTimeoutChanged(val) => {
+                self.state.edit_strings.frame_ack_timeout.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.egfx.frame_ack_timeout = v;
                     self.state.mark_dirty();
@@ -765,6 +850,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::EgfxPeriodicIdrIntervalChanged(val) => {
+                self.state.edit_strings.periodic_idr.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.egfx.periodic_idr_interval = v;
                     self.state.mark_dirty();
@@ -777,6 +863,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::EgfxQpMinChanged(val) => {
+                self.state.edit_strings.qp_min.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.egfx.qp_min = v;
                     self.state.mark_dirty();
@@ -784,6 +871,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::EgfxQpMaxChanged(val) => {
+                self.state.edit_strings.qp_max.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.egfx.qp_max = v;
                     self.state.mark_dirty();
@@ -791,6 +879,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::EgfxQpDefaultChanged(val) => {
+                self.state.edit_strings.qp_default.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.egfx.qp_default = v;
                     self.state.mark_dirty();
@@ -823,6 +912,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::EgfxAvc444MaxAuxIntervalChanged(val) => {
+                self.state.edit_strings.max_aux_interval.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.egfx.avc444_max_aux_interval = v;
                     self.state.mark_dirty();
@@ -860,6 +950,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::DamageTrackingTileSizeChanged(val) => {
+                self.state.edit_strings.tile_size.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.damage_tracking.tile_size = v;
                     self.state.mark_dirty();
@@ -872,6 +963,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::DamageTrackingPixelThresholdChanged(val) => {
+                self.state.edit_strings.pixel_threshold.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.damage_tracking.pixel_threshold = v;
                     self.state.mark_dirty();
@@ -879,6 +971,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::DamageTrackingMergeDistanceChanged(val) => {
+                self.state.edit_strings.merge_distance.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.damage_tracking.merge_distance = v;
                     self.state.mark_dirty();
@@ -886,6 +979,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::DamageTrackingMinRegionAreaChanged(val) => {
+                self.state.edit_strings.min_region_area.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.damage_tracking.min_region_area = v;
                     self.state.mark_dirty();
@@ -942,6 +1036,10 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::DisplayAllowedResolutionsChanged(resolutions) => {
+                self.state
+                    .edit_strings
+                    .resolutions_text
+                    .clone_from(&resolutions);
                 self.state.config.display.allowed_resolutions = resolutions
                     .lines()
                     .map(|s| s.trim().to_string())
@@ -955,8 +1053,8 @@ impl ConfigGuiApp {
                 self.state.mark_dirty();
                 Task::none()
             }
-            Message::DisplayAllowRotationToggled(val) => {
-                self.state.config.display.allow_rotation = val;
+            Message::DisplayFrameTransformChanged(val) => {
+                self.state.config.display.frame_transform = val;
                 self.state.mark_dirty();
                 Task::none()
             }
@@ -976,6 +1074,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::AdvancedVideoIntraRefreshIntervalChanged(val) => {
+                self.state.edit_strings.intra_refresh.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.advanced_video.intra_refresh_interval = v;
                     self.state.mark_dirty();
@@ -1007,6 +1106,10 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::CursorPredictiveThresholdChanged(val) => {
+                self.state
+                    .edit_strings
+                    .predictive_threshold
+                    .clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.cursor.predictive_latency_threshold_ms = v;
                     self.state.mark_dirty();
@@ -1014,6 +1117,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::CursorUpdateFpsChanged(val) => {
+                self.state.edit_strings.cursor_update_fps.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.cursor.cursor_update_fps = v;
                     self.state.mark_dirty();
@@ -1021,6 +1125,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::PredictorHistorySizeChanged(val) => {
+                self.state.edit_strings.history_size.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.cursor.predictor.history_size = v;
                     self.state.mark_dirty();
@@ -1028,6 +1133,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::PredictorLookaheadMsChanged(val) => {
+                self.state.edit_strings.lookahead.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.cursor.predictor.lookahead_ms = v;
                     self.state.mark_dirty();
@@ -1045,6 +1151,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::PredictorMaxPredictionDistanceChanged(val) => {
+                self.state.edit_strings.max_pred_dist.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.cursor.predictor.max_prediction_distance = v;
                     self.state.mark_dirty();
@@ -1052,6 +1159,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::PredictorMinVelocityThresholdChanged(val) => {
+                self.state.edit_strings.min_velocity.clone_from(&val);
                 if let Ok(v) = val.parse() {
                     self.state.config.cursor.predictor.min_velocity_threshold = v;
                     self.state.mark_dirty();
@@ -1098,6 +1206,8 @@ impl ConfigGuiApp {
                 match result {
                     Ok(config) => {
                         self.state.config = config;
+                        self.state.edit_strings =
+                            crate::gui::state::EditStrings::from_config(&self.state.config);
                         self.state.mark_clean();
                         self.state.add_message(
                             MessageLevel::Success,
@@ -1107,7 +1217,7 @@ impl ConfigGuiApp {
                     Err(e) => {
                         self.state.add_message(
                             MessageLevel::Error,
-                            format!("Failed to load config: {}", e),
+                            format!("Failed to load config: {e}"),
                         );
                     }
                 }
@@ -1164,7 +1274,7 @@ impl ConfigGuiApp {
                 Task::perform(
                     async {
                         Config::default_config()
-                            .map_err(|e| format!("Failed to generate defaults: {}", e))
+                            .map_err(|e| format!("Failed to generate defaults: {e}"))
                     },
                     Message::DefaultsRestored,
                 )
@@ -1210,50 +1320,78 @@ impl ConfigGuiApp {
                 self.log_receiver = Some(Arc::new(Mutex::new(rx)));
 
                 let config = self.state.config.clone();
-                match ServerConnection::spawn_process(&config, tx) {
-                    Ok(connection) => {
-                        let mode = connection.mode();
-                        let address = match &connection {
-                            ServerConnection::Process(p) => p.address().to_string(),
-                            ServerConnection::DBus(_) => config.server.listen_addr.clone(),
-                        };
-                        let pid = connection.pid();
+                let pending = self.pending_connection.clone();
 
-                        self.server_connection = Some(connection);
-                        self.connection_mode = mode;
-
-                        self.state.server_status = crate::gui::state::ServerStatus::Running {
-                            connections: 0,
-                            uptime: Duration::from_secs(0),
-                            address,
-                        };
-
-                        let msg = match (mode, pid) {
-                            (ConnectionMode::DBus, _) => {
-                                "Connected to server via D-Bus".to_string()
+                Task::perform(
+                    async move {
+                        let result = ServerConnection::connect(&config, tx, true).await;
+                        match result {
+                            Ok(conn) => {
+                                *pending.lock() = Some(conn);
+                                Ok(())
                             }
-                            (ConnectionMode::Process, Some(p)) => {
-                                format!("Server started (PID: {})", p)
-                            }
-                            _ => "Server started".to_string(),
-                        };
-                        self.state.add_message(MessageLevel::Success, msg);
+                            Err(e) => Err(e),
+                        }
+                    },
+                    Message::ServerConnectResult,
+                )
+            }
+            Message::ServerConnectResult(result) => {
+                match result {
+                    Ok(()) => {
+                        if let Some(connection) = self.pending_connection.lock().take() {
+                            let mode = connection.mode();
+                            let address = match &connection {
+                                ServerConnection::Process(p) => p.address().to_string(),
+                                ServerConnection::DBus(_) | ServerConnection::External(_) => {
+                                    self.state.config.server.listen_addr.clone()
+                                }
+                            };
+                            let pid = connection.pid();
 
-                        // In Flatpak, register with Background portal so the server
-                        // survives GUI close (GNOME 43+ kills unregistered bg processes)
-                        if crate::config::is_flatpak() {
-                            return Task::perform(
-                                crate::gui::server_process::register_background_portal(),
-                                |()| Message::Noop,
+                            if mode == ConnectionMode::DBus {
+                                self.dbus_connection_generation += 1;
+                            }
+                            self.server_connection = Some(connection);
+                            self.connection_mode = mode;
+
+                            self.state.server_status = crate::gui::state::ServerStatus::Running {
+                                connections: 0,
+                                uptime: Duration::from_secs(0),
+                                address,
+                            };
+
+                            let msg = match (mode, pid) {
+                                (ConnectionMode::DBus, _) => {
+                                    "Connected to server via D-Bus".to_string()
+                                }
+                                (ConnectionMode::Process, Some(p)) => {
+                                    format!("Server started (PID: {p})")
+                                }
+                                _ => "Server started".to_string(),
+                            };
+                            self.state.add_message(MessageLevel::Success, msg);
+
+                            // In Flatpak, register with Background portal so the server
+                            // survives GUI close (GNOME 43+ kills unregistered bg processes)
+                            if crate::config::is_flatpak() {
+                                return Task::perform(
+                                    crate::gui::server_process::register_background_portal(),
+                                    |()| Message::Noop,
+                                );
+                            }
+                        } else {
+                            self.state.server_status = crate::gui::state::ServerStatus::Error(
+                                "Connection lost during handoff".to_string(),
                             );
                         }
                     }
                     Err(e) => {
                         self.state.server_status =
-                            crate::gui::state::ServerStatus::Error(e.to_string());
+                            crate::gui::state::ServerStatus::Error(e.clone());
                         self.state.add_message(
                             MessageLevel::Error,
-                            format!("Failed to start server: {}", e),
+                            format!("Failed to start server: {e}"),
                         );
                         self.log_receiver = None;
                     }
@@ -1261,15 +1399,19 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::TryDbusConnect => {
-                // Try to detect existing D-Bus server without spawning
+                // Try to detect and connect to an existing D-Bus server on startup
                 if self.server_connection.is_some() {
                     return Task::none();
                 }
 
+                let pending = self.pending_connection.clone();
                 Task::perform(
-                    async {
+                    async move {
                         match ServerConnection::try_dbus().await {
-                            Some(_) => Ok(()),
+                            Some(conn) => {
+                                *pending.lock() = Some(conn);
+                                Ok(())
+                            }
                             None => Err("No D-Bus server found".to_string()),
                         }
                     },
@@ -1279,28 +1421,50 @@ impl ConfigGuiApp {
             Message::DbusConnectResult(result) => {
                 match result {
                     Ok(()) => {
-                        self.state.add_message(
-                            MessageLevel::Info,
-                            "D-Bus server detected - click Start to connect".to_string(),
-                        );
+                        // Extract the connection stored by the async task
+                        if let Some(connection) = self.pending_connection.lock().take() {
+                            let address = self.state.config.server.listen_addr.clone();
+                            if connection.mode() == ConnectionMode::DBus {
+                                self.dbus_connection_generation += 1;
+                            }
+                            self.connection_mode = connection.mode();
+                            self.server_connection = Some(connection);
+                            self.state.server_status = crate::gui::state::ServerStatus::Running {
+                                connections: 0,
+                                uptime: Duration::from_secs(0),
+                                address,
+                            };
+                            self.state.add_message(
+                                MessageLevel::Success,
+                                "Connected to running server via D-Bus".to_string(),
+                            );
+                        }
                     }
                     Err(_) => {
-                        // No D-Bus server - this is normal, server will be spawned when started
-                        // Don't show a message for this case to avoid noise on startup
+                        // No D-Bus server found on startup - check PID file as fallback.
+                        // Wrap the discovered PID in a ServerConnection::External so the
+                        // GUI's existing control surfaces (Stop button, status display)
+                        // work uniformly regardless of how the server was launched. Stop
+                        // sends SIGTERM (then SIGKILL after grace) to the discovered PID.
+                        if let Some(pid) = crate::gui::server_process::check_pid_file() {
+                            let address = self.state.config.server.listen_addr.clone();
+                            let connection = ServerConnection::external(pid, address.clone());
+                            self.connection_mode = connection.mode();
+                            self.server_connection = Some(connection);
+                            self.state.server_status = crate::gui::state::ServerStatus::Running {
+                                connections: 0,
+                                uptime: Duration::from_secs(0),
+                                address,
+                            };
+                            self.state.add_message(
+                                MessageLevel::Info,
+                                format!(
+                                    "Connected to running server (PID {pid}, externally launched) — Stop will SIGTERM the process"
+                                ),
+                            );
+                        }
                     }
                 }
-                Task::none()
-            }
-            Message::ServerConnectedDbus => {
-                self.connection_mode = ConnectionMode::DBus;
-                self.state.add_message(
-                    MessageLevel::Success,
-                    "Connected to server via D-Bus".to_string(),
-                );
-                Task::none()
-            }
-            Message::ConnectionModeChanged(mode) => {
-                self.connection_mode = mode;
                 Task::none()
             }
             Message::StopServer => {
@@ -1312,12 +1476,13 @@ impl ConfigGuiApp {
                     if let Err(e) = connection.stop() {
                         self.state.add_message(
                             MessageLevel::Error,
-                            format!("Error stopping server: {}", e),
+                            format!("Error stopping server: {e}"),
                         );
                     } else {
                         let msg = match mode {
-                            ConnectionMode::DBus => "Disconnected from D-Bus server",
+                            ConnectionMode::DBus => "Server stopped",
                             ConnectionMode::Process => "Server stopped",
+                            ConnectionMode::External => "Server stopped (SIGTERM to external PID)",
                             ConnectionMode::Disconnected => "Disconnected",
                         };
                         self.state
@@ -1335,7 +1500,7 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::RestartServer => {
-                // Stop then start
+                // Stop if running, then delegate to StartServer
                 if self.server_connection.is_some() {
                     self.state
                         .add_message(MessageLevel::Info, "Restarting server...".to_string());
@@ -1345,59 +1510,12 @@ impl ConfigGuiApp {
                     }
                     self.log_receiver = None;
                     self.connection_mode = ConnectionMode::Disconnected;
-
-                    let (tx, rx) = mpsc::unbounded_channel();
-                    self.log_receiver = Some(Arc::new(Mutex::new(rx)));
-
-                    let config = self.state.config.clone();
-                    match ServerConnection::spawn_process(&config, tx) {
-                        Ok(connection) => {
-                            let mode = connection.mode();
-                            let pid = connection.pid();
-                            let address = match &connection {
-                                ServerConnection::Process(p) => p.address().to_string(),
-                                ServerConnection::DBus(_) => config.server.listen_addr.clone(),
-                            };
-                            self.server_connection = Some(connection);
-                            self.connection_mode = mode;
-
-                            self.state.server_status = crate::gui::state::ServerStatus::Running {
-                                connections: 0,
-                                uptime: Duration::from_secs(0),
-                                address,
-                            };
-
-                            let msg = match pid {
-                                Some(p) => format!("Server restarted (PID: {})", p),
-                                None => "Server restarted".to_string(),
-                            };
-                            self.state.add_message(MessageLevel::Success, msg);
-                        }
-                        Err(e) => {
-                            self.state.server_status =
-                                crate::gui::state::ServerStatus::Error(e.to_string());
-                            self.state.add_message(
-                                MessageLevel::Error,
-                                format!("Failed to restart server: {}", e),
-                            );
-                            self.log_receiver = None;
-                        }
-                    }
-                } else {
-                    // Not running, just start
-                    return self.update(Message::StartServer);
+                    self.state.server_status = crate::gui::state::ServerStatus::Stopped;
                 }
-                Task::none()
+                self.update(Message::StartServer)
             }
             Message::ServerStatusUpdated(status) => {
                 self.state.server_status = status;
-                Task::none()
-            }
-            Message::ServerStarted(pid) => {
-                self.state.add_message(
-                    MessageLevel::Success,
-                    format!("Server process started (PID: {})", pid),
-                );
                 Task::none()
             }
             Message::ServerExited(exit_code) => {
@@ -1406,7 +1524,7 @@ impl ConfigGuiApp {
                 self.connection_mode = ConnectionMode::Disconnected;
 
                 let msg = if let Some(code) = exit_code {
-                    format!("Server exited with code {}", code)
+                    format!("Server exited with code {code}")
                 } else {
                     "Server exited".to_string()
                 };
@@ -1425,16 +1543,6 @@ impl ConfigGuiApp {
                 self.state.add_log_line(log_line);
                 Task::none()
             }
-            Message::ServerStartFailed(error) => {
-                self.server_connection = None;
-                self.log_receiver = None;
-                self.connection_mode = ConnectionMode::Disconnected;
-                self.state.server_status = crate::gui::state::ServerStatus::Error(error.clone());
-                self.state
-                    .add_message(MessageLevel::Error, format!("Server failed: {}", error));
-                Task::none()
-            }
-
             Message::ValidateConfig => {
                 let result = crate::gui::validation::validate_config(&self.state.config);
                 Task::perform(async move { result }, Message::ValidationComplete)
@@ -1475,7 +1583,7 @@ impl ConfigGuiApp {
                             if let Some(f) = file {
                                 let path = f.path().to_path_buf();
                                 crate::gui::capabilities::export_capabilities(&caps_clone, &path)
-                                    .map(|_| path)
+                                    .map(|()| path)
                             } else {
                                 Err("Export cancelled".to_string())
                             }
@@ -1551,13 +1659,13 @@ impl ConfigGuiApp {
                                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
                                 );
                                 for (ts, level, msg) in &logs {
-                                    content.push_str(&format!("{} [{}] {}\n", ts, level, msg));
+                                    content.push_str(&format!("{ts} [{level}] {msg}\n"));
                                 }
                                 handle
                                     .write(content.as_bytes())
                                     .await
-                                    .map(|_| format!("Logs exported ({})", handle.file_name()))
-                                    .map_err(|e| format!("Failed to write: {}", e))
+                                    .map(|()| format!("Logs exported ({})", handle.file_name()))
+                                    .map_err(|e| format!("Failed to write: {e}"))
                             }
                             None => Err("Export cancelled".to_string()),
                         }
@@ -1627,7 +1735,7 @@ impl ConfigGuiApp {
                     Err(e) => {
                         self.state.add_message(
                             MessageLevel::Error,
-                            format!("Failed to save configuration: {}", e),
+                            format!("Failed to save configuration: {e}"),
                         );
                         Task::none()
                     }
@@ -1637,9 +1745,185 @@ impl ConfigGuiApp {
                 self.state.confirm_discard_dialog = false;
                 Task::none()
             }
-            Message::Tick => Task::none(),
+            Message::LiveMetricsUpdated {
+                fps,
+                latency_ms,
+                queue_depth,
+                encoder_backend,
+                activity_level,
+                current_qp,
+                adaptation_enabled,
+                damage_source,
+                sensor_count,
+                bitrate_kbps,
+                health_video,
+                health_input,
+                health_clipboard,
+                health_session,
+            } => {
+                self.state.live_metrics = Some(crate::gui::state::LiveMetrics {
+                    fps,
+                    latency_ms,
+                    queue_depth,
+                    encoder_backend,
+                    activity_level,
+                    current_qp,
+                    adaptation_enabled,
+                    damage_source,
+                    sensor_count,
+                    bitrate_kbps,
+                    last_updated: std::time::Instant::now(),
+                });
+                // Update per-subsystem health from performance signal
+                if let Some(ref mut health) = self.state.session_health {
+                    health.video = health_video;
+                    health.input = health_input;
+                    health.clipboard = health_clipboard;
+                    health.session = health_session;
+                    health.last_updated = std::time::Instant::now();
+                }
+                Task::none()
+            }
+            Message::Tick => {
+                // When connected via D-Bus, periodically check the server is still alive
+                if self.connection_mode == ConnectionMode::DBus && self.server_connection.is_some()
+                {
+                    return Task::perform(
+                        async { crate::gui::dbus_client::DbusClient::is_service_available().await },
+                        Message::DbusHealthCheck,
+                    );
+                }
+                Task::none()
+            }
+            Message::DbusHealthCheck(alive) => {
+                if !alive && self.connection_mode == ConnectionMode::DBus {
+                    // D-Bus server disappeared - clean up
+                    self.server_connection = None;
+                    self.log_receiver = None;
+                    self.connection_mode = ConnectionMode::Disconnected;
+                    self.state.server_status = crate::gui::state::ServerStatus::Stopped;
+                    self.state.add_message(
+                        MessageLevel::Warning,
+                        "Server D-Bus service disappeared - connection lost".to_string(),
+                    );
+                }
+                Task::none()
+            }
+            Message::DbusServerStateChanged(_old, new, detail) => {
+                // Parse health-prefixed states: "running-healthy", "running-degraded", "running-invalid"
+                let (base_state, health) = if let Some(suffix) = new.strip_prefix("running-") {
+                    ("running", Some(suffix.to_string()))
+                } else {
+                    (new.as_str(), None)
+                };
+
+                if let Some(health_level) = health {
+                    // Preserve existing per-subsystem states if already populated
+                    let existing = self.state.session_health.as_ref();
+                    self.state.session_health = Some(crate::gui::state::SessionHealth {
+                        overall: health_level,
+                        detail: detail.clone(),
+                        video: existing.map_or_else(String::new, |h| h.video.clone()),
+                        input: existing.map_or_else(String::new, |h| h.input.clone()),
+                        clipboard: existing.map_or_else(String::new, |h| h.clipboard.clone()),
+                        session: existing.map_or_else(String::new, |h| h.session.clone()),
+                        last_updated: std::time::Instant::now(),
+                    });
+                }
+
+                match base_state {
+                    "stopped" | "error" => {
+                        self.server_connection = None;
+                        self.log_receiver = None;
+                        self.connection_mode = ConnectionMode::Disconnected;
+                        self.state.server_status = crate::gui::state::ServerStatus::Stopped;
+                        self.state.session_health = None;
+                        self.state.add_message(
+                            MessageLevel::Warning,
+                            format!("Server state changed to: {new}"),
+                        );
+                    }
+                    "running" => {
+                        let msg = if detail.is_empty() {
+                            "Server is now running".to_string()
+                        } else {
+                            format!("Server running: {detail}")
+                        };
+                        self.state.add_message(MessageLevel::Success, msg);
+                    }
+                    _ => {}
+                }
+                Task::none()
+            }
+            Message::DbusClientConnected(client_id, peer_addr) => {
+                self.state.add_message(
+                    MessageLevel::Info,
+                    format!("Client connected: {client_id} from {peer_addr}"),
+                );
+                // Update connection count if we're tracking it
+                if let crate::gui::state::ServerStatus::Running {
+                    ref mut connections,
+                    ..
+                } = self.state.server_status
+                {
+                    *connections += 1;
+                }
+                Task::none()
+            }
+            Message::DbusClientDisconnected(client_id, reason) => {
+                self.state.add_message(
+                    MessageLevel::Info,
+                    format!("Client disconnected: {client_id} ({reason})"),
+                );
+                if let crate::gui::state::ServerStatus::Running {
+                    ref mut connections,
+                    ..
+                } = self.state.server_status
+                {
+                    *connections = connections.saturating_sub(1);
+                }
+                Task::none()
+            }
+            Message::DbusConfigReloaded(success) => {
+                if success {
+                    self.state.add_message(
+                        MessageLevel::Info,
+                        "Server configuration reloaded".to_string(),
+                    );
+                } else {
+                    self.state.add_message(
+                        MessageLevel::Warning,
+                        "Server config reload failed".to_string(),
+                    );
+                }
+                Task::none()
+            }
             Message::PollServerLogs => {
                 self.poll_server_logs();
+
+                // For D-Bus mode, poll uptime/connections asynchronously
+                if self.connection_mode == ConnectionMode::DBus
+                    && let Some(ServerConnection::DBus(ref client)) = self.server_connection
+                {
+                    let proxy = client.clone_proxy();
+                    let address = match &self.state.server_status {
+                        crate::gui::state::ServerStatus::Running { address, .. } => address.clone(),
+                        _ => String::new(),
+                    };
+                    return Task::perform(
+                        async move {
+                            let uptime = Duration::from_secs(proxy.uptime().await.unwrap_or(0));
+                            let connections =
+                                proxy.active_connections().await.unwrap_or(0) as usize;
+                            crate::gui::state::ServerStatus::Running {
+                                connections,
+                                uptime,
+                                address,
+                            }
+                        },
+                        Message::ServerStatusUpdated,
+                    );
+                }
                 Task::none()
             }
 
@@ -1658,7 +1942,7 @@ impl ConfigGuiApp {
                         // Mismatched state (one exists, other doesn't)
                         self.state.add_message(
                             MessageLevel::Error,
-                            format!("Certificate configuration error: {}", e),
+                            format!("Certificate configuration error: {e}"),
                         );
                         Task::none()
                     }
@@ -1671,9 +1955,10 @@ impl ConfigGuiApp {
                 let cert_path = self.state.config.security.cert_path.clone();
                 let key_path = self.state.config.security.key_path.clone();
 
-                let hostname = hostname::get()
-                    .map(|h| h.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| "localhost".to_string());
+                let hostname = hostname::get().map_or_else(
+                    |_| "localhost".to_string(),
+                    |h| h.to_string_lossy().to_string(),
+                );
 
                 Task::perform(
                     async move {
@@ -1724,7 +2009,7 @@ impl ConfigGuiApp {
                     Err(e) => {
                         self.state.add_message(
                             MessageLevel::Error,
-                            format!("Failed to generate certificate: {}", e),
+                            format!("Failed to generate certificate: {e}"),
                         );
                     }
                 }
@@ -1734,6 +2019,70 @@ impl ConfigGuiApp {
     }
 
     /// Render the main view
+    /// Render the notification banner for queued user messages. These are added
+    /// via `add_message` (server start/stop results, browse-portal warnings,
+    /// errors); before this existed they were pushed to state but never drawn,
+    /// so the whole notification system was invisible. Shows the most recent
+    /// few, each dismissible.
+    fn view_messages(&self) -> Element<'_, Message> {
+        if self.state.messages.is_empty() {
+            return space().height(0.0).into();
+        }
+
+        let start = self.state.messages.len().saturating_sub(5);
+        let mut banner = column![].spacing(4);
+        for (idx, msg) in self.state.messages.iter().enumerate().skip(start) {
+            let accent = match msg.level {
+                MessageLevel::Info => app_theme::colors::INFO,
+                MessageLevel::Warning => app_theme::colors::WARNING,
+                MessageLevel::Error => app_theme::colors::ERROR,
+                MessageLevel::Success => app_theme::colors::SUCCESS,
+            };
+            let icon = match msg.level {
+                MessageLevel::Info => "ℹ",
+                MessageLevel::Warning => "⚠",
+                MessageLevel::Error => "✗",
+                MessageLevel::Success => "✓",
+            };
+
+            let entry = container(
+                row![
+                    text(icon).size(14).style(move |_theme| text::Style {
+                        color: Some(accent),
+                    }),
+                    text(msg.text.as_str())
+                        .size(13)
+                        .style(|_theme| text::Style {
+                            color: Some(app_theme::colors::TEXT_PRIMARY),
+                        }),
+                    space().width(Length::Fill),
+                    button(text("✕").size(12))
+                        .on_press(Message::DismissMessage(idx))
+                        .style(button::text),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding(8)
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(app_theme::colors::SURFACE)),
+                border: iced::Border {
+                    color: accent,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            });
+            banner = banner.push(entry);
+        }
+
+        container(banner)
+            .padding([8, 12])
+            .width(Length::Fill)
+            .into()
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let header = self.view_header();
         let tab_bar = self.view_tab_bar();
@@ -1742,7 +2091,8 @@ impl ConfigGuiApp {
 
         let main_content = scrollable(content).height(Length::Fill);
 
-        let mut main_layout = column![header, tab_bar, main_content, footer,].spacing(0);
+        let mut main_layout =
+            column![header, tab_bar, self.view_messages(), main_content, footer,].spacing(0);
 
         if self.state.first_run_cert_dialog {
             main_layout = column![
@@ -1859,32 +2209,40 @@ impl ConfigGuiApp {
         ]
         .spacing(2)
         .padding(24)
-        .width(Length::Fixed(480.0));
+        .width(Length::Fill);
 
-        container(container(dialog_content).style(|_theme| container::Style {
-            background: Some(iced::Background::Color(app_theme::colors::SURFACE)),
-            border: iced::Border {
-                color: app_theme::colors::BORDER,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            shadow: iced::Shadow {
-                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 16.0,
-            },
-            ..Default::default()
-        }))
-        .width(Length::Fill)
-        .height(Length::Shrink)
-        .padding(iced::Padding {
-            top: 40.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        })
-        .center_x(Length::Fill)
-        .into()
+        // Center dialog at ~60% width using fill-portion spacers
+        let dialog_row = row![
+            space().width(Length::FillPortion(1)),
+            container(dialog_content)
+                .style(|_theme| container::Style {
+                    background: Some(iced::Background::Color(app_theme::colors::SURFACE)),
+                    border: iced::Border {
+                        color: app_theme::colors::BORDER,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    shadow: iced::Shadow {
+                        color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+                        offset: iced::Vector::new(0.0, 4.0),
+                        blur_radius: 16.0,
+                    },
+                    ..Default::default()
+                })
+                .width(Length::FillPortion(3)),
+            space().width(Length::FillPortion(1)),
+        ];
+
+        container(dialog_row)
+            .width(Length::Fill)
+            .height(Length::Shrink)
+            .padding(iced::Padding {
+                top: 40.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            })
+            .into()
     }
 
     /// Render the unsaved changes confirmation dialog
@@ -1922,32 +2280,40 @@ impl ConfigGuiApp {
         ]
         .spacing(2)
         .padding(24)
-        .width(Length::Fixed(400.0));
+        .width(Length::Fill);
 
-        container(container(dialog_content).style(|_theme| container::Style {
-            background: Some(iced::Background::Color(app_theme::colors::SURFACE)),
-            border: iced::Border {
-                color: app_theme::colors::BORDER,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            shadow: iced::Shadow {
-                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 16.0,
-            },
-            ..Default::default()
-        }))
-        .width(Length::Fill)
-        .height(Length::Shrink)
-        .padding(iced::Padding {
-            top: 100.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        })
-        .center_x(Length::Fill)
-        .into()
+        // Center dialog at ~60% width using fill-portion spacers
+        let dialog_row = row![
+            space().width(Length::FillPortion(1)),
+            container(dialog_content)
+                .style(|_theme| container::Style {
+                    background: Some(iced::Background::Color(app_theme::colors::SURFACE)),
+                    border: iced::Border {
+                        color: app_theme::colors::BORDER,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    shadow: iced::Shadow {
+                        color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+                        offset: iced::Vector::new(0.0, 4.0),
+                        blur_radius: 16.0,
+                    },
+                    ..Default::default()
+                })
+                .width(Length::FillPortion(3)),
+            space().width(Length::FillPortion(1)),
+        ];
+
+        container(dialog_row)
+            .width(Length::Fill)
+            .height(Length::Shrink)
+            .padding(iced::Padding {
+                top: 100.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            })
+            .into()
     }
 
     /// Render the header
@@ -2244,6 +2610,14 @@ impl ConfigGuiApp {
             );
         }
 
+        // D-Bus signal subscription: restarts on each reconnect (generation change)
+        if self.connection_mode == ConnectionMode::DBus && self.server_connection.is_some() {
+            subscriptions.push(Subscription::run_with(
+                self.dbus_connection_generation,
+                dbus_signal_stream,
+            ));
+        }
+
         Subscription::batch(subscriptions)
     }
 
@@ -2272,7 +2646,9 @@ impl ConfigGuiApp {
             }
         }
 
-        // Check if server is still running (process mode only for sync check)
+        // Liveness + uptime tick. Process and External both support sync probes
+        // (the child handle / signal-0 to the discovered PID). D-Bus uses async
+        // polling in the PollServerLogs handler instead.
         if let Some(ref connection) = self.server_connection {
             match connection {
                 ServerConnection::Process(process) => {
@@ -2285,26 +2661,134 @@ impl ConfigGuiApp {
                             MessageLevel::Warning,
                             "Server process exited unexpectedly".to_string(),
                         );
-                    } else {
-                        // Update uptime
-                        if let crate::gui::state::ServerStatus::Running {
-                            ref mut uptime,
-                            connections: _,
-                            address: _,
-                        } = self.state.server_status
-                        {
-                            *uptime = process.uptime();
-                        }
+                    } else if let crate::gui::state::ServerStatus::Running {
+                        ref mut uptime,
+                        connections: _,
+                        address: _,
+                    } = self.state.server_status
+                    {
+                        *uptime = process.uptime();
+                    }
+                }
+                ServerConnection::External(ext) => {
+                    if !ext.is_running() {
+                        // External server went away (operator killed it elsewhere,
+                        // or it crashed). Drop our handle.
+                        self.server_connection = None;
+                        self.connection_mode = ConnectionMode::Disconnected;
+                        self.state.server_status = crate::gui::state::ServerStatus::Stopped;
+                        self.state.add_message(
+                            MessageLevel::Info,
+                            "Externally-managed server is no longer running".to_string(),
+                        );
+                    } else if let crate::gui::state::ServerStatus::Running {
+                        ref mut uptime,
+                        connections: _,
+                        address: _,
+                    } = self.state.server_status
+                    {
+                        *uptime = ext.uptime();
                     }
                 }
                 ServerConnection::DBus(_) => {
-                    // D-Bus mode: uptime is fetched asynchronously
-                    // For now, we rely on the server pushing status updates
-                    // TODO: Implement async polling for D-Bus status
+                    // D-Bus mode: uptime/connections polled via Task::perform
+                    // in the PollServerLogs handler (async D-Bus property reads)
                 }
             }
         }
     }
+}
+
+/// Multiplexed D-Bus signal stream for iced subscription.
+///
+/// Connects to the session bus independently and subscribes to all 5 server
+/// signals. The stream ends when the D-Bus connection drops, which triggers
+/// iced to restart the subscription on the next generation increment.
+fn dbus_signal_stream(
+    _generation: &u64,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = Message> + Send>> {
+    Box::pin(iced::stream::channel(32, async move |mut output| {
+        use futures::{SinkExt, StreamExt};
+
+        let Ok(connection) = zbus::Connection::session().await else {
+            return;
+        };
+        let Ok(proxy) = crate::gui::dbus_client::ManagerProxy::new(&connection).await else {
+            return;
+        };
+
+        let Ok(mut state_stream) = proxy.receive_server_state_changed().await else {
+            return;
+        };
+        let Ok(mut perf_stream) = proxy.receive_performance_updated().await else {
+            return;
+        };
+        let Ok(mut connect_stream) = proxy.receive_client_connected().await else {
+            return;
+        };
+        let Ok(mut disconnect_stream) = proxy.receive_client_disconnected().await else {
+            return;
+        };
+        let Ok(mut config_stream) = proxy.receive_config_reloaded().await else {
+            return;
+        };
+
+        loop {
+            tokio::select! {
+                Some(signal) = state_stream.next() => {
+                    if let Ok(args) = signal.args() {
+                        let _ = output.send(Message::DbusServerStateChanged(
+                            args.old_status.to_string(),
+                            args.new_status.to_string(),
+                            args.message.to_string(),
+                        )).await;
+                    }
+                }
+                Some(signal) = perf_stream.next() => {
+                    if let Ok(args) = signal.args() {
+                        let _ = output.send(Message::LiveMetricsUpdated {
+                            fps: args.fps,
+                            latency_ms: args.latency_ms,
+                            queue_depth: args.queue_depth,
+                            encoder_backend: args.encoder_backend.to_string(),
+                            activity_level: args.activity_level.to_string(),
+                            current_qp: args.current_qp,
+                            adaptation_enabled: args.adaptation_enabled,
+                            damage_source: args.damage_source.to_string(),
+                            sensor_count: args.sensor_count,
+                            bitrate_kbps: args.bitrate_kbps,
+                            health_video: args.health_video.to_string(),
+                            health_input: args.health_input.to_string(),
+                            health_clipboard: args.health_clipboard.to_string(),
+                            health_session: args.health_session.to_string(),
+                        }).await;
+                    }
+                }
+                Some(signal) = connect_stream.next() => {
+                    if let Ok(args) = signal.args() {
+                        let _ = output.send(Message::DbusClientConnected(
+                            args.client_id.to_string(),
+                            args.peer_address.to_string(),
+                        )).await;
+                    }
+                }
+                Some(signal) = disconnect_stream.next() => {
+                    if let Ok(args) = signal.args() {
+                        let _ = output.send(Message::DbusClientDisconnected(
+                            args.client_id.to_string(),
+                            args.reason.to_string(),
+                        )).await;
+                    }
+                }
+                Some(signal) = config_stream.next() => {
+                    if let Ok(_args) = signal.args() {
+                        let _ = output.send(Message::DbusConfigReloaded(true)).await;
+                    }
+                }
+                else => break,
+            }
+        }
+    }))
 }
 
 /// Apply performance preset to config

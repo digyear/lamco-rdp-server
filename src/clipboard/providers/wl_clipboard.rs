@@ -120,6 +120,11 @@ mod monitor {
             wl_seat::{self, WlSeat},
         },
     };
+    use wayland_protocols::ext::data_control::v1::client::{
+        ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
+        ext_data_control_manager_v1::ExtDataControlManagerV1,
+        ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
+    };
     use wayland_protocols_wlr::data_control::v1::client::{
         zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
         zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
@@ -130,8 +135,10 @@ mod monitor {
 
     /// State for the persistent clipboard monitor.
     pub(super) struct MonitorState {
-        /// MIME types for each pending offer (populated by Offer events)
+        /// MIME types for each pending wlr offer (populated by Offer events)
         offers: HashMap<ZwlrDataControlOfferV1, Vec<String>>,
+        /// MIME types for each pending ext offer (populated by Offer events)
+        ext_offers: HashMap<ExtDataControlOfferV1, Vec<String>>,
         /// Current selection's MIME types (set when Selection event fires)
         pub(super) current_mime_types: HashSet<String>,
         /// True when the selection changed since last check
@@ -144,6 +151,7 @@ mod monitor {
         fn new() -> Self {
             Self {
                 offers: HashMap::new(),
+                ext_offers: HashMap::new(),
                 current_mime_types: HashSet::new(),
                 selection_changed: false,
                 has_seat: false,
@@ -257,6 +265,81 @@ mod monitor {
         }
     }
 
+    // ExtDataControlManagerV1 dispatch — no events defined
+    impl Dispatch<ExtDataControlManagerV1, ()> for MonitorState {
+        fn event(
+            _state: &mut Self,
+            _proxy: &ExtDataControlManagerV1,
+            _event: <ExtDataControlManagerV1 as wayland_client::Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    // ExtDataControlDeviceV1 dispatch — handles selection changes
+    impl Dispatch<ExtDataControlDeviceV1, ()> for MonitorState {
+        fn event(
+            state: &mut Self,
+            _proxy: &ExtDataControlDeviceV1,
+            event: <ExtDataControlDeviceV1 as wayland_client::Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            match event {
+                ext_data_control_device_v1::Event::DataOffer { id } => {
+                    state.ext_offers.insert(id, Vec::new());
+                }
+                ext_data_control_device_v1::Event::Selection { id } => {
+                    let new_types: HashSet<String> = match id {
+                        Some(offer) => state
+                            .ext_offers
+                            .remove(&offer)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
+                        None => HashSet::new(),
+                    };
+                    if new_types != state.current_mime_types {
+                        state.current_mime_types = new_types;
+                        state.selection_changed = true;
+                    }
+                    state.ext_offers.retain(|_, _| false);
+                }
+                ext_data_control_device_v1::Event::Finished => {
+                    warn!(
+                        "wl-clipboard monitor: data-control device finished (compositor restarted?)"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        event_created_child!(MonitorState, ExtDataControlDeviceV1, [
+            ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ()),
+        ]);
+    }
+
+    // ExtDataControlOfferV1 dispatch — collects MIME types from offers
+    impl Dispatch<ExtDataControlOfferV1, ()> for MonitorState {
+        fn event(
+            state: &mut Self,
+            proxy: &ExtDataControlOfferV1,
+            event: <ExtDataControlOfferV1 as wayland_client::Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let ext_data_control_offer_v1::Event::Offer { mime_type } = event
+                && let Some(types) = state.ext_offers.get_mut(proxy)
+            {
+                types.push(mime_type);
+            }
+        }
+    }
+
     /// Try to create a persistent data-control monitor.
     ///
     /// Returns the event queue and initial state, or None if the compositor
@@ -280,16 +363,7 @@ mod monitor {
 
         let qh = queue.handle();
 
-        // Bind wlr-data-control-v1 manager
-        let manager: ZwlrDataControlManagerV1 = match globals.bind(&qh, 1..=2, ()) {
-            Ok(m) => m,
-            Err(_) => {
-                warn!("wl-clipboard monitor: compositor lacks wlr-data-control-v1");
-                return None;
-            }
-        };
-
-        // Find the first seat
+        // Find the first seat (needed for either protocol).
         let registry = globals.registry();
         let seat: Option<WlSeat> = globals.contents().with_list(|list| {
             list.iter()
@@ -302,8 +376,22 @@ mod monitor {
             return None;
         };
 
-        // Create a data-control device for the seat
-        let _device = manager.get_data_device(&seat, &qh, ());
+        // Prefer the standardized ext-data-control-v1; fall back to
+        // wlr-data-control-v1. KWin (and other modern compositors) expose only
+        // ext-, so binding wlr first is why the monitor previously dropped to
+        // ephemeral polling on Plasma.
+        if let Ok(manager) = globals.bind::<ExtDataControlManagerV1, _, _>(&qh, 1..=1, ()) {
+            manager.get_data_device(&seat, &qh, ());
+            debug!("wl-clipboard monitor: bound ext-data-control-v1");
+        } else if let Ok(manager) = globals.bind::<ZwlrDataControlManagerV1, _, _>(&qh, 1..=2, ()) {
+            manager.get_data_device(&seat, &qh, ());
+            debug!("wl-clipboard monitor: bound wlr-data-control-v1");
+        } else {
+            warn!(
+                "wl-clipboard monitor: compositor lacks ext-data-control-v1 and wlr-data-control-v1"
+            );
+            return None;
+        }
 
         let state = MonitorState::new();
         Some((queue, state))
@@ -575,6 +663,24 @@ impl ClipboardProvider for WlClipboardProvider {
                 });
         }
 
+        Ok(())
+    }
+
+    async fn on_remote_gone(&self) -> Result<()> {
+        // complete_transfer materializes the remote payload into self-contained
+        // local bytes (copy_multi → Source::Bytes), so the selection is valid
+        // local data that outlives the remote — nothing is held "on the remote's
+        // behalf" to relinquish. A wl_copy::clear() here would force
+        // set_selection(None) on every seat regardless of owner, destroying
+        // whatever a local app may now own. So only drop our in-memory caches.
+        self.pending_data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.our_mime_types
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         Ok(())
     }
 

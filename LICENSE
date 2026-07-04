@@ -2,40 +2,72 @@ Business Source License 1.1
 
 Parameters
 
-Licensor:             Lamco Development
+Licensor:             Lamco Development LLC
 
 Licensed Work:        lamco-rdp-server
-                      The Licensed Work is (c) 2025-2026 Lamco Development
+                      The Licensed Work is (c) 2025-2026 Lamco Development LLC.
 
-Additional Use Grant: You may make production use of the Licensed Work,
-                      provided Your use does not include a Competitive Use
-                      (as defined below).
+                      The Licensed Work is the lamco-rdp-server desktop
+                      remote-desktop-sharing product. The Licensed Work does
+                      not include, and this License does not grant any rights
+                      in, the lamco-qemu-rdp hypervisor console or any other
+                      hypervisor, virtual-desktop, or console product, which
+                      are licensed separately.
 
-                      In addition, You may make production use of the
-                      Licensed Work without purchasing a commercial license
-                      if any of the following apply:
+Additional Use Grant: You may make production use of the Licensed Work only
+                      if both of the following are true:
+
+                      (i) Your use does not include a Competitive Use (as
+                          defined below); and
+
+                      (ii) at least one of the following classes applies to
+                           Your use:
 
                       1. You are a non-profit organization.
-                      2. Your use is limited to a single server instance.
-                      3. Your use is of a Community Edition of the Licensed
-                         Work. A "Community Edition" is any binary
-                         distribution of the Licensed Work that is published
-                         by the Licensor and designated as "Community
-                         Edition" in the documentation accompanying the
-                         distribution.
 
-                      All other production use requires a commercial license
-                      from Lamco Development. Visit https://lamco.ai for
-                      pricing, or contact office@lamco.io.
+                      2. Your use is limited to a single server instance. A
+                         "server instance" means one running invocation of the
+                         Licensed Work serving remote-desktop sessions,
+                         counted once per operating-system environment in
+                         which it runs, whether that environment is a physical
+                         host, a virtual machine, or a container. Two or more
+                         concurrently running invocations, or invocations
+                         across two or more such environments, are two or more
+                         server instances.
+
+                      3. Your use is for non-commercial educational or
+                         research purposes, including use by an educational
+                         institution to provide remote access to its students,
+                         faculty, or researchers.
+
+                      4. Your use is of a Community Edition of the Licensed
+                         Work. A "Community Edition" is a binary distribution
+                         of the lamco-rdp-server desktop product that is
+                         published by the Licensor and designated as
+                         "Community Edition" in or with that distribution,
+                         including in its embedded package metadata, in the
+                         documentation accompanying it, or in a list of
+                         Community Edition distributions published by the
+                         Licensor. This class applies only to such
+                         desktop-product distributions and to no other product;
+                         no distribution of any hypervisor, console, or
+                         virtual-desktop product is a Community Edition under
+                         this License, regardless of how its documentation
+                         describes it.
+
+                      If Your use does not satisfy both (i) and (ii) above, You
+                      must purchase a commercial license from the Licensor.
+                      Visit https://lamco.ai for pricing, or contact
+                      office@lamco.io.
 
                       A "Competitive Use" means using the Licensed Work to
                       create, offer, host, or distribute a Competitive
                       Product. A "Competitive Product" is any product or
                       service made available to third parties that provides
                       RDP server, remote desktop, virtual desktop
-                      infrastructure (VDI), or remote access functionality
-                      where such functionality is substantially derived from
-                      the Licensed Work.
+                      infrastructure (VDI), hypervisor console access, or
+                      remote access functionality where such functionality is
+                      substantially derived from the Licensed Work.
 
                       The following are not Competitive Uses:
 
@@ -52,10 +84,18 @@ Additional Use Grant: You may make production use of the Licensed Work,
                           education or research.
                       (d) Redistributing the Licensed Work in unmodified
                           source form with this License intact.
+                      (e) Redistributing unmodified binary distributions of
+                          the Licensed Work published by the Licensor, with
+                          this License intact.
 
-Change Date:          2028-12-31
+Change Date:          2029-06-01
 
 Change License:       Apache License 2.0
+
+                      Standing policy: each released version carries its own
+                      Change Date approximately three years after that
+                      version's first publication, so that on any version's
+                      Change Date only that three-year-old version converts.
 
 Notice
 

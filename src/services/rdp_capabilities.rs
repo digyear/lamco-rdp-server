@@ -99,6 +99,15 @@ impl RdpCapability {
         }
     }
 
+    pub fn remotefx_bitmap() -> Self {
+        Self::EgfxCodec {
+            avc444: false,
+            avc420: false,
+            remotefx: true,
+            progressive: false,
+        }
+    }
+
     pub fn egfx_full() -> Self {
         Self::EgfxCodec {
             avc444: true,

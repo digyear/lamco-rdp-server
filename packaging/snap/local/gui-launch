@@ -1,0 +1,33 @@
+#!/bin/bash
+# Desktop-launch wrapper for the strictly-confined GUI (command-chain).
+#
+# The snapd `wayland` plug only grants AppArmor access to the HOST socket
+# (/run/user/<uid>/wayland-N); it does NOT place a socket in the per-snap
+# XDG_RUNTIME_DIR (/run/user/<uid>/snap.<name>/) that `snap run` points the app
+# at. libwayland/winit look for $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY and find
+# nothing, so a Wayland GUI panics with NoCompositor. The snapd desktop
+# extensions fix this by symlinking the socket in; we do the same minimal step
+# here instead of pulling a full GTK/GNOME platform runtime. Logic copied from
+# Canonical's snapcraft-desktop-helpers (common/desktop-exports).
+set -e
+
+# 1) Expose the host Wayland socket inside the per-snap XDG_RUNTIME_DIR.
+if [ -n "$XDG_RUNTIME_DIR" ] && [ -z "$DISABLE_WAYLAND" ]; then
+    wdisplay="${WAYLAND_DISPLAY:-wayland-0}"
+    real_sock="$XDG_RUNTIME_DIR/../$wdisplay"   # host: /run/user/<uid>/wayland-N
+    snap_sock="$XDG_RUNTIME_DIR/$wdisplay"       # per-snap: .../snap.<name>/wayland-N
+    if [ -S "$real_sock" ] && [ ! -e "$snap_sock" ]; then
+        ln -sf "$real_sock" "$snap_sock"
+    fi
+fi
+
+# 2) XKB keymap data for libxkbcommon (winit keyboard init). Requires the
+#    xkb-data stage-package, which provides /usr/share/X11/xkb.
+export XKB_CONFIG_ROOT="$SNAP/usr/share/X11/xkb"
+export XLOCALEDIR="$SNAP/usr/share/X11/locale"
+
+# 3) Fonts: point fontconfig at the snap's staged config so text renders.
+export FONTCONFIG_PATH="$SNAP/etc/fonts"
+export FONTCONFIG_FILE="$SNAP/etc/fonts/fonts.conf"
+
+exec "$@"

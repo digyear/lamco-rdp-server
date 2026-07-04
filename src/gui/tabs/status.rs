@@ -17,7 +17,7 @@ use crate::gui::{
 const LOG_LEVELS: &[&str] = &["Trace", "Debug", "Info", "Warn", "Error"];
 
 pub fn view_status_tab(state: &AppState) -> Element<'_, Message> {
-    column![
+    let mut content = column![
         // Section header
         widgets::section_header("Status & Monitoring"),
         space().height(16.0),
@@ -26,23 +26,199 @@ pub fn view_status_tab(state: &AppState) -> Element<'_, Message> {
         space().height(8.0),
         view_server_status(state),
         space().height(20.0),
-        // Detected Capabilities section
-        widgets::collapsible_header(
-            "Detected Capabilities & Service Registry",
-            true,                         // Always expanded
-            Message::RefreshCapabilities, // Just use refresh as a placeholder
-        ),
-        space().height(8.0),
-        view_capabilities_section(state),
-        space().height(20.0),
-        // Live Logs section
-        widgets::subsection_header("Live Logs"),
-        space().height(8.0),
-        view_log_viewer(state),
     ]
-    .spacing(4)
-    .padding(20)
-    .into()
+    .spacing(4);
+
+    // Subsystem Health section (only when health data arrives via D-Bus)
+    if state.session_health.is_some() {
+        content = content
+            .push(widgets::subsection_header("Subsystem Health"))
+            .push(space().height(8.0))
+            .push(view_session_health(state))
+            .push(space().height(20.0));
+    }
+
+    // Live Performance section (only when metrics are available)
+    if state.live_metrics.is_some() {
+        content = content
+            .push(widgets::subsection_header("Live Performance"))
+            .push(space().height(8.0))
+            .push(view_live_performance(state))
+            .push(space().height(20.0));
+    }
+
+    content = content
+        .push(widgets::subsection_header(
+            "Detected Capabilities & Service Registry",
+        ))
+        .push(space().height(8.0))
+        .push(view_capabilities_section(state))
+        .push(space().height(20.0))
+        .push(widgets::subsection_header("Live Logs"))
+        .push(space().height(8.0))
+        .push(view_log_viewer(state));
+
+    content.padding(20).into()
+}
+
+fn health_indicator(status: &str) -> (&'static str, iced::Color) {
+    match status {
+        "Healthy" | "healthy" => ("●", theme::colors::SUCCESS),
+        "Degraded" | "degraded" => ("●", theme::colors::WARNING),
+        "Failed" | "failed" | "Invalid" | "invalid" => ("●", theme::colors::ERROR),
+        "NotApplicable" | "not_applicable" => ("○", theme::colors::TEXT_MUTED),
+        _ => ("○", theme::colors::TEXT_MUTED),
+    }
+}
+
+fn view_session_health(state: &AppState) -> Element<'_, Message> {
+    let Some(ref health) = state.session_health else {
+        return text("No health data").into();
+    };
+
+    let (indicator, health_color) = health_indicator(&health.overall);
+
+    let age_secs = health.last_updated.elapsed().as_secs();
+    let freshness = if age_secs < 30 { "" } else { " (stale)" };
+
+    let mut col = column![
+        row![
+            text(indicator).size(16).style(move |_theme| text::Style {
+                color: Some(health_color),
+            }),
+            text(format!("Session Health: {}{freshness}", health.overall)).size(14),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(4);
+
+    if !health.detail.is_empty() {
+        col = col.push(
+            text(&health.detail)
+                .size(12)
+                .style(|_theme: &iced::Theme| text::Style {
+                    color: Some(theme::colors::TEXT_SECONDARY),
+                }),
+        );
+    }
+
+    // Per-subsystem breakdown (populated from PerformanceUpdated signal)
+    let subsystems = [
+        ("Video", &health.video),
+        ("Input", &health.input),
+        ("Clipboard", &health.clipboard),
+        ("Session", &health.session),
+    ];
+
+    let has_subsystem_data = subsystems.iter().any(|(_, s)| !s.is_empty());
+    if has_subsystem_data {
+        let mut sub_row = row![].spacing(16);
+        for (name, status) in &subsystems {
+            if !status.is_empty() {
+                let (dot, color) = health_indicator(status);
+                sub_row = sub_row.push(
+                    row![
+                        text(dot)
+                            .size(10)
+                            .style(move |_theme| text::Style { color: Some(color) }),
+                        text(format!("{name}: {status}")).size(12),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+        col = col.push(space().height(2.0)).push(sub_row);
+    }
+
+    container(col.padding(12))
+        .style(theme::section_container_style)
+        .into()
+}
+
+fn view_live_performance(state: &AppState) -> Element<'_, Message> {
+    let Some(ref metrics) = state.live_metrics else {
+        return text("No metrics available").into();
+    };
+
+    let age_secs = metrics.last_updated.elapsed().as_secs();
+    let (freshness, freshness_color) = if age_secs < 5 {
+        ("live", theme::colors::SUCCESS)
+    } else if age_secs < 30 {
+        ("updating", theme::colors::WARNING)
+    } else {
+        ("stale", theme::colors::ERROR)
+    };
+
+    let mut col = column![
+        row![
+            text(format!("FPS: {}", metrics.fps)).width(Length::FillPortion(1)),
+            text(format!("Latency: {:.1}ms", metrics.latency_ms)).width(Length::FillPortion(1)),
+            text(format!("Queue: {}", metrics.queue_depth)).width(Length::FillPortion(1)),
+        ]
+        .spacing(16),
+        space().height(4.0),
+        row![
+            text(format!("Activity: {}", metrics.activity_level)).width(Length::FillPortion(1)),
+            text(format!(
+                "Encoder: {}",
+                if metrics.encoder_backend.is_empty() {
+                    "none"
+                } else {
+                    &metrics.encoder_backend
+                }
+            ))
+            .width(Length::FillPortion(1)),
+            text(format!("({freshness})"))
+                .width(Length::FillPortion(1))
+                .style(move |_theme| text::Style {
+                    color: Some(freshness_color),
+                }),
+        ]
+        .spacing(16),
+    ]
+    .spacing(4);
+
+    // Third row: encoding adaptation, bitrate, damage source
+    let mut row3 = row![].spacing(16);
+
+    if metrics.adaptation_enabled {
+        row3 = row3.push(
+            text(format!("QP: {} (adaptive)", metrics.current_qp)).width(Length::FillPortion(1)),
+        );
+    } else if metrics.current_qp > 0 {
+        row3 = row3.push(text(format!("QP: {}", metrics.current_qp)).width(Length::FillPortion(1)));
+    }
+
+    if metrics.bitrate_kbps > 0 {
+        row3 = row3.push(
+            text(format!("Bitrate: {} kbps", metrics.bitrate_kbps)).width(Length::FillPortion(1)),
+        );
+    }
+
+    if !metrics.damage_source.is_empty() {
+        row3 = row3
+            .push(text(format!("Damage: {}", metrics.damage_source)).width(Length::FillPortion(1)));
+    }
+
+    if metrics.sensor_count > 0 {
+        row3 = row3
+            .push(text(format!("Sensors: {}", metrics.sensor_count)).width(Length::FillPortion(1)));
+    }
+
+    // Only add the third row if it has content
+    let row3_el: Element<'_, Message> = row3.into();
+    if metrics.adaptation_enabled
+        || metrics.current_qp > 0
+        || metrics.bitrate_kbps > 0
+        || !metrics.damage_source.is_empty()
+        || metrics.sensor_count > 0
+    {
+        col = col.push(space().height(4.0)).push(row3_el);
+    }
+
+    col.into()
 }
 
 fn view_server_status(state: &AppState) -> Element<'_, Message> {
@@ -64,11 +240,10 @@ fn view_server_status(state: &AppState) -> Element<'_, Message> {
             let minutes = (uptime.as_secs() % 3600) / 60;
             let seconds = uptime.as_secs() % 60;
             format!(
-                "Uptime: {}h {}m {}s | Connections: {} | Address: {}",
-                hours, minutes, seconds, connections, address
+                "Uptime: {hours}h {minutes}m {seconds}s | Connections: {connections} | Address: {address}"
             )
         }
-        ServerStatus::Error(msg) => format!("Error: {}", msg),
+        ServerStatus::Error(msg) => format!("Error: {msg}"),
         _ => String::new(),
     };
 
@@ -78,7 +253,7 @@ fn view_server_status(state: &AppState) -> Element<'_, Message> {
                 text("●").size(16).style(move |_theme| text::Style {
                     color: Some(status_color),
                 }),
-                text(format!("Status: {}", status_text)).size(16),
+                text(format!("Status: {status_text}")).size(16),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -132,12 +307,10 @@ fn view_capabilities_section(state: &AppState) -> Element<'_, Message> {
         let xdg_runtime_str = caps.xdg_runtime_dir.display().to_string();
         let screencast_version_str = caps
             .screencast_version
-            .map(|v| format!("v{}", v))
-            .unwrap_or_else(|| "N/A".to_string());
+            .map_or_else(|| "N/A".to_string(), |v| format!("v{v}"));
         let remote_desktop_version_str = caps
             .remote_desktop_version
-            .map(|v| format!("v{}", v))
-            .unwrap_or_else(|| "N/A".to_string());
+            .map_or_else(|| "N/A".to_string(), |v| format!("v{v}"));
         let compositor_full = format!(
             "{} ({})",
             caps.compositor_name,
@@ -148,11 +321,13 @@ fn view_capabilities_section(state: &AppState) -> Element<'_, Message> {
             caps.services
                 .iter()
                 .find(|s| s.id == "DirectCompositorAPI")
-                .map(|s| {
-                    let notes = s.notes.first().cloned().unwrap_or_default();
-                    format!("{} {}", s.level_emoji, notes)
-                })
-                .unwrap_or_else(|| "Not probed".to_string())
+                .map_or_else(
+                    || "Not probed".to_string(),
+                    |s| {
+                        let notes = s.notes.first().cloned().unwrap_or_default();
+                        format!("{} {}", s.level_emoji, notes)
+                    },
+                )
         } else {
             String::new()
         };
@@ -257,12 +432,12 @@ fn view_capabilities_section(state: &AppState) -> Element<'_, Message> {
                     Element::from(column![
                         text("Performance Hints:").size(13),
                         if let Some(fps) = caps.recommended_fps {
-                            Element::from(text(format!("  • Recommended FPS: {}", fps)).size(12))
+                            Element::from(text(format!("  • Recommended FPS: {fps}")).size(12))
                         } else {
                             Element::from(space().height(0.0))
                         },
                         if let Some(ref codec) = caps.recommended_codec {
-                            Element::from(text(format!("  • Recommended Codec: {}", codec)).size(12))
+                            Element::from(text(format!("  • Recommended Codec: {codec}")).size(12))
                         } else {
                             Element::from(space().height(0.0))
                         },
@@ -370,7 +545,7 @@ fn view_service_registry_table(
                     .notes
                     .iter()
                     .map(|note| {
-                        text(format!("    ↳ {}", note))
+                        text(format!("    ↳ {note}"))
                             .size(11)
                             .style(|_theme| text::Style {
                                 color: Some(theme::colors::TEXT_MUTED),

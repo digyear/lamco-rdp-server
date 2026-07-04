@@ -50,6 +50,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return run_gui();
     }
 
+    // Honor the explicit escape hatch BEFORE probing the GPU, so it holds even when
+    // capability detection would misclassify the adapter. The re-exec sets the
+    // software env and re-enters through the early return above.
+    if force_software {
+        info!("Forced software rendering via LAMCO_GUI_SOFTWARE environment variable");
+        reexec_with_software_rendering();
+    }
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async { Capabilities::initialize().await })?;
 
@@ -70,11 +78,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         RenderingRecommendation::UseGpu { reason } => {
             info!("Using GPU rendering: {}", reason);
         }
-    }
-
-    if force_software {
-        info!("Forced software rendering via LAMCO_GUI_SOFTWARE environment variable");
-        reexec_with_software_rendering();
     }
 
     setup_panic_handler();
@@ -100,7 +103,7 @@ fn reexec_with_software_rendering() -> ! {
         .exec();
 
     // exec() only returns on error
-    eprintln!("Failed to re-exec: {}", err);
+    eprintln!("Failed to re-exec: {err}");
     std::process::exit(1);
 }
 
@@ -139,9 +142,9 @@ fn print_no_gui_message(reason: &str, suggestion: &str) {
     eprintln!("  GUI Unavailable");
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     eprintln!();
-    eprintln!("  Reason: {}", reason);
+    eprintln!("  Reason: {reason}");
     eprintln!();
-    eprintln!("  Suggestion: {}", suggestion);
+    eprintln!("  Suggestion: {suggestion}");
     eprintln!();
     eprintln!("  For CLI usage:");
     eprintln!("    lamco-rdp-server --help");
@@ -162,7 +165,7 @@ fn print_gpu_error_message(msg: &str) {
     eprintln!();
     eprintln!("  Your system's GPU does not support required features.");
     eprintln!();
-    eprintln!("  Error: {}", msg);
+    eprintln!("  Error: {msg}");
     eprintln!();
     eprintln!("  Solutions:");
     eprintln!("    1. Enable GPU passthrough in VM settings");
@@ -179,6 +182,10 @@ fn print_gpu_error_message(msg: &str) {
 fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     iced::application(ConfigGuiApp::new, ConfigGuiApp::update, ConfigGuiApp::view)
         .title("Lamco RDP Server")
+        .window(iced::window::Settings {
+            min_size: Some(Size::new(700.0, 450.0)),
+            ..Default::default()
+        })
         .window_size(Size::new(1200.0, 800.0))
         .centered()
         .antialiasing(true)

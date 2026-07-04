@@ -259,11 +259,11 @@ fn unicode_to_evdev(cp: u16) -> Option<(u32, bool)> {
     }
 }
 
-fn portal_err(e: impl std::fmt::Display) -> InputError {
-    InputError::PortalError(e.to_string())
+fn input_injection_err(e: impl std::fmt::Display) -> InputError {
+    InputError::PortalError(format!("Input injection error: {e}"))
 }
 
-/// WRD Input Handler
+/// Lamco RDP Input Handler
 ///
 /// Bridges IronRDP input events to our Portal-based input injection system.
 /// This handler receives keyboard and mouse events from RDP clients and forwards
@@ -280,7 +280,74 @@ pub enum InputEvent {
     Mouse(IronMouseEvent),
 }
 
-/// WRD input handler that bridges IronRDP input events to Portal injection
+/// Coalesce consecutive Move and RelMove events in a mouse-event batch.
+///
+/// Remote-desktop clients (notably mstsc) stream hundreds of mouse-move
+/// events per millisecond during window manipulation. Each event becomes a
+/// separate `wl_pointer.motion` request that must be flushed to the
+/// compositor. Under software-rendering load the compositor cannot drain
+/// the Wayland socket fast enough; flushes return EAGAIN/WouldBlock and the
+/// input subsystem fails.
+///
+/// Coalescing rules:
+/// - Consecutive `Move { x, y }` events collapse to a single Move with the
+///   latest position. Intermediate trail positions are visually equivalent
+///   to the final position from the compositor's perspective.
+/// - Consecutive `RelMove { x, y }` events sum into a single RelMove with
+///   the total delta. Equivalent end-effect.
+/// - When a Move/RelMove run is interrupted by the other variant, the
+///   pending run flushes before the new run starts.
+/// - Non-move events (buttons, scroll, etc.) pass through unchanged, but
+///   flush any pending Move/RelMove first so the button/scroll occurs at
+///   the final cursor position rather than at an arbitrary intermediate
+///   point.
+fn coalesce_mouse_batch(events: Vec<IronMouseEvent>) -> Vec<IronMouseEvent> {
+    if events.len() < 2 {
+        return events;
+    }
+    fn flush_pending(
+        out: &mut Vec<IronMouseEvent>,
+        abs: &mut Option<(u16, u16)>,
+        rel: &mut Option<(i32, i32)>,
+    ) {
+        if let Some((x, y)) = abs.take() {
+            out.push(IronMouseEvent::Move { x, y });
+        }
+        if let Some((dx, dy)) = rel.take() {
+            out.push(IronMouseEvent::RelMove { x: dx, y: dy });
+        }
+    }
+
+    let mut out: Vec<IronMouseEvent> = Vec::with_capacity(events.len());
+    let mut pending_abs: Option<(u16, u16)> = None;
+    let mut pending_rel: Option<(i32, i32)> = None;
+
+    for ev in events {
+        match ev {
+            IronMouseEvent::Move { x, y } => {
+                if pending_rel.is_some() {
+                    flush_pending(&mut out, &mut pending_abs, &mut pending_rel);
+                }
+                pending_abs = Some((x, y));
+            }
+            IronMouseEvent::RelMove { x, y } => {
+                if pending_abs.is_some() {
+                    flush_pending(&mut out, &mut pending_abs, &mut pending_rel);
+                }
+                let (dx, dy) = pending_rel.unwrap_or((0, 0));
+                pending_rel = Some((dx.saturating_add(x), dy.saturating_add(y)));
+            }
+            other => {
+                flush_pending(&mut out, &mut pending_abs, &mut pending_rel);
+                out.push(other);
+            }
+        }
+    }
+    flush_pending(&mut out, &mut pending_abs, &mut pending_rel);
+    out
+}
+
+/// Lamco RDP input handler that bridges IronRDP input events to Portal injection
 ///
 /// Receives keyboard and mouse events from RDP clients and injects them
 /// into the Wayland compositor via the Portal RemoteDesktop API.
@@ -369,9 +436,9 @@ impl LamcoInputHandler {
                             ).await {
                                 let count = consecutive_kbd_errors.fetch_add(1, Ordering::Relaxed) + 1;
                                 if count == 1 {
-                                    warn!("Portal keyboard injection failed: {e}");
+                                    warn!("Keyboard injection failed: {e}");
                                 } else if count.is_power_of_two() {
-                                    warn!("Portal keyboard injection failed ({count} consecutive): {e}");
+                                    warn!("Keyboard injection failed ({count} consecutive): {e}");
                                 }
                             } else {
                                 let prev = consecutive_kbd_errors.swap(0, Ordering::Relaxed);
@@ -381,11 +448,18 @@ impl LamcoInputHandler {
                             }
                         }
 
-                        // Process mouse batch
-                        if !mouse_batch.is_empty() {
-                            trace!("🔄 Input batching: flushing {} mouse events", mouse_batch.len());
+                        // Process mouse batch — coalesce consecutive Move/RelMove
+                        // first to limit Wayland flush count under mstsc-style
+                        // bursts (see coalesce_mouse_batch for rules).
+                        let coalesced: Vec<IronMouseEvent> =
+                            coalesce_mouse_batch(std::mem::take(&mut mouse_batch));
+                        if !coalesced.is_empty() {
+                            trace!(
+                                "🔄 Input batching: flushing {} mouse events (after coalesce)",
+                                coalesced.len()
+                            );
                         }
-                        for mouse_event in mouse_batch.drain(..) {
+                        for mouse_event in coalesced {
                             if let Err(e) = Self::handle_mouse_event_impl(
                                 &session_handle_clone,
                                 &mouse_clone,
@@ -395,9 +469,9 @@ impl LamcoInputHandler {
                             ).await {
                                 let count = consecutive_mouse_errors.fetch_add(1, Ordering::Relaxed) + 1;
                                 if count == 1 {
-                                    warn!("Portal mouse injection failed: {e}");
+                                    warn!("Mouse injection failed: {e}");
                                 } else if count.is_power_of_two() {
-                                    warn!("Portal mouse injection failed ({count} consecutive): {e}");
+                                    warn!("Mouse injection failed ({count} consecutive): {e}");
                                 }
                             } else {
                                 let prev = consecutive_mouse_errors.swap(0, Ordering::Relaxed);
@@ -438,6 +512,15 @@ impl LamcoInputHandler {
             primary_stream_id,
             input_tx,
         })
+    }
+
+    /// Activate the input subsystem (deferred EIS creation).
+    ///
+    /// Called when the first RDP client connects. Delegates to the
+    /// session handle's `activate_input()` which creates the EIS
+    /// connection on-demand.
+    pub async fn activate_input(&self) -> anyhow::Result<()> {
+        self.session_handle.activate_input().await
     }
 
     /// Notify input handler that client reconnected
@@ -491,7 +574,7 @@ impl LamcoInputHandler {
                         code, extended
                     );
                 }
-                debug!("Keyboard pressed: code={}, extended={}", code, extended);
+                trace!("Keyboard pressed: code={}, extended={}", code, extended);
 
                 let kbd_event = keyboard.handle_key_down(code as u16, extended, false)?;
 
@@ -530,7 +613,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_keyboard_keycode(keycode as i32, true)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronKeyboardEvent::Released { code, extended } => {
@@ -542,7 +625,7 @@ impl LamcoInputHandler {
                         code, extended
                     );
                 }
-                debug!("Keyboard released: code={}, extended={}", code, extended);
+                trace!("Keyboard released: code={}, extended={}", code, extended);
 
                 let kbd_event = keyboard.handle_key_up(code as u16, extended, false)?;
 
@@ -567,11 +650,12 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_keyboard_keycode(keycode as i32, false)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronKeyboardEvent::UnicodePressed(unicode) => {
                 if let Some((keycode, needs_shift)) = unicode_to_evdev(unicode) {
+                    // Fast path: ASCII characters mapped to evdev keycodes
                     debug!(
                         "Unicode press 0x{:04X} -> evdev {} (shift={})",
                         unicode, keycode, needs_shift
@@ -581,17 +665,21 @@ impl LamcoInputHandler {
                         session_handle
                             .notify_keyboard_keycode(42, true)
                             .await
-                            .map_err(portal_err)?;
+                            .map_err(input_injection_err)?;
                     }
                     session_handle
                         .notify_keyboard_keycode(keycode as i32, true)
                         .await
-                        .map_err(portal_err)?;
+                        .map_err(input_injection_err)?;
                 } else {
-                    debug!(
-                        "Unicode press 0x{:04X}: no evdev mapping (non-ASCII or unmapped)",
-                        unicode
-                    );
+                    // Keysym path: CJK, accented, and other non-ASCII characters.
+                    // XKB Unicode keysyms: 0x01000000 + Unicode code point.
+                    let keysym = 0x0100_0000_u32 + u32::from(unicode);
+                    debug!("Unicode press 0x{:04X} -> keysym 0x{:08X}", unicode, keysym);
+                    session_handle
+                        .notify_keyboard_keysym(keysym, true)
+                        .await
+                        .map_err(input_injection_err)?;
                 }
             }
 
@@ -604,23 +692,28 @@ impl LamcoInputHandler {
                     session_handle
                         .notify_keyboard_keycode(keycode as i32, false)
                         .await
-                        .map_err(portal_err)?;
+                        .map_err(input_injection_err)?;
                     if needs_shift {
                         session_handle
                             .notify_keyboard_keycode(42, false)
                             .await
-                            .map_err(portal_err)?;
+                            .map_err(input_injection_err)?;
                     }
                 } else {
+                    let keysym = 0x0100_0000_u32 + u32::from(unicode);
                     debug!(
-                        "Unicode release 0x{:04X}: no evdev mapping (non-ASCII or unmapped)",
-                        unicode
+                        "Unicode release 0x{:04X} -> keysym 0x{:08X}",
+                        unicode, keysym
                     );
+                    session_handle
+                        .notify_keyboard_keysym(keysym, false)
+                        .await
+                        .map_err(input_injection_err)?;
                 }
             }
 
             IronKeyboardEvent::Synchronize(flags) => {
-                debug!("Keyboard synchronize: {:?}", flags);
+                trace!("Keyboard synchronize: {:?}", flags);
                 // Update toggle key states based on sync flags
                 // The flags tell us the client's current Caps/Num/Scroll lock states
                 // We should sync our local state but portal doesn't have direct sync API
@@ -645,7 +738,7 @@ impl LamcoInputHandler {
 
         match event {
             IronMouseEvent::Move { x, y } => {
-                debug!("Mouse move: x={}, y={}", x, y);
+                trace!("Mouse move: x={}, y={}", x, y);
 
                 let mouse_event =
                     mouse.handle_absolute_move(x as u32, y as u32, &mut transformer)?;
@@ -662,11 +755,11 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_motion_absolute(stream_id, stream_x, stream_y)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::RelMove { x, y } => {
-                debug!("Mouse relative move: dx={}, dy={}", x, y);
+                trace!("Mouse relative move: dx={}, dy={}", x, y);
 
                 let mouse_event = mouse.handle_relative_move(x, y, &mut transformer)?;
 
@@ -683,7 +776,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_motion_absolute(stream_id, stream_x, stream_y)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::LeftPressed => {
@@ -691,7 +784,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(272, true) // BTN_LEFT
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::LeftReleased => {
@@ -699,7 +792,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(272, false)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::RightPressed => {
@@ -707,7 +800,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(273, true) // BTN_RIGHT
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::RightReleased => {
@@ -715,7 +808,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(273, false)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::MiddlePressed => {
@@ -723,7 +816,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(274, true) // BTN_MIDDLE
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::MiddleReleased => {
@@ -731,7 +824,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(274, false)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::Button4Pressed => {
@@ -739,7 +832,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(275, true) // BTN_SIDE
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::Button4Released => {
@@ -747,7 +840,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(275, false)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::Button5Pressed => {
@@ -755,7 +848,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(276, true) // BTN_EXTRA
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::Button5Released => {
@@ -763,7 +856,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_button(276, false)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::VerticalScroll { value } => {
@@ -773,7 +866,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_axis(0.0, delta_y)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
 
             IronMouseEvent::Scroll { x, y } => {
@@ -783,7 +876,7 @@ impl LamcoInputHandler {
                 session_handle
                     .notify_pointer_axis(delta_x, delta_y)
                     .await
-                    .map_err(portal_err)?;
+                    .map_err(input_injection_err)?;
             }
         }
 
@@ -801,8 +894,20 @@ impl RdpServerInputHandler for LamcoInputHandler {
 
     fn mouse(&mut self, event: IronMouseEvent) {
         trace!("🖱️  Input multiplexer: routing mouse to queue");
+        // Position events (Move/RelMove) are coalesce-safe: if the channel
+        // is full the dropped event will be effectively replaced by the
+        // next arriving position. Buttons and scrolls cannot be dropped
+        // without semantic loss, so they remain ERROR.
+        let is_position_event = matches!(
+            &event,
+            IronMouseEvent::Move { .. } | IronMouseEvent::RelMove { .. }
+        );
         if let Err(e) = self.input_tx.try_send(InputEvent::Mouse(event)) {
-            error!("Failed to queue mouse event for batching: {}", e);
+            if is_position_event {
+                trace!("Dropped queued mouse position event: {}", e);
+            } else {
+                error!("Failed to queue mouse event for batching: {}", e);
+            }
         }
     }
 }
@@ -828,5 +933,82 @@ mod tests {
     fn test_input_handler_clone() {
         // Verify clone compiles and works
         // Full tests require portal mocking
+    }
+
+    #[test]
+    fn test_unicode_to_evdev_ascii() {
+        use super::unicode_to_evdev;
+
+        // Space
+        assert_eq!(unicode_to_evdev(0x20), Some((57, false)));
+        // Lowercase 'a'
+        assert_eq!(unicode_to_evdev(0x61), Some((30, false)));
+        // Uppercase 'A' (shift)
+        assert_eq!(unicode_to_evdev(0x41), Some((30, true)));
+        // Digit '0'
+        assert_eq!(unicode_to_evdev(0x30), Some((11, false)));
+        // Exclamation '!' (shift+1)
+        assert_eq!(unicode_to_evdev(0x21), Some((2, true)));
+        // Tab
+        assert_eq!(unicode_to_evdev(0x09), Some((15, false)));
+        // Enter
+        assert_eq!(unicode_to_evdev(0x0D), Some((28, false)));
+    }
+
+    #[test]
+    fn test_unicode_to_evdev_symbols() {
+        use super::unicode_to_evdev;
+
+        assert_eq!(unicode_to_evdev(0x2D), Some((12, false))); // '-'
+        assert_eq!(unicode_to_evdev(0x5F), Some((12, true))); // '_'
+        assert_eq!(unicode_to_evdev(0x3D), Some((13, false))); // '='
+        assert_eq!(unicode_to_evdev(0x2B), Some((13, true))); // '+'
+        assert_eq!(unicode_to_evdev(0x5B), Some((26, false))); // '['
+        assert_eq!(unicode_to_evdev(0x7B), Some((26, true))); // '{'
+    }
+
+    #[test]
+    fn test_unicode_to_evdev_non_ascii_returns_none() {
+        use super::unicode_to_evdev;
+
+        // CJK characters should return None (handled by keysym path)
+        assert_eq!(unicode_to_evdev(0x754C), None); // unicode codepoint beyond ASCII
+        assert_eq!(unicode_to_evdev(0x4E16), None); // unicode codepoint beyond ASCII
+        // Accented characters
+        assert_eq!(unicode_to_evdev(0x00E9), None); // 'e' with acute
+        // High values
+        assert_eq!(unicode_to_evdev(0xD83D), None); // high surrogate
+    }
+
+    #[test]
+    fn test_unicode_keysym_encoding() {
+        // Verify the XKB Unicode keysym formula: 0x01000000 + code_point
+        let unicode: u16 = 0x754C;
+        let keysym = 0x0100_0000_u32 + u32::from(unicode);
+        assert_eq!(keysym, 0x0100_754C);
+
+        let unicode: u16 = 0x4E16;
+        let keysym = 0x0100_0000_u32 + u32::from(unicode);
+        assert_eq!(keysym, 0x0100_4E16);
+
+        // ASCII 'A' would be 0x01000041, but we use evdev for ASCII
+        let unicode: u16 = 0x0041;
+        let keysym = 0x0100_0000_u32 + u32::from(unicode);
+        assert_eq!(keysym, 0x0100_0041);
+    }
+
+    #[test]
+    fn test_unicode_full_ascii_coverage() {
+        use super::unicode_to_evdev;
+
+        // Every printable ASCII character (0x20-0x7E) should map to something
+        for cp in 0x20u16..=0x7E {
+            assert!(
+                unicode_to_evdev(cp).is_some(),
+                "ASCII 0x{:02X} ('{}') should have a mapping",
+                cp,
+                char::from(cp as u8)
+            );
+        }
     }
 }

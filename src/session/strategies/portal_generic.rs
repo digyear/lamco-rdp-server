@@ -43,6 +43,7 @@ use async_trait::async_trait;
 use tracing::{debug, error, info, warn};
 use xdg_desktop_portal_generic::{
     CaptureProtocol, InputBackend, InputEvent, KeyState, KeyboardEvent, PointerEvent,
+    health::{self as portal_health, PortalHealthEvent},
     pipewire::PipeWireManager,
     services::{
         capture::{CapturePreference, create_capture_backend},
@@ -60,6 +61,36 @@ use crate::{
     health::{HealthEvent, HealthReporter},
     session::strategy::{PipeWireAccess, SessionHandle, SessionStrategy, SessionType, StreamInfo},
 };
+
+/// Map a wl_shm pixel format (as delivered on the wlr-screencopy `buffer`
+/// event) to its in-memory channel order. wl_shm names describe the 32-bit
+/// little-endian word, so `Xrgb8888` stores as [B,G,R,X] (BGRx) and `Xbgr8888`
+/// stores as [R,G,B,X] (RGBx). Treating an Xbgr8888 buffer as BGRx swaps R and
+/// B — the blue→brown skew on sway/wlroots, where virtio-backed compositors
+/// hand back Xbgr8888 rather than the Xrgb8888 that KDE/GNOME portals negotiate.
+fn wl_shm_format_to_pixel_format(raw: u32) -> Option<lamco_pipewire::PixelFormat> {
+    use lamco_pipewire::PixelFormat;
+    use wayland_client::protocol::wl_shm::Format;
+
+    match Format::try_from(raw).ok()? {
+        Format::Argb8888 => Some(PixelFormat::BGRA),
+        Format::Xrgb8888 => Some(PixelFormat::BGRx),
+        Format::Abgr8888 => Some(PixelFormat::RGBA),
+        Format::Xbgr8888 => Some(PixelFormat::RGBx),
+        _ => None,
+    }
+}
+
+/// Swap the red and blue bytes of every 32-bit pixel in place, converting
+/// between RGBx/RGBA and BGRx/BGRA. The frame pipeline downstream assumes the
+/// BGRx family and does no channel-order conversion of its own, so RGBx/RGBA
+/// capture sources are normalized here rather than propagated as a label no
+/// consumer reads.
+fn swap_rb_in_place(data: &mut [u8]) {
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+}
 
 /// Session strategy using embedded portal-generic backends.
 ///
@@ -84,15 +115,22 @@ impl PortalGenericStrategy {
 
             // Need at least one capture protocol
             let has_capture = protocols.ext_image_copy_capture || protocols.wlr_screencopy;
-            // Need input protocols (virtual pointer + virtual keyboard)
-            let has_input = protocols.wlr_virtual_pointer && protocols.zwp_virtual_keyboard;
+            // Need at least keyboard input (pointer optional -- can use uinput fallback
+            // or run in keyboard-only mode on compositors like COSMIC)
+            let has_keyboard = protocols.zwp_virtual_keyboard;
+            let has_pointer = protocols.wlr_virtual_pointer;
 
-            if has_capture && has_input {
+            if has_capture && has_keyboard {
+                if !has_pointer {
+                    debug!(
+                        "[portal-generic] No wlr-virtual-pointer — pointer will use uinput fallback or keyboard-only mode"
+                    );
+                }
                 Some(())
             } else {
                 debug!(
-                    "[portal-generic] Missing protocols: capture={}, input={}",
-                    has_capture, has_input
+                    "[portal-generic] Missing protocols: capture={}, keyboard={}",
+                    has_capture, has_keyboard
                 );
                 None
             }
@@ -215,6 +253,12 @@ impl SessionStrategy for PortalGenericStrategy {
             // (PipeWire buffer data can't be shared across separate connections)
             let (frame_tx, frame_rx) = std::sync::mpsc::channel();
 
+            // Create health event channel for capture metrics
+            let (health_tx, health_rx) = portal_health::health_channel();
+            wayland.set_health_sender(health_tx.clone());
+            let input_health_tx = health_tx.clone();
+            let clipboard_health_tx = health_tx;
+
             // Spawn the Wayland event loop with direct frame channel
             let (
                 wayland_stop,
@@ -240,6 +284,9 @@ impl SessionStrategy for PortalGenericStrategy {
             };
             let mut input_backend = create_input_backend(&input_config, &protocols)
                 .map_err(|e| anyhow::anyhow!("Input backend: {e}"))?;
+
+            // Wire health sender to input backend
+            input_backend.set_health_sender(input_health_tx);
 
             // Create a default input context for this session
             let session_id = format!("lamco-rdp-{}", uuid::Uuid::new_v4());
@@ -300,12 +347,17 @@ impl SessionStrategy for PortalGenericStrategy {
 
             // Create clipboard backend (optional, may not be available)
             let clipboard_prefs = ClipboardPreference::from_env();
-            let clipboard_backend = create_clipboard_backend(
+            let mut clipboard_backend = create_clipboard_backend(
                 &protocols,
                 &clipboard_prefs,
                 clipboard_tx,
                 shared_clipboard,
             );
+
+            // Wire health sender to clipboard backend
+            if let Some(ref mut cb) = clipboard_backend {
+                cb.set_health_sender(clipboard_health_tx);
+            }
 
             if clipboard_backend.is_some() {
                 info!("portal-generic: Clipboard backend active");
@@ -313,14 +365,39 @@ impl SessionStrategy for PortalGenericStrategy {
                 warn!("portal-generic: No clipboard protocol available");
             }
 
+            // COSMIC-class compositors expose a virtual keyboard but no
+            // wlr-virtual-pointer, so the wlr backend comes up keyboard-only.
+            // Inject the pointer at the kernel (/dev/uinput) as a trusted
+            // application; fall back to keyboard-only if /dev/uinput is unusable.
+            let uinput_pointer = if !protocols.wlr_virtual_pointer
+                && protocols.zwp_virtual_keyboard
+            {
+                match super::uinput_pointer::UinputPointer::new() {
+                    Ok(p) => {
+                        info!(
+                            "COSMIC-class compositor: pointer via /dev/uinput (no wlr-virtual-pointer)"
+                        );
+                        Some(Mutex::new(p))
+                    }
+                    Err(e) => {
+                        warn!("uinput pointer unavailable ({e:#}); session will be keyboard-only");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let handle = PortalGenericSessionHandle {
                 session_id,
                 input_backend: Arc::new(Mutex::new(input_backend)),
+                uinput_pointer,
                 _capture_backend: Arc::new(Mutex::new(capture_backend)),
                 clipboard_backend: clipboard_backend.map(|cb| Arc::new(Mutex::new(cb))),
                 _pipewire_manager: pipewire_manager,
                 streams,
                 frame_rx: std::sync::Mutex::new(Some(frame_rx)),
+                health_rx: std::sync::Mutex::new(Some(health_rx)),
             };
 
             Ok((handle, wayland_stop))
@@ -373,7 +450,162 @@ impl Drop for PortalGenericSessionWithStop {
 #[async_trait]
 impl SessionHandle for PortalGenericSessionWithStop {
     fn set_health_reporter(&self, reporter: HealthReporter) {
-        let _ = self.health_reporter.set(reporter);
+        let _ = self.health_reporter.set(reporter.clone());
+
+        // Spawn portal health bridge: PortalHealthEvent → server HealthEvent
+        let health_rx_opt: Option<portal_health::HealthReceiver> =
+            self.handle.health_rx.lock().ok().and_then(
+                |mut g: std::sync::MutexGuard<'_, Option<portal_health::HealthReceiver>>| g.take(),
+            );
+        if let Some(health_rx) = health_rx_opt {
+            let reporter_for_bridge = reporter;
+            tokio::spawn(async move {
+                let mut rx: portal_health::HealthReceiver = health_rx;
+                let mut last_eis_serial: Option<u32> = None;
+                let mut consecutive_frame_failures: u32 = 0;
+
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        // --- Capture ---
+                        PortalHealthEvent::FrameCaptured {
+                            capture_latency,
+                            frame_number,
+                            ..
+                        } => {
+                            consecutive_frame_failures = 0;
+                            if frame_number <= 3 || frame_number % 500 == 0 {
+                                tracing::debug!(
+                                    frame = frame_number,
+                                    latency_us = capture_latency.as_micros() as u64,
+                                    "Portal capture health"
+                                );
+                            }
+                        }
+                        PortalHealthEvent::FrameFailed { reason, .. } => {
+                            consecutive_frame_failures += 1;
+                            tracing::warn!(
+                                reason,
+                                consecutive = consecutive_frame_failures,
+                                "Portal capture frame failed"
+                            );
+                            if consecutive_frame_failures >= 3 {
+                                reporter_for_bridge.report(HealthEvent::VideoStreamStateChanged {
+                                    state: crate::health::VideoStreamState::Error,
+                                });
+                            }
+                        }
+                        PortalHealthEvent::CaptureStateChanged { protocol, state } => {
+                            let health_state = match state {
+                                portal_health::CaptureState::Active => {
+                                    tracing::info!(?protocol, "Capture active");
+                                    crate::health::VideoStreamState::Streaming
+                                }
+                                portal_health::CaptureState::Paused => {
+                                    tracing::warn!(?protocol, "Capture paused");
+                                    crate::health::VideoStreamState::Paused
+                                }
+                                portal_health::CaptureState::Failed => {
+                                    tracing::error!(?protocol, "Capture failed");
+                                    crate::health::VideoStreamState::Error
+                                }
+                            };
+                            reporter_for_bridge.report(HealthEvent::VideoStreamStateChanged {
+                                state: health_state,
+                            });
+                        }
+
+                        // --- EIS Protocol ---
+                        PortalHealthEvent::EisFrameReceived {
+                            last_serial,
+                            time_usec,
+                        } => {
+                            if let Some(prev) = last_eis_serial {
+                                let gap = last_serial.wrapping_sub(prev);
+                                if gap > 1 {
+                                    tracing::warn!(
+                                        gap = gap - 1,
+                                        prev_serial = prev,
+                                        current_serial = last_serial,
+                                        "EIS serial gap: {} events may have been lost",
+                                        gap - 1
+                                    );
+                                }
+                            }
+                            last_eis_serial = Some(last_serial);
+                            let _ = time_usec;
+                        }
+                        PortalHealthEvent::EisDeviceStateChanged {
+                            emulating, serial, ..
+                        } => {
+                            tracing::info!(emulating, serial, "EIS device emulation state changed");
+                        }
+
+                        // --- Input ---
+                        PortalHealthEvent::InputBatch {
+                            events_forwarded,
+                            events_failed,
+                            protocol,
+                        } => {
+                            if events_failed > 0 {
+                                reporter_for_bridge.report(HealthEvent::InputFailed {
+                                    reason: format!(
+                                        "{protocol:?}: {events_failed} failures in last {events_forwarded} events"
+                                    ),
+                                    permanent: false,
+                                });
+                            }
+                            tracing::debug!(
+                                forwarded = events_forwarded,
+                                failed = events_failed,
+                                protocol = ?protocol,
+                                "Input batch health"
+                            );
+                        }
+                        PortalHealthEvent::InputDisconnected {
+                            reason,
+                            recoverable,
+                        } => {
+                            reporter_for_bridge.report(HealthEvent::InputFailed {
+                                reason: reason.clone(),
+                                permanent: !recoverable,
+                            });
+                        }
+
+                        // --- Clipboard ---
+                        PortalHealthEvent::ClipboardSelectionChanged { format_count } => {
+                            tracing::debug!(format_count, "Portal clipboard selection changed");
+                        }
+                        PortalHealthEvent::ClipboardTransferResult { success, bytes } => {
+                            if !success {
+                                reporter_for_bridge.report(HealthEvent::ClipboardFailed {
+                                    reason: "Clipboard transfer failed".into(),
+                                });
+                            } else {
+                                tracing::trace!(bytes, "Clipboard transfer completed");
+                            }
+                        }
+
+                        // --- Session ---
+                        PortalHealthEvent::SessionStateChanged { state } => match state {
+                            portal_health::PortalSessionState::Closed => {
+                                tracing::warn!("Portal-generic session closed");
+                                reporter_for_bridge.report(HealthEvent::SessionClosed {
+                                    reason: "portal-generic session state changed to closed".into(),
+                                });
+                            }
+                            portal_health::PortalSessionState::Started => {
+                                tracing::info!("Portal-generic session started");
+                            }
+                            portal_health::PortalSessionState::Init => {
+                                tracing::debug!("Portal-generic session initializing");
+                            }
+                        },
+                    }
+                }
+                tracing::debug!("Portal health bridge ended");
+            });
+            info!("Portal health bridge started");
+        }
     }
 
     fn pipewire_access(&self) -> PipeWireAccess {
@@ -390,6 +622,10 @@ impl SessionHandle for PortalGenericSessionWithStop {
 
     async fn notify_keyboard_keycode(&self, keycode: i32, pressed: bool) -> Result<()> {
         self.handle.notify_keyboard_keycode(keycode, pressed).await
+    }
+
+    async fn notify_keyboard_keysym(&self, keysym: u32, pressed: bool) -> Result<()> {
+        self.handle.notify_keyboard_keysym(keysym, pressed).await
     }
 
     async fn notify_pointer_motion_absolute(&self, stream_id: u32, x: f64, y: f64) -> Result<()> {
@@ -418,6 +654,11 @@ impl SessionHandle for PortalGenericSessionWithStop {
 pub struct PortalGenericSessionHandle {
     session_id: String,
     input_backend: Arc<Mutex<Box<dyn InputBackend>>>,
+    /// Application-owned `/dev/uinput` pointer, used only on compositors that
+    /// expose a virtual keyboard but no `wlr-virtual-pointer` (COSMIC). When
+    /// present, pointer events route here instead of the (pointer-less) wlr
+    /// backend; keyboard always stays on `input_backend`.
+    uinput_pointer: Option<Mutex<super::uinput_pointer::UinputPointer>>,
     _capture_backend: Arc<Mutex<Box<dyn xdg_desktop_portal_generic::CaptureBackend>>>,
     clipboard_backend: Option<Arc<Mutex<Box<dyn xdg_desktop_portal_generic::ClipboardBackend>>>>,
     _pipewire_manager: Arc<PipeWireManager>,
@@ -425,6 +666,8 @@ pub struct PortalGenericSessionHandle {
     /// Direct frame channel receiver (taken once by the display handler).
     frame_rx:
         std::sync::Mutex<Option<std::sync::mpsc::Receiver<xdg_desktop_portal_generic::RawFrame>>>,
+    /// Portal health event receiver (taken once to spawn bridge task).
+    health_rx: std::sync::Mutex<Option<portal_health::HealthReceiver>>,
 }
 
 /// Get current time in microseconds for event timestamps.
@@ -461,13 +704,48 @@ impl SessionHandle for PortalGenericSessionHandle {
         if let Err(e) = std::thread::Builder::new()
             .name("raw-frame-bridge".into())
             .spawn(move || {
+                let mut last_format_raw: Option<u32> = None;
                 while let Ok(raw) = raw_rx.recv() {
+                    let src_format = wl_shm_format_to_pixel_format(raw.format_raw);
+                    if last_format_raw != Some(raw.format_raw) {
+                        match src_format {
+                            Some(f) => info!(
+                                format_raw = raw.format_raw,
+                                capture_format = ?f,
+                                "portal-generic: capture pixel format resolved"
+                            ),
+                            None => warn!(
+                                format_raw = raw.format_raw,
+                                "portal-generic: unmapped wl_shm format — assuming BGRx, colors may be wrong"
+                            ),
+                        }
+                        last_format_raw = Some(raw.format_raw);
+                    }
+
+                    // Normalize to the BGRx family: display_handler and the bitmap
+                    // converter treat all frames as BGRx/BGRA with no channel-order
+                    // conversion, so an RGBx/RGBA source (wlroots/virtio over
+                    // wlr-screencopy) must be swapped here. Relabeling alone leaves
+                    // R and B transposed — the blue→brown skew on sway.
+                    let mut data = raw.data;
+                    let format = match src_format {
+                        Some(lamco_pipewire::PixelFormat::RGBx) => {
+                            swap_rb_in_place(&mut data);
+                            Some(lamco_pipewire::PixelFormat::BGRx)
+                        }
+                        Some(lamco_pipewire::PixelFormat::RGBA) => {
+                            swap_rb_in_place(&mut data);
+                            Some(lamco_pipewire::PixelFormat::BGRA)
+                        }
+                        other => other,
+                    };
+
                     let converted = lamco_pipewire::frame::RawFrameData {
-                        data: raw.data,
+                        data,
                         width: Some(raw.width),
                         height: Some(raw.height),
                         stride: Some(raw.stride),
-                        format: None,
+                        format,
                     };
                     if tx.send(converted).is_err() {
                         break;
@@ -515,9 +793,38 @@ impl SessionHandle for PortalGenericSessionHandle {
     }
 
     async fn notify_pointer_motion_absolute(&self, stream_id: u32, x: f64, y: f64) -> Result<()> {
+        // Caller (input_handler) passes pixel coordinates in the stream's frame.
+        // Look up that stream's dimensions so the backend can normalize.
+        let (x_extent, y_extent) = self
+            .streams
+            .iter()
+            .find(|s| s.node_id == stream_id)
+            .map_or((0, 0), |s| (s.width, s.height));
+
+        // COSMIC: route to the kernel uinput pointer. Normalize to [0,1] within
+        // the stream frame first (the device maps [0,1] onto its ABS range).
+        if let Some(ref uinput) = self.uinput_pointer {
+            let nx = if x_extent == 0 {
+                x
+            } else {
+                x / f64::from(x_extent)
+            };
+            let ny = if y_extent == 0 {
+                y
+            } else {
+                y / f64::from(y_extent)
+            };
+            return uinput
+                .lock()
+                .map_err(|e| anyhow::anyhow!("uinput pointer lock poisoned: {e}"))?
+                .motion_absolute(nx, ny);
+        }
+
         let event = InputEvent::Pointer(PointerEvent::MotionAbsolute {
             x,
             y,
+            x_extent,
+            y_extent,
             stream: stream_id,
             time_usec: current_time_usec(),
         });
@@ -534,6 +841,13 @@ impl SessionHandle for PortalGenericSessionHandle {
     }
 
     async fn notify_pointer_button(&self, button: i32, pressed: bool) -> Result<()> {
+        if let Some(ref uinput) = self.uinput_pointer {
+            return uinput
+                .lock()
+                .map_err(|e| anyhow::anyhow!("uinput pointer lock poisoned: {e}"))?
+                .button(button as u32, pressed);
+        }
+
         let event = InputEvent::Pointer(PointerEvent::Button {
             button: button as u32,
             state: if pressed {
@@ -556,6 +870,13 @@ impl SessionHandle for PortalGenericSessionHandle {
     }
 
     async fn notify_pointer_axis(&self, dx: f64, dy: f64) -> Result<()> {
+        if let Some(ref uinput) = self.uinput_pointer {
+            return uinput
+                .lock()
+                .map_err(|e| anyhow::anyhow!("uinput pointer lock poisoned: {e}"))?
+                .scroll(dx, dy);
+        }
+
         let event = InputEvent::Pointer(PointerEvent::Scroll {
             dx,
             dy,
@@ -599,5 +920,25 @@ mod tests {
         assert_eq!(strategy.name(), "portal-generic");
         assert!(!strategy.requires_initial_setup());
         assert!(strategy.supports_unattended_restore());
+    }
+
+    #[test]
+    fn test_wl_shm_format_mapping() {
+        use lamco_pipewire::PixelFormat;
+
+        // wl_shm values from wayland.xml. The byte order below is the
+        // little-endian in-memory layout; the RDP pipeline treats BGRx as the
+        // no-conversion format, so RGBx/RGBA must be flagged to trigger a swap.
+        assert_eq!(wl_shm_format_to_pixel_format(0), Some(PixelFormat::BGRA)); // argb8888
+        assert_eq!(wl_shm_format_to_pixel_format(1), Some(PixelFormat::BGRx)); // xrgb8888
+        // xbgr8888 = 0x34324258: the format sway/virtio actually delivers.
+        assert_eq!(
+            wl_shm_format_to_pixel_format(0x3432_4258),
+            Some(PixelFormat::RGBx)
+        );
+        assert_eq!(
+            wl_shm_format_to_pixel_format(0x3432_4241), // abgr8888
+            Some(PixelFormat::RGBA)
+        );
     }
 }

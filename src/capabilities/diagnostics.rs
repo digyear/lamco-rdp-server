@@ -274,7 +274,7 @@ pub fn run_diagnostics(caps: &SystemCapabilities) -> DiagnosticReport {
         SystemHealth::Critical
     };
 
-    recommendations.sort_by(|a, b| b.priority.cmp(&a.priority));
+    recommendations.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
     DiagnosticReport {
         health,

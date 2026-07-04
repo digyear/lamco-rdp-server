@@ -22,6 +22,8 @@ use tracing::{debug, info, warn};
 use super::nvenc::NvencEncoder;
 #[cfg(feature = "vaapi")]
 use super::vaapi::VaapiEncoder;
+#[cfg(feature = "vulkan-video")]
+use super::vulkan::VulkanVideoEncoder;
 use super::{HardwareEncoder, HardwareEncoderError, HardwareEncoderResult, QualityPreset};
 use crate::config::HardwareEncodingConfig;
 
@@ -53,11 +55,11 @@ pub fn create_hardware_encoder(
     height: u32,
 ) -> HardwareEncoderResult<Box<dyn HardwareEncoder>> {
     // Check compile-time feature availability
-    #[cfg(not(any(feature = "vaapi", feature = "nvenc")))]
+    #[cfg(not(any(feature = "vaapi", feature = "nvenc", feature = "vulkan-video")))]
     {
         return Err(HardwareEncoderError::NoBackendAvailable {
             reason: "No hardware encoding features enabled at compile time. \
-                     Enable 'vaapi' and/or 'nvenc' features."
+                     Enable 'vaapi', 'nvenc', and/or 'vulkan-video' features."
                 .to_string(),
         });
     }
@@ -72,47 +74,41 @@ pub fn create_hardware_encoder(
     });
 
     debug!(
-        "Creating hardware encoder: {}x{}, preset={}, prefer_nvenc={}",
-        width, height, preset, config.prefer_nvenc
+        "Creating hardware encoder: {}x{}, preset={}, backends={:?}",
+        width, height, preset, config.backend_priority
     );
 
     let mut errors: Vec<String> = Vec::new();
 
-    // Determine backend order based on preference
-    let try_nvenc_first = config.prefer_nvenc;
-
-    // First attempt based on preference
-    #[cfg(feature = "nvenc")]
-    if try_nvenc_first {
-        match try_nvenc(config, width, height, preset) {
-            Ok(encoder) => return Ok(encoder),
-            Err(e) => {
-                debug!("NVENC initialization failed: {}", e);
-                errors.push(format!("NVENC: {}", e));
-            }
-        }
-    }
-
-    // Try VA-API
-    #[cfg(feature = "vaapi")]
-    {
-        match try_vaapi(config, width, height, preset) {
-            Ok(encoder) => return Ok(encoder),
-            Err(e) => {
-                debug!("VA-API initialization failed: {}", e);
-                errors.push(format!("VA-API: {e}"));
-            }
-        }
-    }
-
-    // Try NVENC as fallback if not tried first
-    #[cfg(feature = "nvenc")]
-    if !try_nvenc_first {
-        match try_nvenc(config, width, height, preset) {
-            Ok(encoder) => return Ok(encoder),
-            Err(e) => {
-                debug!("NVENC initialization failed: {}", e);
-                errors.push(format!("NVENC: {}", e));
+    // Use backend_priority list for ordered selection
+    for backend in &config.backend_priority {
+        match backend.as_str() {
+            #[cfg(feature = "vulkan-video")]
+            "vulkan-video" => match try_vulkan_video(config, width, height, preset) {
+                Ok(encoder) => return Ok(encoder),
+                Err(e) => {
+                    debug!("Vulkan Video initialization failed: {}", e);
+                    errors.push(format!("Vulkan Video: {e}"));
+                }
+            },
+            #[cfg(feature = "nvenc")]
+            "nvenc" => match try_nvenc(config, width, height, preset) {
+                Ok(encoder) => return Ok(encoder),
+                Err(e) => {
+                    debug!("NVENC initialization failed: {}", e);
+                    errors.push(format!("NVENC: {e}"));
+                }
+            },
+            #[cfg(feature = "vaapi")]
+            "vaapi" => match try_vaapi(config, width, height, preset) {
+                Ok(encoder) => return Ok(encoder),
+                Err(e) => {
+                    debug!("VA-API initialization failed: {}", e);
+                    errors.push(format!("VA-API: {e}"));
+                }
+            },
+            other => {
+                debug!("Unknown backend '{}' in priority list, skipping", other);
             }
         }
     }
@@ -165,6 +161,23 @@ fn try_nvenc(
     let encoder = NvencEncoder::new(config, width, height, preset)?;
 
     info!("✅ NVENC encoder initialized: {}x{}", width, height);
+
+    Ok(Box::new(encoder))
+}
+
+/// Try to create a Vulkan Video encoder
+#[cfg(feature = "vulkan-video")]
+fn try_vulkan_video(
+    config: &HardwareEncodingConfig,
+    width: u32,
+    height: u32,
+    preset: QualityPreset,
+) -> HardwareEncoderResult<Box<dyn HardwareEncoder>> {
+    info!("Attempting Vulkan Video encoder: {}x{}", width, height);
+
+    let encoder = VulkanVideoEncoder::new(config, width, height, preset)?;
+
+    info!("Vulkan Video encoder initialized: {}x{}", width, height);
 
     Ok(Box::new(encoder))
 }
@@ -257,6 +270,7 @@ mod tests {
             fallback_to_software: true,
             quality_preset: "balanced".to_string(),
             prefer_nvenc: true,
+            ..HardwareEncodingConfig::default()
         }
     }
 

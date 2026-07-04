@@ -27,7 +27,11 @@ pub struct RenderingCapabilities {
     /// Is a GPU available?
     pub gpu_available: bool,
 
-    /// GPU information if available
+    // TODO: Support multiple GPUs with role tracking (display vs compute vs offload).
+    // Currently probe_gpu() returns only the compositor's active GPU via glxinfo.
+    // Systems with GPU passthrough (e.g., virgl display + AMD compute) need per-GPU
+    // identity to make correct decisions downstream (buffer transforms, encoding offload).
+    /// GPU information if available (compositor's active GPU only)
     pub gpu_info: Option<GpuInfo>,
 
     /// Is wgpu supported on this system?
@@ -55,14 +59,77 @@ pub struct RenderingCapabilities {
 /// GPU information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuInfo {
-    /// GPU name/description
+    /// GPU name/description (OpenGL renderer string)
     pub name: String,
     /// GPU vendor
     pub vendor: GpuVendor,
     /// Driver version
     pub driver: Option<String>,
-    /// Is this a virtual GPU (virtio, QXL, etc)?
+    /// Is this a virtual GPU (virtio, QXL, virgl, llvmpipe, etc)?
     pub is_virtual: bool,
+}
+
+impl GpuInfo {
+    /// Check if this is a virgl GPU (virtio-gpu with GL acceleration).
+    ///
+    /// virgl proxies GL commands to the host GPU through QEMU/KVM.
+    /// KWin's screencast plugin has a known issue where it produces
+    /// 180-rotated MemFd buffers on virgl because grabTexture()
+    /// mishandles the GL Y-axis convention. Same class as KDE Bug 485827.
+    pub fn is_virgl(&self) -> bool {
+        self.name.to_lowercase().starts_with("virgl")
+    }
+}
+
+/// Check if the compositor's display GPU is virtio-gpu (virgl) via sysfs.
+///
+/// This is independent of the GL context environment — the server process
+/// may force llvmpipe for its own rendering while the compositor uses virgl.
+/// We check DRM cards with active connectors to find the display GPU.
+pub fn is_display_gpu_virgl() -> bool {
+    let drm_path = std::path::Path::new("/sys/class/drm");
+    let Ok(entries) = std::fs::read_dir(drm_path) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Look for connector entries (e.g., "card0-Virtual-1", "card0-HDMI-A-1")
+        // A connected connector means this card drives a display
+        if !name_str.contains('-') || name_str.starts_with("render") {
+            continue;
+        }
+
+        // Check if this connector is active
+        let status_path = entry.path().join("status");
+        let status = std::fs::read_to_string(&status_path).unwrap_or_default();
+        if !status.trim().eq_ignore_ascii_case("connected") {
+            continue;
+        }
+
+        // Extract the card name (e.g., "card0" from "card0-Virtual-1")
+        let card_name = name_str.split('-').next().unwrap_or("");
+        let driver_link = drm_path.join(card_name).join("device/driver");
+
+        if let Ok(target) = std::fs::read_link(&driver_link) {
+            let driver = target
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if driver == "virtio-pci" || driver == "virtio-gpu" {
+                tracing::debug!(
+                    "Display GPU is virtio ({}) via connector {}",
+                    driver,
+                    name_str
+                );
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// GPU vendor identification
@@ -130,11 +197,16 @@ impl RenderingProbe {
         let software_available = Self::check_software_rendering();
         debug!("Software rendering available: {}", software_available);
 
-        let wgpu_supported = if display_server.is_some() {
-            Self::test_wgpu_compatibility().await
-        } else {
-            false
-        };
+        let wgpu_supported =
+            if display_server.is_some() && !gpu_info.as_ref().is_some_and(|g| g.is_virtual) {
+                Self::test_wgpu_compatibility().await
+            } else {
+                // A virtual display GPU (virtio/QXL/llvmpipe) can't drive wgpu
+                // hardware rendering; skip the adapter probe, which otherwise
+                // re-initializes a GLES context before failing (slow GUI start on
+                // VMs). Go straight to the software recommendation.
+                false
+            };
         debug!("wgpu supported: {}", wgpu_supported);
 
         let (recommendation, fallback_reason) = Self::determine_recommendation(
@@ -239,6 +311,7 @@ impl RenderingProbe {
             n.contains("llvmpipe")
                 || n.contains("softpipe")
                 || n.contains("virtio")
+                || n.contains("virgl")
                 || n.contains("qxl")
                 || n.contains("swrast")
         });

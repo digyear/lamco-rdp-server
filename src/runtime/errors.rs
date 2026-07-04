@@ -75,7 +75,7 @@ pub fn format_user_error(error: &anyhow::Error) -> String {
     writeln!(&mut output, "  - Check logs in: /var/log/lamco-rdp-server/").ok();
     writeln!(
         &mut output,
-        "  - Report issues: https://github.com/lamco-admin/wayland-rdp/issues"
+        "  - Report issues: https://github.com/lamco-admin/lamco-rdp-server/issues"
     )
     .ok();
     writeln!(

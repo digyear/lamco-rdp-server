@@ -30,6 +30,10 @@ pub struct SessionHealthMonitor {
     session_valid: Arc<AtomicBool>,
     /// Shutdown signal
     shutdown: tokio::sync::broadcast::Receiver<()>,
+    /// Whether an RDP client is currently connected (shared with the display
+    /// handler). Between clients a paused capture stream is the idle state, not
+    /// a degradation, so the Paused handler consults this before degrading.
+    client_active: Arc<AtomicBool>,
 }
 
 impl SessionHealthMonitor {
@@ -42,6 +46,7 @@ impl SessionHealthMonitor {
     /// subsystems that need to read health state.
     pub fn new(
         shutdown: tokio::sync::broadcast::Receiver<()>,
+        client_active: Arc<AtomicBool>,
     ) -> (Self, HealthReporter, HealthSubscriber) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (state_tx, state_rx) = watch::channel(SessionHealthState::default());
@@ -58,6 +63,7 @@ impl SessionHealthMonitor {
             state_tx,
             session_valid,
             shutdown,
+            client_active,
         };
 
         (monitor, reporter, subscriber)
@@ -87,16 +93,28 @@ impl SessionHealthMonitor {
     fn handle_event(&self, event: HealthEvent) {
         debug!("Health event: {event:?}");
 
+        let client_active = self.client_active.load(Ordering::Acquire);
         self.state_tx.send_modify(|state| {
             let old_overall = state.overall;
 
             match event {
                 HealthEvent::SessionClosed { ref reason } => {
-                    error!("Session closed by compositor: {reason}");
-                    state.session = SubsystemHealth::Failed(reason.clone());
-                    // Session closure cascades — input and clipboard also fail
-                    state.input = SubsystemHealth::Failed("session closed".into());
-                    state.clipboard = SubsystemHealth::Failed("session closed".into());
+                    if client_active {
+                        error!("Session closed by compositor: {reason}");
+                        state.session = SubsystemHealth::Failed(reason.clone());
+                        // Session closure cascades — input and clipboard also fail
+                        state.input = SubsystemHealth::Failed("session closed".into());
+                        state.clipboard = SubsystemHealth::Failed("session closed".into());
+                    } else {
+                        // No client connected: the compositor closing an idle
+                        // session is the expected PerConnection teardown, not a
+                        // failure — it re-establishes on the next connect. Reset
+                        // to healthy so health doesn't stick at "failed" while idle.
+                        debug!("Session closed while idle (no client) — expected teardown, not a failure");
+                        state.session = SubsystemHealth::Healthy;
+                        state.input = SubsystemHealth::Healthy;
+                        state.clipboard = SubsystemHealth::Healthy;
+                    }
                 }
 
                 HealthEvent::SessionInvalidated { ref reason } => {
@@ -116,10 +134,38 @@ impl SessionHealthMonitor {
                             info!("Video stream recovered: streaming");
                         }
                         state.video = SubsystemHealth::Healthy;
+                        // If input was degraded due to stream pause (Portal coupling),
+                        // recover it now that the stream is active again
+                        if let SubsystemHealth::Degraded(ref reason) = state.input
+                            && reason.contains("stream paused")
+                        {
+                            info!("Input recovered: stream resumed");
+                            state.input = SubsystemHealth::Healthy;
+                        }
+                    }
+                    VideoStreamState::Paused if !client_active => {
+                        // No client connected: a paused capture stream is the
+                        // idle state between clients (PerConnection releases the
+                        // session on disconnect), not a degradation.
+                        debug!("Video stream paused while idle (no client) — treating as healthy");
+                        state.video = SubsystemHealth::Healthy;
+                        if let SubsystemHealth::Degraded(ref reason) = state.input
+                            && reason.contains("stream paused")
+                        {
+                            state.input = SubsystemHealth::Healthy;
+                        }
                     }
                     VideoStreamState::Paused => {
                         warn!("Video stream paused");
                         state.video = SubsystemHealth::Degraded("PipeWire stream paused".into());
+                        // On Portal sessions, input injection is coupled to stream state.
+                        // GNOME rejects input D-Bus calls when the ScreenCast stream is
+                        // not actively streaming. Mark input as degraded proactively
+                        // (don't override a permanent failure).
+                        if !state.input.is_failed() {
+                            state.input =
+                                SubsystemHealth::Degraded("stream paused — input suspended".into());
+                        }
                     }
                     VideoStreamState::Error => {
                         error!("Video stream error");
@@ -128,9 +174,14 @@ impl SessionHealthMonitor {
                 },
 
                 HealthEvent::VideoFrameStalled { stall_duration_ms } => {
-                    warn!("Video frames stalled for {}ms", stall_duration_ms);
-                    state.video =
-                        SubsystemHealth::Degraded(format!("no frames for {stall_duration_ms}ms"));
+                    // Damage-driven capture legitimately delivers no frames while
+                    // the desktop is static, and on some compositors (e.g. KWin)
+                    // the stream stays in the streaming state rather than pausing.
+                    // A frame-timeout is therefore not by itself a health problem —
+                    // it previously flapped the session degraded↔healthy on every
+                    // idle. Log it for visibility and let the authoritative PipeWire
+                    // stream-state events (Paused/Error/Unconnected) drive health.
+                    debug!("Video frames stalled for {stall_duration_ms}ms (informational)");
                 }
 
                 HealthEvent::VideoFrameNeverStarted { elapsed_ms } => {
@@ -144,10 +195,9 @@ impl SessionHealthMonitor {
                 }
 
                 HealthEvent::VideoFrameResumed => {
-                    if !state.video.is_healthy() {
-                        info!("Video frames resumed after stall");
-                        state.video = SubsystemHealth::Healthy;
-                    }
+                    // Informational only — video health is driven by PipeWire
+                    // stream state, not frame timing (see VideoFrameStalled).
+                    debug!("Video frames resumed");
                 }
 
                 HealthEvent::InputFailed {
@@ -194,12 +244,47 @@ impl SessionHealthMonitor {
                     state.input = SubsystemHealth::Failed(reason.clone());
                 }
 
+                HealthEvent::EisStreamRecovered => {
+                    info!("EIS stream recovered -- input restored");
+                    state.input = SubsystemHealth::Healthy;
+                }
+
                 HealthEvent::SubsystemNotAvailable { ref subsystem } => {
                     debug!("{subsystem} not available in this session");
                     match subsystem.as_str() {
                         "clipboard" => state.clipboard = SubsystemHealth::NotApplicable,
                         "input" => state.input = SubsystemHealth::NotApplicable,
                         _ => {}
+                    }
+                }
+
+                HealthEvent::EgfxChannelClosed { ref reason } => {
+                    if client_active {
+                        warn!("EGFX channel closed: {reason}");
+                        // EGFX closure degrades video but doesn't kill it —
+                        // V8 bitmap fallback may still work for the client
+                        if matches!(state.video, SubsystemHealth::Healthy) {
+                            state.video = SubsystemHealth::Degraded(format!(
+                                "EGFX channel closed: {reason}"
+                            ));
+                        }
+                    } else {
+                        // No client connected: the DVC channel closing is part of
+                        // the client's own normal disconnect teardown, not a
+                        // degradation — every disconnect closes its EGFX channel.
+                        debug!(
+                            "EGFX channel closed while idle (no client) — expected teardown: {reason}"
+                        );
+                    }
+                }
+
+                HealthEvent::EgfxChannelReady { ref version } => {
+                    info!("EGFX channel ready: {version}");
+                    // Recover video if it was degraded due to EGFX closure
+                    if let SubsystemHealth::Degraded(ref msg) = state.video
+                        && msg.contains("EGFX")
+                    {
+                        state.video = SubsystemHealth::Healthy;
                     }
                 }
             }
@@ -228,7 +313,8 @@ mod tests {
     async fn test_monitor_session_closed() {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         let shutdown_rx = shutdown_tx.subscribe();
-        let (monitor, reporter, subscriber) = SessionHealthMonitor::new(shutdown_rx);
+        let (monitor, reporter, subscriber) =
+            SessionHealthMonitor::new(shutdown_rx, Arc::new(AtomicBool::new(true)));
 
         let monitor_handle = tokio::spawn(monitor.run());
 
@@ -253,7 +339,8 @@ mod tests {
     async fn test_monitor_session_invalidated_cascades() {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         let shutdown_rx = shutdown_tx.subscribe();
-        let (monitor, reporter, subscriber) = SessionHealthMonitor::new(shutdown_rx);
+        let (monitor, reporter, subscriber) =
+            SessionHealthMonitor::new(shutdown_rx, Arc::new(AtomicBool::new(true)));
 
         let monitor_handle = tokio::spawn(monitor.run());
 
@@ -279,7 +366,8 @@ mod tests {
     async fn test_monitor_video_paused_degrades() {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         let shutdown_rx = shutdown_tx.subscribe();
-        let (monitor, reporter, subscriber) = SessionHealthMonitor::new(shutdown_rx);
+        let (monitor, reporter, subscriber) =
+            SessionHealthMonitor::new(shutdown_rx, Arc::new(AtomicBool::new(true)));
 
         let monitor_handle = tokio::spawn(monitor.run());
 
@@ -293,8 +381,110 @@ mod tests {
         let state = subscriber.current();
         assert_eq!(state.overall, OverallHealth::Degraded);
         assert!(!state.video.is_healthy());
+        // Stream pause cascades to input (Portal coupling)
+        assert!(!state.input.is_healthy());
         // Session is still valid even when degraded
         assert!(subscriber.is_session_valid());
+
+        let _ = shutdown_tx.send(());
+        let _ = monitor_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_monitor_video_paused_idle_no_client_stays_healthy() {
+        // With no client connected, a paused capture stream is the idle state
+        // between clients (PerConnection releases the session on disconnect),
+        // not a degradation.
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let shutdown_rx = shutdown_tx.subscribe();
+        let (monitor, reporter, subscriber) =
+            SessionHealthMonitor::new(shutdown_rx, Arc::new(AtomicBool::new(false)));
+
+        let monitor_handle = tokio::spawn(monitor.run());
+
+        reporter.report(HealthEvent::VideoStreamStateChanged {
+            state: VideoStreamState::Paused,
+        });
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let state = subscriber.current();
+        assert!(
+            state.video.is_healthy(),
+            "idle pause with no client should read healthy, got {:?}",
+            state.video
+        );
+        assert!(
+            state.input.is_healthy(),
+            "idle pause with no client should not suspend input"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = monitor_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_resume_recovers_input() {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let shutdown_rx = shutdown_tx.subscribe();
+        let (monitor, reporter, subscriber) =
+            SessionHealthMonitor::new(shutdown_rx, Arc::new(AtomicBool::new(true)));
+
+        let monitor_handle = tokio::spawn(monitor.run());
+
+        // Pause (degrades both video and input)
+        reporter.report(HealthEvent::VideoStreamStateChanged {
+            state: VideoStreamState::Paused,
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(!subscriber.current().input.is_healthy());
+
+        // Resume (recovers both)
+        reporter.report(HealthEvent::VideoStreamStateChanged {
+            state: VideoStreamState::Streaming,
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let state = subscriber.current();
+        assert!(state.video.is_healthy());
+        assert!(state.input.is_healthy());
+        assert_eq!(state.overall, OverallHealth::Healthy);
+
+        let _ = shutdown_tx.send(());
+        let _ = monitor_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_pause_doesnt_override_failed_input() {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let shutdown_rx = shutdown_tx.subscribe();
+        let (monitor, reporter, subscriber) =
+            SessionHealthMonitor::new(shutdown_rx, Arc::new(AtomicBool::new(true)));
+
+        let monitor_handle = tokio::spawn(monitor.run());
+
+        // Permanently fail input first
+        reporter.report(HealthEvent::InputFailed {
+            reason: "permanent failure".into(),
+            permanent: true,
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(subscriber.current().input.is_failed());
+
+        // Stream pause should NOT downgrade Failed to Degraded
+        reporter.report(HealthEvent::VideoStreamStateChanged {
+            state: VideoStreamState::Paused,
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Input should still be Failed, not Degraded
+        assert!(subscriber.current().input.is_failed());
 
         let _ = shutdown_tx.send(());
         let _ = monitor_handle.await;
@@ -304,7 +494,8 @@ mod tests {
     async fn test_monitor_recovery() {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         let shutdown_rx = shutdown_tx.subscribe();
-        let (monitor, reporter, subscriber) = SessionHealthMonitor::new(shutdown_rx);
+        let (monitor, reporter, subscriber) =
+            SessionHealthMonitor::new(shutdown_rx, Arc::new(AtomicBool::new(true)));
 
         let monitor_handle = tokio::spawn(monitor.run());
 
@@ -329,14 +520,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monitor_video_stall_and_resume() {
+    async fn test_monitor_video_stall_is_informational() {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         let shutdown_rx = shutdown_tx.subscribe();
-        let (monitor, reporter, subscriber) = SessionHealthMonitor::new(shutdown_rx);
+        let (monitor, reporter, subscriber) =
+            SessionHealthMonitor::new(shutdown_rx, Arc::new(AtomicBool::new(true)));
 
         let monitor_handle = tokio::spawn(monitor.run());
 
-        // Report stall
+        // A frame-timeout is informational only: a static desktop legitimately
+        // produces no frames (damage-driven capture), so a stall must NOT
+        // degrade health. Video health is driven by PipeWire stream state.
         reporter.report(HealthEvent::VideoFrameStalled {
             stall_duration_ms: 5000,
         });
@@ -344,12 +538,11 @@ mod tests {
         tokio::task::yield_now().await;
 
         let state = subscriber.current();
-        assert_eq!(state.overall, OverallHealth::Degraded);
-        assert!(!state.video.is_healthy());
-        // Stall is degraded, not failed — session stays valid
+        assert_eq!(state.overall, OverallHealth::Healthy);
+        assert!(state.video.is_healthy());
         assert!(subscriber.is_session_valid());
 
-        // Report resume
+        // Resume is likewise informational and leaves health unchanged.
         reporter.report(HealthEvent::VideoFrameResumed);
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;

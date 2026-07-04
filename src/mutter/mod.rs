@@ -30,9 +30,9 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use lamco_rdp_server::mutter::MutterSessionManager;
+//! use lamco_rdp_server::mutter::MutterSession;
 //!
-//! let manager = MutterSessionManager::new().await?;
+//! let manager = MutterSession::new().await?;
 //! let session = manager.create_session(None).await?;
 //! // session provides video (PipeWire node), input (D-Bus or EIS), and clipboard
 //! ```
@@ -44,11 +44,11 @@ pub mod screencast;
 pub mod session_manager;
 
 // Re-exports
-pub(crate) use clipboard::MutterClipboardManager;
+pub(crate) use clipboard::MutterClipboard;
 pub use pipewire_helper::{connect_to_pipewire_daemon, get_pipewire_fd_for_mutter};
 pub use remote_desktop::{MutterRemoteDesktop, MutterRemoteDesktopSession};
 pub use screencast::{MutterScreenCast, MutterScreenCastSession, MutterScreenCastStream};
-pub use session_manager::{MutterSessionHandle, MutterSessionManager};
+pub use session_manager::{MutterSession, MutterSessionHandle};
 
 /// Check if Mutter ScreenCast API is available
 ///

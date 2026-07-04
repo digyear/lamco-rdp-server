@@ -29,6 +29,17 @@ pub enum ClipboardProviderEvent {
     ///
     /// The provider identified by `serial` that we need to fulfill via `complete_transfer()`.
     SelectionTransfer { serial: u32, mime_type: String },
+
+    /// The provider's own signal-listener lifecycle changed state.
+    ///
+    /// Emitted when a backend's clipboard signal subscriptions are (re)bound to
+    /// the live compositor session, or when they cannot be. This is what makes an
+    /// otherwise-silent listener death observable: on the Mutter path the session
+    /// is re-established per connection, and if the `SelectionOwnerChanged` /
+    /// `SelectionTransfer` subscriptions are not re-bound to the new session,
+    /// copy/paste is dead with no error — so the listener reports its own health
+    /// and the orchestrator forwards it to the health monitor.
+    ListenerHealth { healthy: bool, reason: String },
 }
 
 /// Clipboard provider backend interface.
@@ -78,6 +89,24 @@ pub trait ClipboardProvider: Send + Sync {
     /// backends use delayed rendering and ignore this.
     async fn provide_data(&self, _mime_type: &str, _data: Vec<u8>) -> Result<()> {
         Ok(()) // Default: no-op (Portal uses SelectionTransfer)
+    }
+
+    /// A remote RDP client reached the Ready state (sent its first Format List).
+    ///
+    /// Most backends need nothing here: presenting the current local selection
+    /// to the remote is the orchestrator's job (`SendInitiateCopy`). Override
+    /// only when the backend must re-arm something on remote attach.
+    async fn on_remote_ready(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The remote RDP client disconnected.
+    ///
+    /// Release any clipboard ownership held on the remote's behalf so local
+    /// apps stop trying to paste from a remote that is gone. Local
+    /// change-detection listeners must stay alive for the next client.
+    async fn on_remote_gone(&self) -> Result<()> {
+        Ok(())
     }
 
     /// Whether this provider needs data before the compositor requests it.

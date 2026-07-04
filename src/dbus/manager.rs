@@ -10,8 +10,14 @@
 //! **Note:** Keeps "Manager" suffix because it implements the external D-Bus API
 //! contract `io.lamco.RdpServer.Manager`. Not a candidate for humanization rename.
 
+#![expect(
+    clippy::too_many_arguments,
+    reason = "zbus #[interface] macro expands to dispatch fns taking one arg per property; we can't shrink them"
+)]
+
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +25,7 @@ use tokio::sync::mpsc;
 use zbus::{interface, zvariant::Value};
 
 use super::{ClientInfo, SharedServerState};
+use crate::health::snapshot_collector::SnapshotCollector;
 
 /// Commands sent from D-Bus manager to the server runtime
 #[derive(Debug)]
@@ -45,6 +52,12 @@ pub struct RdpServerManager {
 
     /// Channel to send commands to the server runtime
     command_tx: Option<mpsc::UnboundedSender<ServerCommand>>,
+
+    /// Performance snapshot collector (set after session is established)
+    snapshot_collector: tokio::sync::RwLock<Option<Arc<SnapshotCollector>>>,
+
+    /// Health subscriber for reading subsystem health states
+    health_subscriber: tokio::sync::RwLock<Option<crate::health::HealthSubscriber>>,
 }
 
 impl RdpServerManager {
@@ -54,6 +67,8 @@ impl RdpServerManager {
             clients: tokio::sync::RwLock::new(Vec::new()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             command_tx: None,
+            snapshot_collector: tokio::sync::RwLock::new(None),
+            health_subscriber: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -70,6 +85,8 @@ impl RdpServerManager {
             clients: tokio::sync::RwLock::new(Vec::new()),
             version: env!("CARGO_PKG_VERSION").to_string(),
             command_tx: Some(tx),
+            snapshot_collector: tokio::sync::RwLock::new(None),
+            health_subscriber: tokio::sync::RwLock::new(None),
         };
         (manager, rx)
     }
@@ -77,6 +94,16 @@ impl RdpServerManager {
     pub async fn add_client(&self, info: ClientInfo) {
         let mut clients = self.clients.write().await;
         clients.push(info);
+    }
+
+    /// Set the snapshot collector once the session is established.
+    pub async fn set_snapshot_collector(&self, collector: Arc<SnapshotCollector>) {
+        *self.snapshot_collector.write().await = Some(collector);
+    }
+
+    /// Set the health subscriber for reading subsystem health states.
+    pub async fn set_health_subscriber(&self, subscriber: crate::health::HealthSubscriber) {
+        *self.health_subscriber.write().await = Some(subscriber);
     }
 
     pub async fn remove_client(&self, client_id: &str) -> Option<ClientInfo> {
@@ -436,9 +463,161 @@ impl RdpServerManager {
         }
     }
 
+    /// Query current session health for all subsystems.
+    ///
+    /// Returns a map of subsystem names to health status strings.
+    /// Health is the liveness layer (is it working?), not performance.
+    async fn get_health(&self) -> HashMap<String, Value<'static>> {
+        let mut result: HashMap<String, Value<'static>> = HashMap::new();
+        result.insert("version".into(), Value::from(self.version.clone()));
+
+        // Read subsystem health states from the health monitor
+        let subscriber = self.health_subscriber.read().await;
+        if let Some(ref sub) = *subscriber {
+            let state = sub.current();
+            result.insert("status".into(), Value::from("available".to_string()));
+            result.insert("video".into(), Value::from(state.video.to_string()));
+            result.insert("input".into(), Value::from(state.input.to_string()));
+            result.insert("clipboard".into(), Value::from(state.clipboard.to_string()));
+            result.insert("session".into(), Value::from(state.session.to_string()));
+            result.insert("overall".into(), Value::from(state.overall.to_string()));
+        } else {
+            result.insert("status".into(), Value::from("not_available".to_string()));
+        }
+
+        // Include sensor summary if available
+        let collector = self.snapshot_collector.read().await;
+        if let Some(ref collector) = *collector {
+            let snap = collector.snapshot();
+            result.insert(
+                "sensors_registered".into(),
+                Value::from(snap.sensor_snapshots.len() as u32),
+            );
+        }
+
+        result
+    }
+
+    /// Query current performance metrics as a flat map.
+    ///
+    /// Returns all performance metrics from the PerformanceSnapshot.
+    /// This is the primary programmatic API for monitoring consumers.
+    async fn get_performance(&self) -> HashMap<String, Value<'static>> {
+        let mut result: HashMap<String, Value<'static>> = HashMap::new();
+
+        let collector = self.snapshot_collector.read().await;
+        let Some(ref collector) = *collector else {
+            result.insert(
+                "error".into(),
+                Value::from("session not established".to_string()),
+            );
+            return result;
+        };
+
+        let snap = collector.snapshot();
+
+        // FPS
+        result.insert("fps".into(), Value::from(snap.fps.current_fps));
+        result.insert(
+            "activity_level".into(),
+            Value::from(snap.fps.activity_level.clone()),
+        );
+        result.insert("adaptive_fps_enabled".into(), Value::from(snap.fps.enabled));
+
+        // Latency
+        result.insert(
+            "latency_mode".into(),
+            Value::from(snap.latency.mode.clone()),
+        );
+        result.insert(
+            "total_latency_avg_ms".into(),
+            Value::from(f64::from(snap.latency.total_latency_avg_ms)),
+        );
+        result.insert(
+            "encode_duration_avg_ms".into(),
+            Value::from(f64::from(snap.latency.encode_duration_avg_ms)),
+        );
+
+        // EGFX
+        result.insert("egfx_ready".into(), Value::from(snap.egfx.channel_ready));
+        result.insert(
+            "egfx_queue_depth".into(),
+            Value::from(snap.egfx.queue_depth),
+        );
+        result.insert("egfx_frame_acks".into(), Value::from(snap.egfx.frame_acks));
+        if let Some(decode_us) = snap.egfx.client_decode_render_us {
+            result.insert("client_decode_render_us".into(), Value::from(decode_us));
+        }
+        if let Some(ref version) = snap.egfx.negotiated_version {
+            result.insert("egfx_version".into(), Value::from(version.clone()));
+        }
+
+        // Encoder
+        if let Some(ref enc) = snap.encoder {
+            result.insert("encoder_backend".into(), Value::from(enc.backend.clone()));
+            result.insert("encoder_fps".into(), Value::from(f64::from(enc.fps)));
+            result.insert("encoder_bitrate_kbps".into(), Value::from(enc.bitrate_kbps));
+        }
+
+        // Aggregate
+        result.insert("uptime_seconds".into(), Value::from(snap.uptime.as_secs()));
+        result.insert(
+            "frames_received".into(),
+            Value::from(snap.metrics.frames_received),
+        );
+        result.insert(
+            "frames_dropped".into(),
+            Value::from(snap.metrics.frames_dropped),
+        );
+
+        result
+    }
+
+    /// Query negotiated protocol versions.
+    ///
+    /// Returns version information for each active protocol layer.
+    async fn get_protocol_versions(&self) -> HashMap<String, Value<'static>> {
+        let mut result: HashMap<String, Value<'static>> = HashMap::new();
+
+        let collector = self.snapshot_collector.read().await;
+        let Some(ref collector) = *collector else {
+            return result;
+        };
+
+        let snap = collector.snapshot();
+        if let Some(ref v) = snap.egfx.negotiated_version {
+            result.insert("egfx".into(), Value::from(v.clone()));
+        }
+        if let Some(ref enc) = snap.encoder {
+            result.insert("encoder".into(), Value::from(enc.backend.clone()));
+        }
+
+        result
+    }
+
     // =========================================================================
     // Signals
     // =========================================================================
+
+    /// Emitted periodically with performance metrics update.
+    #[zbus(signal)]
+    pub async fn performance_updated(
+        ctxt: &zbus::object_server::SignalEmitter<'_>,
+        fps: u32,
+        latency_ms: f32,
+        queue_depth: u32,
+        encoder_backend: &str,
+        activity_level: &str,
+        current_qp: u32,
+        adaptation_enabled: bool,
+        damage_source: &str,
+        sensor_count: u32,
+        bitrate_kbps: u32,
+        health_video: &str,
+        health_input: &str,
+        health_clipboard: &str,
+        health_session: &str,
+    ) -> zbus::Result<()>;
 
     /// Emitted when the server status changes (distinct from property change signal).
     #[zbus(signal)]

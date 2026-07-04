@@ -25,6 +25,8 @@ pub mod security;
 pub mod server;
 pub mod services;
 pub mod session;
+pub mod third_party;
+pub mod transport;
 
 /// D-Bus management interface for GUI ↔ server communication.
 /// Session bus for native/Flatpak, system bus for system services.
@@ -40,6 +42,10 @@ pub mod mutter;
 /// GUI configuration interface (iced framework). Requires the `gui` feature.
 #[cfg(feature = "gui")]
 pub mod gui;
+
+/// HTTP metrics server (Prometheus + /health). Requires the `metrics-server` feature.
+#[cfg(feature = "metrics-server")]
+pub mod metrics_server;
 
 pub use lamco_clipboard_core;
 pub use lamco_pipewire;

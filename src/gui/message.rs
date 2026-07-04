@@ -6,10 +6,7 @@ use std::path::PathBuf;
 
 use crate::{
     config::Config,
-    gui::{
-        server_connection::ConnectionMode,
-        state::{DetectedCapabilities, GpuInfo, ServerStatus, Tab, TabCategory, ValidationResult},
-    },
+    gui::state::{DetectedCapabilities, GpuInfo, ServerStatus, Tab, TabCategory, ValidationResult},
 };
 
 /// Main application message type
@@ -174,6 +171,8 @@ pub enum Message {
     LoggingBrowseLogDir,
     /// Log directory selected
     LoggingLogDirSelected(Option<PathBuf>),
+    /// Result of the startup check for a FileChooser portal (file-browse support)
+    FileDialogPortalChecked(bool),
     /// Metrics enabled toggled
     LoggingMetricsToggled(bool),
     /// Clear log directory (set to None)
@@ -243,7 +242,7 @@ pub enum Message {
     DisplayAllowResizeToggled(bool),
     DisplayAllowedResolutionsChanged(String),
     DisplayDpiAwareToggled(bool),
-    DisplayAllowRotationToggled(bool),
+    DisplayFrameTransformChanged(String),
 
     /// Toggle advanced video section expanded
     AdvancedVideoToggleExpanded,
@@ -306,18 +305,22 @@ pub enum Message {
     DbusConnectResult(Result<(), String>),
     /// Server status updated (from IPC)
     ServerStatusUpdated(ServerStatus),
-    /// Server process started (contains PID)
-    ServerStarted(u32),
-    /// Server connected via D-Bus (no PID, service mode)
-    ServerConnectedDbus,
+    /// Async server connection attempt completed (D-Bus-first, then spawn)
+    ServerConnectResult(Result<(), String>),
     /// Server process exited
     ServerExited(Option<i32>),
     /// Server log line received
     ServerLogReceived(String, crate::gui::state::LogLevel),
-    /// Server start failed
-    ServerStartFailed(String),
-    /// Connection mode changed
-    ConnectionModeChanged(ConnectionMode),
+    /// D-Bus health check result (true = server still alive)
+    DbusHealthCheck(bool),
+    /// D-Bus signal: server state changed (old_status, new_status, message)
+    DbusServerStateChanged(String, String, String),
+    /// D-Bus signal: client connected (client_id, peer_address)
+    DbusClientConnected(String, String),
+    /// D-Bus signal: client disconnected (client_id, reason)
+    DbusClientDisconnected(String, String),
+    /// D-Bus signal: config reloaded on server side
+    DbusConfigReloaded(bool),
 
     /// Validate current configuration
     ValidateConfig,
@@ -368,6 +371,24 @@ pub enum Message {
     SaveAndExit,
     /// Cancel discard changes dialog
     CancelDiscardChanges,
+
+    /// Live metrics update from D-Bus PerformanceUpdated signal
+    LiveMetricsUpdated {
+        fps: u32,
+        latency_ms: f32,
+        queue_depth: u32,
+        encoder_backend: String,
+        activity_level: String,
+        current_qp: u32,
+        adaptation_enabled: bool,
+        damage_source: String,
+        sensor_count: u32,
+        bitrate_kbps: u32,
+        health_video: String,
+        health_input: String,
+        health_clipboard: String,
+        health_session: String,
+    },
 
     /// Periodic tick for updates (e.g., log tail, status poll)
     Tick,

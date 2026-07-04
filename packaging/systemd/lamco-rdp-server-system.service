@@ -31,6 +31,12 @@ BusName=io.lamco.RdpServer.System
 # Run as dedicated user (create with: sudo useradd -r -s /sbin/nologin lamco-rdp)
 User=lamco-rdp
 Group=lamco-rdp
+# Join the shadow group so pam_unix reads /etc/shadow directly, avoiding the
+# sgid unix_chkpwd helper that NoNewPrivileges blocks — this keeps the full
+# seccomp hardening below usable with auth_method=pam. On distros where
+# /etc/shadow is not group-readable (e.g. Fedora, mode 0000), drop the
+# SystemCallFilter lines below instead so unix_chkpwd can elevate.
+SupplementaryGroups=shadow
 
 # Main executable with D-Bus service mode on system bus
 ExecStart=/usr/bin/lamco-rdp-server --dbus-service --system
@@ -43,8 +49,15 @@ RestartSec=10
 Environment=RUST_LOG=info
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 
+# Hardening note: the ~@privileged/@resources seccomp DENIES are deliberately
+# absent — pam_unix's in-process setuid probe and PipeWire's realtime setup
+# were SIGSYS-killed by them (no SystemCallErrorNumber= set). The seccomp
+# options that remain (SystemCallFilter=@system-service etc.) imply
+# NoNewPrivileges=yes, which would block the sgid unix_chkpwd helper; the
+# SupplementaryGroups=shadow above sidesteps that by letting pam_unix read
+# /etc/shadow directly, so PAM works with this hardening intact.
+
 # Filesystem hardening
-NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -76,7 +89,6 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 # Syscall filtering: allow system-service baseline plus mount/umount for FUSE clipboard
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
 SystemCallFilter=mount umount2
 SystemCallArchitectures=native
 

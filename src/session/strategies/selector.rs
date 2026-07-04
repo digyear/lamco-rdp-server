@@ -166,10 +166,16 @@ impl SessionStrategySelector {
         }
 
         // PRIORITY 1: Mutter Direct API (GNOME only, zero dialogs ever)
-        if self
-            .service_registry
-            .service_level(ServiceId::DirectCompositorAPI)
-            >= ServiceLevel::BestEffort
+        // Skip if LAMCO_SKIP_MUTTER_DIRECT is set (for testing Portal EIS path on GNOME)
+        let skip_mutter_direct = std::env::var("LAMCO_SKIP_MUTTER_DIRECT").is_ok();
+        if skip_mutter_direct {
+            info!("Skipping Mutter Direct strategy (LAMCO_SKIP_MUTTER_DIRECT set)");
+        }
+        if !skip_mutter_direct
+            && self
+                .service_registry
+                .service_level(ServiceId::DirectCompositorAPI)
+                >= ServiceLevel::BestEffort
         {
             if MutterDirectStrategy::is_available().await {
                 info!("✅ Selected: Mutter Direct API strategy");
@@ -184,13 +190,29 @@ impl SessionStrategySelector {
             }
         }
 
-        // PRIORITY 2: portal-generic embedded (wlroots, video + input + clipboard)
+        // PRIORITY 2: portal-generic embedded (wlroots/Smithay — video + input + clipboard)
+        //
+        // Two ways in:
+        //   1. wlr-direct input present (Sway/Hyprland) — original behavior, unchanged.
+        //   2. A direct capture protocol (ext-image-copy-capture / wlr-screencopy) is
+        //      present AND the system portal has no RemoteDesktop. This is the COSMIC
+        //      case: COSMIC 1.0 exposes ext-image-copy-capture + virtual keyboard but
+        //      no virtual pointer (issue #1350), so condition 1 alone dropped it,
+        //      losing working video + data-control clipboard.
+        //
+        // The `!supports_remote_desktop` guard scopes condition 2 to compositors whose
+        // portal cannot drive a full session. KDE/GNOME advertise Portal RemoteDesktop
+        // and keep their existing (tested) Portal path — they are never rerouted here.
         #[cfg(feature = "portal-generic")]
-        if self
+        let has_wlr_direct_input = self
             .service_registry
             .service_level(ServiceId::WlrDirectInput)
-            >= ServiceLevel::BestEffort
-        {
+            >= ServiceLevel::BestEffort;
+        #[cfg(feature = "portal-generic")]
+        let has_direct_capture_without_portal = !caps.portal.supports_remote_desktop
+            && (caps.has_ext_image_copy_capture() || caps.has_wlr_screencopy());
+        #[cfg(feature = "portal-generic")]
+        if has_wlr_direct_input || has_direct_capture_without_portal {
             use super::portal_generic::PortalGenericStrategy;
 
             if PortalGenericStrategy::is_available().await {

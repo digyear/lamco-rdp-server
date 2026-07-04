@@ -87,6 +87,9 @@ pub mod strategies {
     #[cfg(feature = "portal-generic")]
     pub mod portal_generic;
 
+    #[cfg(feature = "portal-generic")]
+    pub mod uinput_pointer;
+
     #[cfg(feature = "libei")]
     pub mod libei;
 

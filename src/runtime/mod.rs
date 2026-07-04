@@ -3,6 +3,7 @@
 pub mod diagnostics;
 pub mod errors;
 pub mod metrics;
+pub mod pidfile;
 
 pub use diagnostics::{
     RuntimeStats, SystemInfo, detect_compositor, detect_portal_backend, get_pipewire_version,

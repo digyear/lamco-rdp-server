@@ -114,6 +114,16 @@ impl TlsConfig {
         Arc::clone(&self.server_config)
     }
 
+    /// Returns the DER-encoded certificate chain, owned. Used by transports
+    /// that need to surface the server cert chain to clients out-of-band
+    /// (e.g. RDCleanPath Response in the WebSocket+RDCleanPath path).
+    pub fn cert_chain_der(&self) -> Vec<Vec<u8>> {
+        self.cert_chain
+            .iter()
+            .map(|c| c.as_ref().to_vec())
+            .collect()
+    }
+
     /// Extract the DER-encoded subject public key from the leaf certificate.
     ///
     /// Required for CredSSP/NLA: the server's public key is used to encrypt

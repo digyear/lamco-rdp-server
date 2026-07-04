@@ -25,6 +25,10 @@ pub fn validate_config(config: &Config) -> ValidationResult {
     validate_hardware_encoding_config(config, &mut errors, &mut warnings);
     validate_display_config(config, &mut errors, &mut warnings);
     validate_logging_config(config, &mut errors, &mut warnings);
+    validate_audio_config(config, &mut errors, &mut warnings);
+    validate_cursor_config(config, &mut errors, &mut warnings);
+    validate_multimon_config(config, &mut errors, &mut warnings);
+    validate_video_pipeline_config(config, &mut errors, &mut warnings);
     validate_cross_section(config, &mut errors, &mut warnings);
 
     ValidationResult {
@@ -47,16 +51,16 @@ fn validate_server_config(
         });
     }
 
-    if let Ok(addr) = config.server.listen_addr.parse::<SocketAddr>() {
-        if addr.port() < 1024 {
-            warnings.push(ValidationWarning {
-                field: "server.listen_addr".to_string(),
-                message: format!(
-                    "Port {} requires root privileges on most systems",
-                    addr.port()
-                ),
-            });
-        }
+    if let Ok(addr) = config.server.listen_addr.parse::<SocketAddr>()
+        && addr.port() < 1024
+    {
+        warnings.push(ValidationWarning {
+            field: "server.listen_addr".to_string(),
+            message: format!(
+                "Port {} requires root privileges on most systems",
+                addr.port()
+            ),
+        });
     }
 
     if config.server.max_connections == 0 {
@@ -86,13 +90,11 @@ fn validate_security_config(
                 config.security.cert_path.display()
             ),
         });
-    } else {
-        if let Err(e) = validate_pem_file(&config.security.cert_path, "CERTIFICATE") {
-            errors.push(ValidationError {
-                field: "security.cert_path".to_string(),
-                message: e,
-            });
-        }
+    } else if let Err(e) = validate_pem_file(&config.security.cert_path, "CERTIFICATE") {
+        errors.push(ValidationError {
+            field: "security.cert_path".to_string(),
+            message: e,
+        });
     }
 
     if !config.security.key_path.exists() {
@@ -136,6 +138,19 @@ fn validate_security_config(
                 message: format!(
                     "Invalid auth method: '{}'. Valid options: pam, none, password",
                     config.security.auth_method
+                ),
+            });
+        }
+    }
+
+    match config.security.security_mode.as_str() {
+        "tls" | "hybrid" | "auto" => {}
+        _ => {
+            errors.push(ValidationError {
+                field: "security.security_mode".to_string(),
+                message: format!(
+                    "Invalid security mode: '{}'. Valid options: tls, hybrid, auto",
+                    config.security.security_mode
                 ),
             });
         }
@@ -444,8 +459,7 @@ fn validate_display_config(
             errors.push(ValidationError {
                 field: "display.allowed_resolutions".to_string(),
                 message: format!(
-                    "Invalid resolution format: '{}'. Expected format: WIDTHxHEIGHT (e.g., 1920x1080)",
-                    res
+                    "Invalid resolution format: '{res}'. Expected format: WIDTHxHEIGHT (e.g., 1920x1080)"
                 ),
             });
         }
@@ -489,6 +503,22 @@ fn validate_logging_config(
                 field: "logging.log_dir".to_string(),
                 message: format!("Log path is not a directory: {}", log_dir.display()),
             });
+        } else {
+            let probe = log_dir.join(format!(".lamco-write-test-{}", std::process::id()));
+            match std::fs::File::create(&probe) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) => {
+                    errors.push(ValidationError {
+                        field: "logging.log_dir".to_string(),
+                        message: format!(
+                            "Log directory is not writable: {} ({e})",
+                            log_dir.display()
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -527,23 +557,300 @@ fn validate_cross_section(
     }
 }
 
+/// Validate audio configuration
+fn validate_audio_config(
+    config: &Config,
+    errors: &mut Vec<ValidationError>,
+    warnings: &mut Vec<ValidationWarning>,
+) {
+    if !config.audio.enabled {
+        return;
+    }
+
+    match config.audio.codec.as_str() {
+        "opus" | "pcm" | "adpcm" | "auto" => {}
+        _ => {
+            errors.push(ValidationError {
+                field: "audio.codec".to_string(),
+                message: format!(
+                    "Invalid audio codec: '{}'. Valid options: opus, pcm, adpcm, auto",
+                    config.audio.codec
+                ),
+            });
+        }
+    }
+
+    match config.audio.sample_rate {
+        8000 | 16000 | 24000 | 44100 | 48000 => {}
+        other => {
+            warnings.push(ValidationWarning {
+                field: "audio.sample_rate".to_string(),
+                message: format!(
+                    "Non-standard sample rate: {other} Hz. Common values: 8000, 16000, 24000, 44100, 48000."
+                ),
+            });
+        }
+    }
+
+    if config.audio.channels == 0 || config.audio.channels > 2 {
+        errors.push(ValidationError {
+            field: "audio.channels".to_string(),
+            message: format!(
+                "Invalid channel count: {}. Must be 1 (mono) or 2 (stereo).",
+                config.audio.channels
+            ),
+        });
+    }
+
+    match config.audio.frame_ms {
+        10 | 20 | 40 | 60 => {}
+        other => {
+            warnings.push(ValidationWarning {
+                field: "audio.frame_ms".to_string(),
+                message: format!(
+                    "Non-standard frame duration: {other} ms. Opus standard sizes: 10, 20, 40, 60."
+                ),
+            });
+        }
+    }
+
+    if config.audio.codec == "opus" {
+        if config.audio.opus_bitrate < 6000 {
+            warnings.push(ValidationWarning {
+                field: "audio.opus_bitrate".to_string(),
+                message: format!(
+                    "Opus bitrate {} bps below practical minimum (~6 kbps).",
+                    config.audio.opus_bitrate
+                ),
+            });
+        } else if config.audio.opus_bitrate > 510_000 {
+            warnings.push(ValidationWarning {
+                field: "audio.opus_bitrate".to_string(),
+                message: format!(
+                    "Opus bitrate {} bps exceeds the codec's 510 kbps maximum.",
+                    config.audio.opus_bitrate
+                ),
+            });
+        }
+    }
+}
+
+/// Validate cursor configuration
+fn validate_cursor_config(
+    config: &Config,
+    errors: &mut Vec<ValidationError>,
+    warnings: &mut Vec<ValidationWarning>,
+) {
+    match config.cursor.mode.as_str() {
+        "metadata" | "painted" | "hidden" | "predictive" => {}
+        _ => {
+            errors.push(ValidationError {
+                field: "cursor.mode".to_string(),
+                message: format!(
+                    "Invalid cursor mode: '{}'. Valid options: metadata, painted, hidden, predictive",
+                    config.cursor.mode
+                ),
+            });
+        }
+    }
+
+    if config.cursor.cursor_update_fps == 0 {
+        errors.push(ValidationError {
+            field: "cursor.cursor_update_fps".to_string(),
+            message: "cursor_update_fps must be at least 1".to_string(),
+        });
+    } else if config.cursor.cursor_update_fps > 240 {
+        warnings.push(ValidationWarning {
+            field: "cursor.cursor_update_fps".to_string(),
+            message: format!(
+                "Cursor update rate {} Hz exceeds typical display refresh; bandwidth waste likely.",
+                config.cursor.cursor_update_fps
+            ),
+        });
+    }
+
+    let pred = &config.cursor.predictor;
+
+    if !(0.0..=1.0).contains(&pred.velocity_smoothing) {
+        errors.push(ValidationError {
+            field: "cursor.predictor.velocity_smoothing".to_string(),
+            message: format!(
+                "velocity_smoothing must be in [0.0, 1.0]; got {}",
+                pred.velocity_smoothing
+            ),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&pred.acceleration_smoothing) {
+        errors.push(ValidationError {
+            field: "cursor.predictor.acceleration_smoothing".to_string(),
+            message: format!(
+                "acceleration_smoothing must be in [0.0, 1.0]; got {}",
+                pred.acceleration_smoothing
+            ),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&pred.stop_convergence_rate) {
+        errors.push(ValidationError {
+            field: "cursor.predictor.stop_convergence_rate".to_string(),
+            message: format!(
+                "stop_convergence_rate must be in [0.0, 1.0]; got {}",
+                pred.stop_convergence_rate
+            ),
+        });
+    }
+
+    if pred.max_prediction_distance < 0 {
+        errors.push(ValidationError {
+            field: "cursor.predictor.max_prediction_distance".to_string(),
+            message: format!(
+                "max_prediction_distance must be non-negative; got {}",
+                pred.max_prediction_distance
+            ),
+        });
+    }
+}
+
+/// Validate multi-monitor configuration
+fn validate_multimon_config(
+    config: &Config,
+    errors: &mut Vec<ValidationError>,
+    warnings: &mut Vec<ValidationWarning>,
+) {
+    if !config.multimon.enabled {
+        return;
+    }
+
+    if config.multimon.max_monitors == 0 {
+        errors.push(ValidationError {
+            field: "multimon.max_monitors".to_string(),
+            message: "max_monitors must be at least 1 when multi-monitor is enabled".to_string(),
+        });
+    } else if config.multimon.max_monitors > 16 {
+        warnings.push(ValidationWarning {
+            field: "multimon.max_monitors".to_string(),
+            message: format!(
+                "max_monitors = {} exceeds the MS-RDPEDISP 16-monitor practical limit.",
+                config.multimon.max_monitors
+            ),
+        });
+    }
+}
+
+/// Validate video pipeline configuration (processor, dispatcher, converter)
+fn validate_video_pipeline_config(
+    config: &Config,
+    errors: &mut Vec<ValidationError>,
+    warnings: &mut Vec<ValidationWarning>,
+) {
+    let proc = &config.video_pipeline.processor;
+    let disp = &config.video_pipeline.dispatcher;
+    let conv = &config.video_pipeline.converter;
+
+    if proc.target_fps == 0 {
+        errors.push(ValidationError {
+            field: "video_pipeline.processor.target_fps".to_string(),
+            message: "processor.target_fps must be at least 1".to_string(),
+        });
+    } else if proc.target_fps > 120 {
+        warnings.push(ValidationWarning {
+            field: "video_pipeline.processor.target_fps".to_string(),
+            message: format!(
+                "processor.target_fps = {} above 120 may cause excessive CPU/bandwidth usage",
+                proc.target_fps
+            ),
+        });
+    }
+
+    if proc.max_queue_depth == 0 {
+        errors.push(ValidationError {
+            field: "video_pipeline.processor.max_queue_depth".to_string(),
+            message: "max_queue_depth must be at least 1".to_string(),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&proc.damage_threshold) {
+        errors.push(ValidationError {
+            field: "video_pipeline.processor.damage_threshold".to_string(),
+            message: format!(
+                "processor.damage_threshold must be in [0.0, 1.0]; got {}",
+                proc.damage_threshold
+            ),
+        });
+    }
+
+    if disp.channel_size == 0 {
+        errors.push(ValidationError {
+            field: "video_pipeline.dispatcher.channel_size".to_string(),
+            message: "dispatcher.channel_size must be at least 1".to_string(),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&disp.high_water_mark) {
+        errors.push(ValidationError {
+            field: "video_pipeline.dispatcher.high_water_mark".to_string(),
+            message: format!(
+                "dispatcher.high_water_mark must be in [0.0, 1.0]; got {}",
+                disp.high_water_mark
+            ),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&disp.low_water_mark) {
+        errors.push(ValidationError {
+            field: "video_pipeline.dispatcher.low_water_mark".to_string(),
+            message: format!(
+                "dispatcher.low_water_mark must be in [0.0, 1.0]; got {}",
+                disp.low_water_mark
+            ),
+        });
+    }
+
+    if disp.low_water_mark >= disp.high_water_mark {
+        errors.push(ValidationError {
+            field: "video_pipeline.dispatcher.low_water_mark".to_string(),
+            message: format!(
+                "dispatcher.low_water_mark ({}) must be strictly less than high_water_mark ({})",
+                disp.low_water_mark, disp.high_water_mark
+            ),
+        });
+    }
+
+    if conv.buffer_pool_size == 0 {
+        errors.push(ValidationError {
+            field: "video_pipeline.converter.buffer_pool_size".to_string(),
+            message: "converter.buffer_pool_size must be at least 1".to_string(),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&conv.damage_threshold) {
+        errors.push(ValidationError {
+            field: "video_pipeline.converter.damage_threshold".to_string(),
+            message: format!(
+                "converter.damage_threshold must be in [0.0, 1.0]; got {}",
+                conv.damage_threshold
+            ),
+        });
+    }
+}
+
 /// Validate a PEM file contains the expected type
 fn validate_pem_file(path: &Path, expected_type: &str) -> Result<(), String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("Cannot read file: {}", e))?;
+    let content = std::fs::read_to_string(path).map_err(|e| format!("Cannot read file: {e}"))?;
 
-    let begin_marker = format!("-----BEGIN {}-----", expected_type);
+    let begin_marker = format!("-----BEGIN {expected_type}-----");
 
     // Also accept more specific markers
     let has_valid_markers = content.contains(&begin_marker)
-        || content.contains(&format!("-----BEGIN RSA {}-----", expected_type))
-        || content.contains(&format!("-----BEGIN EC {}-----", expected_type))
+        || content.contains(&format!("-----BEGIN RSA {expected_type}-----"))
+        || content.contains(&format!("-----BEGIN EC {expected_type}-----"))
         || content.contains("-----BEGIN PRIVATE KEY-----") && expected_type == "PRIVATE KEY"
         || content.contains("-----BEGIN CERTIFICATE-----") && expected_type == "CERTIFICATE";
 
     if !has_valid_markers {
         return Err(format!(
-            "File does not contain valid PEM {} markers",
-            expected_type
+            "File does not contain valid PEM {expected_type} markers"
         ));
     }
 
@@ -585,5 +892,99 @@ mod tests {
         config.egfx.qp_max = 20;
         let result = validate_config(&config);
         assert!(result.errors.iter().any(|e| e.field == "egfx.qp_min"));
+    }
+
+    #[test]
+    fn test_validate_security_mode_enum() {
+        let mut config = Config::default();
+        config.security.security_mode = "bogus".to_string();
+        let result = validate_config(&config);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field == "security.security_mode"),
+            "expected security.security_mode error"
+        );
+    }
+
+    #[test]
+    fn test_validate_audio_codec_enum() {
+        let mut config = Config::default();
+        config.audio.enabled = true;
+        config.audio.codec = "mp3".to_string();
+        let result = validate_config(&config);
+        assert!(result.errors.iter().any(|e| e.field == "audio.codec"));
+    }
+
+    #[test]
+    fn test_validate_audio_channels_range() {
+        let mut config = Config::default();
+        config.audio.enabled = true;
+        config.audio.channels = 5;
+        let result = validate_config(&config);
+        assert!(result.errors.iter().any(|e| e.field == "audio.channels"));
+    }
+
+    #[test]
+    fn test_validate_cursor_mode_enum() {
+        let mut config = Config::default();
+        config.cursor.mode = "wiggle".to_string();
+        let result = validate_config(&config);
+        assert!(result.errors.iter().any(|e| e.field == "cursor.mode"));
+    }
+
+    #[test]
+    fn test_validate_cursor_smoothing_range() {
+        let mut config = Config::default();
+        config.cursor.predictor.velocity_smoothing = 1.5;
+        let result = validate_config(&config);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field == "cursor.predictor.velocity_smoothing")
+        );
+    }
+
+    #[test]
+    fn test_validate_multimon_max_monitors_zero() {
+        let mut config = Config::default();
+        config.multimon.enabled = true;
+        config.multimon.max_monitors = 0;
+        let result = validate_config(&config);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field == "multimon.max_monitors")
+        );
+    }
+
+    #[test]
+    fn test_validate_video_pipeline_watermark_ordering() {
+        let mut config = Config::default();
+        config.video_pipeline.dispatcher.high_water_mark = 0.4;
+        config.video_pipeline.dispatcher.low_water_mark = 0.6;
+        let result = validate_config(&config);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field == "video_pipeline.dispatcher.low_water_mark")
+        );
+    }
+
+    #[test]
+    fn test_validate_video_pipeline_damage_threshold_range() {
+        let mut config = Config::default();
+        config.video_pipeline.processor.damage_threshold = 1.5;
+        let result = validate_config(&config);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field == "video_pipeline.processor.damage_threshold")
+        );
     }
 }

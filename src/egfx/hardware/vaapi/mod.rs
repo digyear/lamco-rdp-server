@@ -1291,6 +1291,7 @@ mod tests {
             fallback_to_software: true,
             quality_preset: "balanced".to_string(),
             prefer_nvenc: false,
+            ..HardwareEncodingConfig::default()
         }
     }
 

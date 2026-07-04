@@ -58,11 +58,13 @@ pub async fn start_compositor_watcher(
 
     info!("Starting compositor D-Bus name watcher for: {:?}", names);
 
-    let handle = tokio::spawn(watch_names(connection, names, reporter, shutdown));
+    let handle = tokio::spawn(watch_dbus_names(connection, names, reporter, shutdown));
     Some(handle)
 }
 
-async fn watch_names(
+/// Core D-Bus name watching loop — shared by both the legacy free function
+/// and the `DbusNameWatcher` CompositorHealthSource implementation.
+pub(super) async fn watch_dbus_names(
     connection: zbus::Connection,
     names: Vec<&'static str>,
     reporter: HealthReporter,

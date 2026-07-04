@@ -182,13 +182,16 @@ impl ClipboardIntegrationMode {
                     crate::services::clipboard_manager::SystemClipboardManagerKind::CopyQ {
                         ..
                     }
-                    | crate::services::clipboard_manager::SystemClipboardManagerKind::Diodon => {
-                        info!("  Third-party clipboard manager detected");
+                    | crate::services::clipboard_manager::SystemClipboardManagerKind::Diodon
+                    | crate::services::clipboard_manager::SystemClipboardManagerKind::GPaste
+                    | crate::services::clipboard_manager::SystemClipboardManagerKind::Clipcat => {
+                        info!("  Clipboard manager detected (persists/takes ownership)");
                         info!("  Using conservative manager detection mode");
                         Self::PortalWithDetection
                     }
 
                     crate::services::clipboard_manager::SystemClipboardManagerKind::GnomeShell
+                    | crate::services::clipboard_manager::SystemClipboardManagerKind::CosmicClipboard
                     | crate::services::clipboard_manager::SystemClipboardManagerKind::None => {
                         info!("  No clipboard manager interference expected");
                         info!("  Using standard Portal strategy");
@@ -196,9 +199,12 @@ impl ClipboardIntegrationMode {
                     }
 
                     crate::services::clipboard_manager::SystemClipboardManagerKind::WlClipboard
+                    | crate::services::clipboard_manager::SystemClipboardManagerKind::Cliphist
+                    | crate::services::clipboard_manager::SystemClipboardManagerKind::WlClipPersist
+                    | crate::services::clipboard_manager::SystemClipboardManagerKind::Clipman
                     | crate::services::clipboard_manager::SystemClipboardManagerKind::Unknown => {
-                        info!("  Unknown/wl-clipboard detected");
-                        info!("  Using conservative standard strategy");
+                        info!("  Passive clipboard tools detected");
+                        info!("  Using standard Portal strategy");
                         Self::PortalDirect
                     }
                 }

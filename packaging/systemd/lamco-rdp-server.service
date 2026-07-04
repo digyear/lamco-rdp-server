@@ -38,8 +38,16 @@ RestartSec=5
 # Environment
 Environment=RUST_LOG=info
 
+# Hardening note: NoNewPrivileges= and the ~@privileged/@resources seccomp
+# denies are deliberately absent. PAM verification needs unix_chkpwd (sgid
+# shadow) to elevate, which no_new_privs forbids, and pam_unix's in-process
+# setuid probe plus PipeWire's realtime scheduling were SIGSYS-killed by the
+# denies (no SystemCallErrorNumber= set). The @system-service allowlist,
+# ProtectSystem=, and RestrictRealtime= (RT degrades to EPERM) remain.
+# A user manager still implies no_new_privs while seccomp options are set;
+# the server detects that at startup and falls back from auth_method=pam.
+
 # Filesystem hardening
-NoNewPrivileges=yes
 ProtectSystem=strict
 PrivateTmp=yes
 ProtectProc=invisible
@@ -72,7 +80,6 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 # Syscall filtering: allow system-service baseline plus mount/umount for FUSE clipboard
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
 SystemCallFilter=mount umount2
 SystemCallArchitectures=native
 

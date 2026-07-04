@@ -212,10 +212,13 @@ mod tests {
 
     #[test]
     fn test_axis_source_types() {
-        // Verify all axis source variants exist
-        let _wheel = AxisSource::Wheel;
-        let _finger = AxisSource::Finger;
-        let _continuous = AxisSource::Continuous;
-        let _tilt = AxisSource::WheelTilt;
+        // Exhaustive match: compiler proves all variants are accounted for.
+        // Adding a new variant requires updating this arm.
+        match AxisSource::Wheel {
+            AxisSource::Wheel
+            | AxisSource::Finger
+            | AxisSource::Continuous
+            | AxisSource::WheelTilt => {}
+        }
     }
 }

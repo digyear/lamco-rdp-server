@@ -36,14 +36,8 @@ pub struct ClipboardComponents {
     pub manager: Option<Arc<lamco_portal::ClipboardManager>>,
     /// Portal session for clipboard operations (always available)
     /// Uses RwLock to allow concurrent access from input and clipboard operations
-    pub session: Arc<
-        RwLock<
-            ashpd::desktop::Session<
-                'static,
-                ashpd::desktop::remote_desktop::RemoteDesktop<'static>,
-            >,
-        >,
-    >,
+    pub session:
+        Arc<RwLock<ashpd::desktop::Session<ashpd::desktop::remote_desktop::RemoteDesktop>>>,
     /// Session validity — false when compositor has destroyed the Portal session.
     /// Clipboard operations should check this before calling Portal D-Bus methods.
     pub session_valid: Arc<AtomicBool>,
@@ -68,7 +62,7 @@ pub enum ClipboardSource {
 
     /// Mutter D-Bus clipboard (MutterDirect strategy).
     /// Clipboard is handled natively via org.gnome.Mutter.RemoteDesktop.
-    Mutter(Arc<crate::mutter::MutterClipboardManager>),
+    Mutter(Arc<crate::mutter::MutterClipboard>),
 
     /// Wayland data-control protocol (PortalGeneric strategy).
     /// Clipboard is handled via ext-data-control-v1 or wlr-data-control-v1.
@@ -95,6 +89,18 @@ pub trait SessionHandle: Send + Sync {
     // === Input Injection Methods ===
 
     async fn notify_keyboard_keycode(&self, keycode: i32, pressed: bool) -> Result<()>;
+
+    /// Send a keyboard event by XKB keysym (for Unicode input).
+    ///
+    /// Used for characters that don't have a direct evdev keycode mapping,
+    /// such as CJK, accented characters, or symbols outside US QWERTY.
+    /// XKB Unicode keysyms use the range 0x01000000 + Unicode code point.
+    ///
+    /// Default implementation returns Ok (no-op for strategies that don't
+    /// support keysym input, like EIS).
+    async fn notify_keyboard_keysym(&self, _keysym: u32, _pressed: bool) -> Result<()> {
+        Ok(())
+    }
 
     async fn notify_pointer_motion_absolute(&self, stream_id: u32, x: f64, y: f64) -> Result<()>;
 
@@ -133,12 +139,73 @@ pub trait SessionHandle: Send + Sync {
     /// Default: no-op for strategies that don't support health reporting.
     fn set_health_reporter(&self, _reporter: HealthReporter) {}
 
+    /// Get the shared stream active flag for Portal input coupling.
+    ///
+    /// Portal sessions return a shared `AtomicBool` that the display handler
+    /// updates on PipeWire state transitions. The Portal input methods check
+    /// this flag before attempting D-Bus calls, preventing hundreds of futile
+    /// errors when the stream is paused.
+    ///
+    /// Non-Portal strategies return `None` — their input is independent of
+    /// PipeWire stream state.
+    fn stream_active_flag(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
+
     /// Provide stream info from an external video source.
     ///
     /// wlr-direct creates input devices before ScreenCast streams are known.
     /// The server calls this after obtaining streams so pointer coordinate
     /// transformation uses the real resolution instead of a fallback.
     fn set_streams(&self, _streams: Vec<StreamInfo>) {}
+
+    // === Input Lifecycle ===
+
+    /// Activate the input subsystem (e.g., EIS session creation).
+    ///
+    /// Called when the first RDP client connects. Strategies that need
+    /// to defer input setup (like libei, where the EIS socket has a
+    /// compositor-imposed idle timeout) implement this to create the
+    /// input connection on-demand rather than at server startup.
+    async fn activate_input(&self) -> Result<()> {
+        Ok(())
+    }
+
+    // === Session Lifecycle (per-backend "protocol") ===
+
+    /// How this backend's compositor session behaves across successive RDP
+    /// client connections.
+    ///
+    /// Backends diverge here, and this is the seam that expresses it. An XDG
+    /// Portal or wlroots session is created once and reused for the whole
+    /// server process ([`SessionLifecyclePolicy::Persistent`]); Mutter's
+    /// RemoteDesktop session is reaped by the compositor's idle timeout once
+    /// the RDP client leaves and must be re-established per connection
+    /// ([`SessionLifecyclePolicy::PerConnection`]). Future compositor session
+    /// protocols slot in here without touching the connection layer.
+    fn lifecycle_policy(&self) -> SessionLifecyclePolicy {
+        SessionLifecyclePolicy::Persistent
+    }
+
+    /// Establish (or re-establish) the compositor session for an incoming RDP
+    /// client. Returns the capture streams to bind, and whether the session was
+    /// actually (re-)established this call (`true`) versus reused (`false`).
+    ///
+    /// `Persistent` backends reuse the existing session and return
+    /// `(streams, false)` (the default). `PerConnection` backends create a fresh
+    /// session when the previous one was released and return `(streams, true)` —
+    /// the caller must then rebind the capture pipeline **even if the PipeWire
+    /// node id is unchanged**, because the compositor can reuse a node id for a
+    /// brand-new stream, so number-equality does not imply the same stream.
+    async fn establish_for_client(&self) -> Result<(Vec<StreamInfo>, bool)> {
+        Ok((self.streams(), false))
+    }
+
+    /// Tear the compositor session down after the RDP client disconnects, per
+    /// policy. `Persistent` keeps the session alive (default no-op);
+    /// `PerConnection` closes it cleanly so the compositor does not reap a
+    /// half-idle session and the next client is handed a fresh one.
+    async fn release_after_client(&self) {}
 
     // === Clipboard Support ===
 
@@ -147,6 +214,53 @@ pub trait SessionHandle: Send + Sync {
     /// The server uses this to wire the correct clipboard provider without
     /// needing to know strategy-specific details.
     fn clipboard_source(&self) -> ClipboardSource;
+
+    /// Build the clipboard provider this strategy backs, if any.
+    ///
+    /// The default constructs from [`clipboard_source`](Self::clipboard_source):
+    /// Portal / Mutter / data-control natively. `portal_fallback` supplies a
+    /// server-created Portal session for `None` strategies that still want Portal
+    /// clipboard. Strategies override when they source clipboard differently
+    /// (libei and wlr-direct use Wayland data-control — no Portal session).
+    /// Returns `None` when the strategy provides no clipboard (view-only).
+    async fn build_clipboard(
+        &self,
+        portal_fallback: Option<ClipboardComponents>,
+        rate_limit_ms: u64,
+    ) -> Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> {
+        let components = match self.clipboard_source() {
+            ClipboardSource::Portal(c) => Some(c),
+            ClipboardSource::Mutter(m) => {
+                return match crate::clipboard::providers::MutterClipboardProvider::new(m).await {
+                    Ok(p) => Some(Arc::new(p)),
+                    Err(e) => {
+                        tracing::warn!("Failed to create Mutter clipboard provider: {e}");
+                        None
+                    }
+                };
+            }
+            #[cfg(feature = "portal-generic")]
+            ClipboardSource::DataControl(b) => {
+                return Some(Arc::new(
+                    crate::clipboard::providers::DataControlClipboardProvider::new(b),
+                ));
+            }
+            ClipboardSource::None => portal_fallback,
+        };
+
+        // Portal source, or a None strategy with a server-provided fallback session.
+        let c = components?;
+        let manager = c.manager?; // Portal v1 (no clipboard) → None
+        Some(Arc::new(
+            crate::clipboard::providers::PortalClipboardProvider::new(
+                manager,
+                c.session,
+                c.session_valid,
+                rate_limit_ms,
+            )
+            .await,
+        ))
+    }
 }
 
 /// PipeWire access method
@@ -189,6 +303,26 @@ pub struct StreamInfo {
     pub height: u32,
     pub position_x: i32,
     pub position_y: i32,
+}
+
+/// How a backend's compositor session behaves across successive RDP client
+/// connections — the "session lifecycle protocol" for that backend.
+///
+/// The connection layer drives the same connect/disconnect events for every
+/// backend; this policy is what each backend declares so those generic events
+/// are interpreted by the backend's own rules rather than a single assumed
+/// model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLifecyclePolicy {
+    /// One compositor session for the whole server process, reused across all
+    /// RDP connections. Re-establishment is unavailable or needs user
+    /// interaction (XDG Portal restore, wlroots, portal-generic, view-only).
+    Persistent,
+    /// The compositor reaps its session when the RDP client leaves (e.g.
+    /// Mutter's idle timeout on an unused RemoteDesktop session). The session
+    /// is (re-)established per RDP connection and torn down cleanly on
+    /// disconnect; re-establishment is dialog-free. Mutter-direct.
+    PerConnection,
 }
 
 /// Session type

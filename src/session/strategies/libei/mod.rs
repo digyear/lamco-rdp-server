@@ -122,9 +122,18 @@ impl SessionStrategy for LibeiStrategy {
             .context("Failed to create RemoteDesktop proxy")?;
 
         let session = remote_desktop
-            .create_session()
+            .create_session(ashpd::desktop::CreateSessionOptions::default())
             .await
             .context("Failed to create RemoteDesktop session")?;
+
+        // Tag this Portal session for log correlation across multi-session setups
+        // (KDE+libei creates 3 sessions: this libei one, ScreenCast for video,
+        // and a duplicate combined session for clipboard via server/mod.rs).
+        let session_tag = format!("libei-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        info!(
+            session_tag = %session_tag,
+            "[libei] Portal RemoteDesktop session created"
+        );
 
         // Load restore token from previous session (avoids permission dialog)
         let restore_token = if let Some(ref tm) = self.token_manager {
@@ -146,12 +155,16 @@ impl SessionStrategy for LibeiStrategy {
             None
         };
 
+        use ashpd::desktop::remote_desktop::SelectDevicesOptions;
         remote_desktop
             .select_devices(
                 &session,
-                DeviceType::Keyboard | DeviceType::Pointer | DeviceType::Touchscreen,
-                restore_token.as_deref(),
-                PersistMode::ExplicitlyRevoked,
+                SelectDevicesOptions::default()
+                    .set_devices(
+                        DeviceType::Keyboard | DeviceType::Pointer | DeviceType::Touchscreen,
+                    )
+                    .set_restore_token(restore_token.as_deref())
+                    .set_persist_mode(PersistMode::ExplicitlyRevoked),
             )
             .await
             .context("Failed to select input devices")?;
@@ -159,7 +172,11 @@ impl SessionStrategy for LibeiStrategy {
         info!("libei: Selected keyboard, pointer, and touchscreen devices");
 
         let response = remote_desktop
-            .start(&session, None)
+            .start(
+                &session,
+                None,
+                ashpd::desktop::remote_desktop::StartOptions::default(),
+            )
             .await
             .context("Failed to start RemoteDesktop session")?;
 
@@ -178,49 +195,73 @@ impl SessionStrategy for LibeiStrategy {
             debug!("[libei] No restore token in response (portal may not support persistence)");
         }
 
-        info!("libei: RemoteDesktop session started, calling ConnectToEIS");
+        // Phase 1 complete: Portal session has permissions.
+        // EIS activation (ConnectToEIS) is deferred until the first
+        // RDP client connects, preventing compositor idle timeout.
+        info!("libei: Portal session ready (EIS deferred until client connects)");
 
-        let fd = remote_desktop
-            .connect_to_eis(&session)
-            .await
-            .context("ConnectToEIS failed - portal may not support this method (requires v2+)")?;
+        let portal_session = Arc::new(RwLock::new(session));
 
-        let stream = UnixStream::from(fd);
-        let context =
-            ei::Context::new(stream).context("Failed to create EIS context from socket")?;
-
-        let mut events =
-            EiEventStream::new(context.clone()).context("Failed to create EIS event stream")?;
-
-        let handshake_resp = reis::tokio::ei_handshake(
-            &mut events,
-            "lamco-rdp-server",
-            ei::handshake::ContextType::Sender,
-        )
-        .await
-        .context("EIS handshake failed")?;
-
-        info!("libei: EIS handshake complete");
+        // Subscribe to Session.Closed signal. Without this, when the portal
+        // backend (kwin/mutter/wlr) decides to kill the session, we keep using
+        // a dead handle and the cascade surfaces ~7s later as mstsc TCP RST or
+        // PipeWire stream death with no visible cause in our logs.
+        //
+        // The spawned task holds an OwnedRwLockReadGuard for the session
+        // lifetime; this is sound because portal_session is read-only after
+        // creation (verified: no .write()/.write_owned() calls on it anywhere).
+        {
+            let session_for_closed = portal_session.clone();
+            let task_tag = session_tag.clone();
+            tokio::spawn(async move {
+                let session_guard = session_for_closed.read_owned().await;
+                let mut closed_stream = match session_guard.receive_closed().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(
+                            session_tag = %task_tag,
+                            error = %e,
+                            "[libei] Failed to subscribe to Session.Closed signal"
+                        );
+                        return;
+                    }
+                };
+                info!(
+                    session_tag = %task_tag,
+                    "[libei] Subscribed to Portal Session.Closed signal"
+                );
+                match closed_stream.next().await {
+                    Some(payload) => {
+                        error!(
+                            session_tag = %task_tag,
+                            payload = ?payload,
+                            "[libei] PORTAL SESSION CLOSED by backend — input/EIS path is now dead"
+                        );
+                    }
+                    None => {
+                        warn!(
+                            session_tag = %task_tag,
+                            "[libei] Portal Session.Closed stream ended without a Closed event (D-Bus connection lost?)"
+                        );
+                    }
+                }
+                // session_guard held until task ends — keeps the session alive
+                // and the signal subscription valid.
+            });
+        }
 
         let handle = Arc::new(LibeiSessionHandleImpl {
-            portal_session: Arc::new(RwLock::new(session)),
-            context: Arc::new(context),
-            connection: Arc::new(Mutex::new(handshake_resp.connection)),
-            event_stream: Arc::new(Mutex::new(events)),
+            portal_session,
+            remote_desktop: Arc::new(remote_desktop),
+            context: Arc::new(RwLock::new(None)),
+            connection: Arc::new(Mutex::new(None)),
             seats: Arc::new(Mutex::new(HashMap::new())),
-            devices: Arc::new(EisDevices::new(handshake_resp.serial)),
+            devices: Arc::new(EisDevices::new(0)),
             streams: Arc::new(Mutex::new(vec![])),
             health_reporter: std::sync::OnceLock::new(),
+            eis_activated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            activating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
-
-        let handle_clone = handle.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_clone.event_loop().await {
-                error!("libei: Event loop error: {:#}", e);
-            }
-        });
-
-        info!("libei: Session created with background event loop");
 
         Ok(handle as Arc<dyn SessionHandle>)
     }
@@ -241,54 +282,158 @@ struct SeatData {
 /// libei session handle implementation
 ///
 /// Implements SessionHandle trait using event-driven EIS protocol.
+/// The context and devices are behind RwLock to allow replacement
+/// during EIS session recovery (when the EIS socket dies due to
+/// compositor idle timeout).
 pub struct LibeiSessionHandleImpl {
-    #[expect(dead_code, reason = "keeps Portal session alive for EIS lifetime")]
-    portal_session: Arc<RwLock<ashpd::desktop::Session<'static, RemoteDesktop<'static>>>>,
-    context: Arc<ei::Context>,
-    connection: Arc<Mutex<ei::Connection>>,
-    event_stream: Arc<Mutex<EiEventStream>>,
+    /// Portal session (alive for server lifetime, holds permissions)
+    portal_session: Arc<RwLock<ashpd::desktop::Session<RemoteDesktop>>>,
+    /// RemoteDesktop proxy for calling ConnectToEIS
+    remote_desktop: Arc<RemoteDesktop>,
+    /// EIS context — None until activate_input() is called
+    context: Arc<RwLock<Option<ei::Context>>>,
+    /// EIS connection — None until activated
+    connection: Arc<Mutex<Option<ei::Connection>>>,
+    /// Seat tracking (populated by event loop after activation)
     seats: Arc<Mutex<HashMap<ei::Seat, SeatData>>>,
+    /// Input devices (populated by event loop after activation)
     devices: Arc<EisDevices>,
+    /// External video streams (set by server, independent of EIS)
     streams: Arc<Mutex<Vec<StreamInfo>>>,
     health_reporter: std::sync::OnceLock<HealthReporter>,
+    /// Whether EIS has been activated (ConnectToEIS called)
+    eis_activated: Arc<std::sync::atomic::AtomicBool>,
+    /// Prevent concurrent activation
+    activating: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LibeiSessionHandleImpl {
-    /// Background event loop for EIS protocol
-    async fn event_loop(&self) -> Result<()> {
-        let mut events = self.event_stream.lock().await;
+    /// Activate EIS: call ConnectToEIS, handshake, and set up devices.
+    ///
+    /// Called on-demand when the first RDP client connects (via activate_input).
+    /// This prevents the EIS socket from dying due to compositor idle timeout.
+    async fn activate_eis(&self) -> Result<()> {
+        // Prevent concurrent activation
+        if self
+            .activating
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            // Another task is already activating — wait for it
+            while self.activating.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            return Ok(());
+        }
 
-        while let Some(result) = events.next().await {
-            let event = match result {
-                Ok(PendingRequestResult::Request(event)) => event,
-                Ok(PendingRequestResult::ParseError(msg)) => {
-                    warn!("libei: EIS parse error: {}", msg);
-                    continue;
+        struct ActivationGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ActivationGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _guard = ActivationGuard(Arc::clone(&self.activating));
+
+        if self
+            .eis_activated
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Check if socket is still alive
+            let ctx = self.context.read().await;
+            if let Some(ref c) = *ctx {
+                if c.flush().is_ok() {
+                    return Ok(());
                 }
-                Ok(PendingRequestResult::InvalidObject(obj_id)) => {
-                    debug!("[libei] Invalid object ID: {}", obj_id);
-                    continue;
+                warn!("[libei] EIS socket dead on reactivation, creating new session");
+            }
+            drop(ctx);
+            // Socket is dead — reset state for fresh activation
+            self.devices.clear().await;
+            self.seats.lock().await.clear();
+            self.eis_activated
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+
+        info!("[libei] Activating EIS — calling ConnectToEIS");
+
+        let session = self.portal_session.read().await;
+        let fd = self
+            .remote_desktop
+            .connect_to_eis(
+                &session,
+                ashpd::desktop::remote_desktop::ConnectToEISOptions::default(),
+            )
+            .await
+            .context("ConnectToEIS failed")?;
+        drop(session);
+
+        let stream = UnixStream::from(fd);
+        let context = ei::Context::new(stream).context("Failed to create EIS context")?;
+
+        let mut events =
+            EiEventStream::new(context.clone()).context("Failed to create EIS event stream")?;
+
+        let handshake_resp = reis::tokio::ei_handshake(
+            &mut events,
+            "lamco-rdp-server",
+            ei::handshake::ContextType::Sender,
+        )
+        .await
+        .context("EIS handshake failed")?;
+
+        info!("[libei] EIS handshake complete");
+
+        if let Err(e) = context.flush() {
+            warn!("[libei] Context flush after handshake failed: {}", e);
+        }
+
+        // Store context
+        {
+            let mut ctx = self.context.write().await;
+            *ctx = Some(context);
+        }
+        *self.connection.lock().await = Some(handshake_resp.connection);
+        *self.devices.last_serial.lock().await = handshake_resp.serial;
+
+        // Process initial events (seat + device setup) with a timeout.
+        // The compositor sends all setup events in a burst. We process
+        // until the stream goes quiet (no event within 500ms) or EOF.
+        loop {
+            match tokio::time::timeout(tokio::time::Duration::from_millis(500), events.next()).await
+            {
+                Ok(Some(Ok(PendingRequestResult::Request(event)))) => {
+                    self.handle_event(event).await?;
                 }
-                Err(e) => {
-                    error!("libei: Event stream error: {}", e);
-                    if let Some(r) = self.health_reporter.get() {
-                        r.report(HealthEvent::EisStreamEnded {
-                            reason: format!("stream error: {e}"),
-                        });
-                    }
+                Ok(Some(Ok(PendingRequestResult::ParseError(msg)))) => {
+                    warn!("[libei] EIS parse error during setup: {}", msg);
+                }
+                Ok(Some(Ok(PendingRequestResult::InvalidObject(id)))) => {
+                    debug!("[libei] Invalid object during setup: {}", id);
+                }
+                Ok(Some(Err(e))) => {
+                    error!("[libei] EIS event stream error during setup: {}", e);
                     return Err(e.into());
                 }
-            };
-
-            self.handle_event(event).await?;
+                Ok(None) => {
+                    // Stream EOF — setup complete
+                    debug!("[libei] Event stream EOF during setup");
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — no more events, setup is done
+                    debug!("[libei] No more events after 500ms, setup complete");
+                    break;
+                }
+            }
         }
 
-        info!("libei: Event loop terminated");
+        info!("[libei] EIS setup complete — devices ready for input injection");
+        self.eis_activated
+            .store(true, std::sync::atomic::Ordering::Release);
+
         if let Some(r) = self.health_reporter.get() {
-            r.report(HealthEvent::EisStreamEnded {
-                reason: "stream EOF".into(),
-            });
+            r.report(HealthEvent::EisStreamRecovered);
         }
+
         Ok(())
     }
 
@@ -302,7 +447,9 @@ impl LibeiSessionHandleImpl {
                 }
                 ei::connection::Event::Ping { ping } => {
                     ping.done(0);
-                    let _ = self.context.flush();
+                    if let Some(ref ctx) = *self.context.read().await {
+                        let _ = ctx.flush();
+                    }
                 }
                 _ => {}
             },
@@ -326,10 +473,12 @@ impl LibeiSessionHandleImpl {
                     ei::seat::Event::Done => {
                         let caps = data.capabilities.values().fold(0, |a, b| a | b);
                         seat.bind(caps);
-                        let connection = self.connection.lock().await;
-                        connection.sync(1);
-                        drop(connection);
-                        let _ = self.context.flush();
+                        if let Some(ref conn) = *self.connection.lock().await {
+                            conn.sync(1);
+                        }
+                        if let Some(ref ctx) = *self.context.read().await {
+                            let _ = ctx.flush();
+                        }
 
                         info!(
                             "libei: Seat '{}' ready with capabilities: {:?}",
@@ -371,19 +520,45 @@ impl LibeiSessionHandleImpl {
                     ei::device::Event::Interface { object } => {
                         let interface_name = object.interface().to_owned();
                         data.interfaces.insert(interface_name.clone(), object);
-                        debug!("[libei] Device interface: {}", interface_name);
+                        info!("[libei] Device interface: {}", interface_name);
+                    }
+                    ei::device::Event::Region {
+                        offset_x,
+                        offset_y,
+                        width,
+                        hight,
+                        scale,
+                    } => {
+                        info!(
+                            "[libei] Device region: {}x{} at ({},{}) scale={}",
+                            width, hight, offset_x, offset_y, scale
+                        );
+                        data.regions.push(eis_common::DeviceRegion {
+                            x: offset_x,
+                            y: offset_y,
+                            width,
+                            height: hight,
+                        });
                     }
                     ei::device::Event::Done => {
+                        // Assign device roles (keyboard, pointer, touch).
+                        // start_emulating is called in Resumed, not here --
+                        // calling it in Done + Resumed causes KWin to reject
+                        // the second call with "Invalid device state 3"
+                        // and disconnect the client.
                         eis_common::assign_device_roles(&device, data, &self.devices).await;
-                        debug!(
-                            "[libei] Device '{}' ready with interfaces: {:?}",
+                        info!(
+                            "[libei] Device '{}' setup complete",
                             data.name.as_deref().unwrap_or("unknown"),
-                            data.interfaces.keys().collect::<Vec<_>>()
                         );
                     }
                     ei::device::Event::Resumed { serial } => {
                         *self.devices.last_serial.lock().await = serial;
-                        debug!("[libei] Device resumed with serial: {}", serial);
+                        device.start_emulating(serial.wrapping_add(1), serial);
+                        if let Some(ref ctx) = *self.context.read().await {
+                            let _ = ctx.flush();
+                        }
+                        info!("[libei] Device resumed and emulating (serial={})", serial);
                     }
                     _ => {}
                 }
@@ -417,6 +592,10 @@ impl SessionHandle for LibeiSessionHandleImpl {
 
     fn session_type(&self) -> SessionType {
         SessionType::Libei
+    }
+
+    async fn activate_input(&self) -> Result<()> {
+        self.activate_eis().await
     }
 
     async fn notify_keyboard_keycode(&self, keycode: i32, pressed: bool) -> Result<()> {
@@ -454,6 +633,20 @@ impl SessionHandle for LibeiSessionHandleImpl {
     fn clipboard_source(&self) -> crate::session::strategy::ClipboardSource {
         crate::session::strategy::ClipboardSource::None
     }
+
+    #[cfg(feature = "wl-clipboard")]
+    async fn build_clipboard(
+        &self,
+        _portal_fallback: Option<crate::session::strategy::ClipboardComponents>,
+        _rate_limit_ms: u64,
+    ) -> Option<std::sync::Arc<dyn crate::clipboard::provider::ClipboardProvider>> {
+        // Wayland data-control clipboard (wl-clipboard-rs) — no second Portal
+        // session, so libei keeps EIS input without the duplicate-session
+        // permission prompt / input-routing coupling.
+        Some(std::sync::Arc::new(
+            crate::clipboard::providers::WlClipboardProvider::new(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -464,7 +657,7 @@ mod tests {
     #[ignore = "Requires Portal RemoteDesktop"]
     async fn test_libei_availability() {
         let available = LibeiStrategy::is_available().await;
-        println!("libei available: {}", available);
+        println!("libei available: {available}");
     }
 
     #[tokio::test]
@@ -485,7 +678,7 @@ mod tests {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
             Err(e) => {
-                println!("libei session creation failed: {}", e);
+                println!("libei session creation failed: {e}");
             }
         }
     }

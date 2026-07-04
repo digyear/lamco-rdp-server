@@ -42,6 +42,7 @@ modules:
       - cargo --offline build --release --no-default-features --features "h264,libei,gui"
       - install -Dm755 target/release/lamco-rdp-server /app/bin/lamco-rdp-server
       - install -Dm755 target/release/lamco-rdp-server-gui /app/bin/lamco-rdp-server-gui
+      - install -Dm644 licenses/OpenH264-BINARY_LICENSE.txt /app/share/licenses/io.lamco.rdp-server/OpenH264-BINARY_LICENSE.txt
       - install -Dm644 data/io.lamco.rdp-server.metainfo.xml /app/share/metainfo/io.lamco.rdp-server.metainfo.xml
       - install -Dm644 data/io.lamco.rdp-server.desktop /app/share/applications/io.lamco.rdp-server.desktop
       - install -Dm644 data/icons/io.lamco.rdp-server.svg /app/share/icons/hicolor/scalable/apps/io.lamco.rdp-server.svg
@@ -53,5 +54,5 @@ modules:
 
     sources:
       - type: archive
-        url: https://github.com/lamco-admin/lamco-rdp-server/releases/download/v1.4.2/lamco-rdp-server-1.4.2.tar.xz
-        sha256: dec91e5c33f686a63b49c03d230af78f2393fe564ebaeeac9afdfa1f556d24d0
+        url: https://github.com/lamco-admin/lamco-rdp-server/releases/download/v1.4.4/lamco-rdp-server-1.4.4.tar.xz
+        sha256: 6246e10b6ea6e24b712fc3f812431446c7792d04593ae8426682b12e3e83a51d

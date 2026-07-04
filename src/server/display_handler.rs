@@ -80,6 +80,7 @@ use ironrdp_server::{
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
+use super::pipeline_decisions;
 use crate::{
     damage::{DamageConfig, DamageDetector, DamageRegion},
     egfx::{Avc420Encoder, Avc444Encoder, ColorSpaceConfig, EncoderConfig},
@@ -87,8 +88,8 @@ use crate::{
     pipewire::{PipeWireThreadCommand, PipeWireThreadManager, VideoFrame},
     portal::StreamInfo,
     server::{
-        egfx_sender::EgfxFrameSender, event_multiplexer::GraphicsFrame, gfx_factory::HandlerState,
-        input_handler::LamcoInputHandler,
+        egfx_sender::EgfxFrameSender, event_multiplexer::GraphicsFrame,
+        gfx_factory::SharedHandlerState, input_handler::LamcoInputHandler,
     },
     services::{ServiceId, ServiceRegistry},
     video::{BitmapConverter, BitmapUpdate, RdpPixelFormat},
@@ -161,18 +162,25 @@ impl VideoEncoder {
         }
     }
 
-    /// Request IDR keyframe (for PLI or manual recovery)
+    /// Request IDR keyframe (for PLI or stress-triggered early-IDR via L2)
     ///
     /// Forces the next encoded frame to be a full IDR keyframe,
     /// clearing any accumulated compression artifacts.
-    #[expect(
-        dead_code,
-        reason = "PLI-triggered IDR not yet wired to RDP event loop"
-    )]
     fn request_idr(&mut self) {
         match self {
             VideoEncoder::Avc420(encoder) => encoder.force_keyframe(),
             VideoEncoder::Avc444(encoder) => encoder.request_idr(),
+        }
+    }
+
+    /// Milliseconds since the last IDR was emitted.
+    ///
+    /// Returns `u64::MAX` for AVC420 (no IDR tracking — every keyframe is an IDR,
+    /// so any call site that uses this is implicitly asking about AVC444 stress).
+    fn ms_since_last_idr(&self) -> u64 {
+        match self {
+            VideoEncoder::Avc420(_) => u64::MAX,
+            VideoEncoder::Avc444(encoder) => encoder.ms_since_last_idr(),
         }
     }
 
@@ -280,8 +288,8 @@ pub struct LamcoDisplayHandler {
     /// Populated by GfxFactory after channel attachment
     gfx_server_handle: Arc<RwLock<Option<GfxServerHandle>>>,
 
-    /// Handler state for checking EGFX readiness
-    gfx_handler_state: Arc<RwLock<Option<HandlerState>>>,
+    /// Handler state for checking EGFX readiness (None when EGFX not configured)
+    gfx_handler_state: Option<Arc<SharedHandlerState>>,
 
     /// Server event sender for routing EGFX messages
     /// Set after server is built (via set_server_event_sender)
@@ -324,12 +332,47 @@ pub struct LamcoDisplayHandler {
     /// The pipeline loop checks this to avoid encoding/sending frames to nobody.
     client_active: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Live PipeWire capture node id. A session re-establishment (PerConnection
+    /// lifecycle) rebinds capture to a new node via `rebind_capture_node`; this
+    /// tracks it so a subsequent client resize acts on the current node rather
+    /// than the one captured at startup (which `stream_info` still holds).
+    capture_node: Arc<std::sync::atomic::AtomicU32>,
+
+    /// Set true by `on_client_disconnect` on a real disconnect; consumed
+    /// (swap→false) by the connect-start reset in `updates()`. Distinguishes a
+    /// genuine new-client reconnection from a same-connection
+    /// DeactivationReactivation (display resize) — the latter re-enters
+    /// `updates()` but must NOT tear down clipboard lifecycle.
+    saw_real_disconnect: Arc<std::sync::atomic::AtomicBool>,
+
     /// Health reporter for forwarding PipeWire stream state to health monitor
     health_reporter: Arc<RwLock<Option<crate::health::HealthReporter>>>,
+
+    /// PipeWire sensor for version-adaptive health monitoring (set via set_pipewire_sensor)
+    pipewire_sensor: Arc<RwLock<Option<Arc<crate::health::sensors::pipewire::PipeWireSensor>>>>,
+
+    /// EGFX performance snapshot for encoding adaptation feedback loop
+    egfx_snapshot:
+        Arc<RwLock<Option<Arc<parking_lot::RwLock<crate::health::performance::EgfxSnapshot>>>>>,
+
+    /// FPS controller performance snapshot for D-Bus/GUI live-metrics reporting
+    /// (set via set_fps_state)
+    fps_state:
+        Arc<RwLock<Option<Arc<parking_lot::RwLock<crate::health::performance::FpsSnapshot>>>>>,
+
+    /// Shared stream active flag for Portal input coupling.
+    /// Updated on PipeWire state transitions. Portal session reads this
+    /// to suppress input injection when the stream is paused.
+    /// None for non-Portal strategies (input is independent of stream state).
+    stream_active_flag: parking_lot::RwLock<Option<Arc<std::sync::atomic::AtomicBool>>>,
 
     /// True when using direct frame channel (portal-generic) instead of PipeWire.
     /// Resize via PipeWire DestroyStream/CreateStream is not available in this mode.
     direct_channel_mode: bool,
+
+    /// Whether to request DMA-BUF buffers from PipeWire.
+    /// Set based on compositor recommendation (DmaBuf for real GPUs, MemFd for virtual/software).
+    use_dmabuf: bool,
 }
 
 impl LamcoDisplayHandler {
@@ -344,9 +387,11 @@ impl LamcoDisplayHandler {
         stream_info: Vec<StreamInfo>,
         graphics_tx: Option<mpsc::Sender<GraphicsFrame>>,
         gfx_server_handle: Option<Arc<RwLock<Option<GfxServerHandle>>>>,
-        gfx_handler_state: Option<Arc<RwLock<Option<HandlerState>>>>,
+        gfx_handler_state: Option<Arc<SharedHandlerState>>,
         config: Arc<crate::config::Config>,
         service_registry: Arc<ServiceRegistry>,
+        use_dmabuf: bool,
+        client_active: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self> {
         let size = Arc::new(RwLock::new(DesktopSize {
             width: initial_width,
@@ -364,9 +409,10 @@ impl LamcoDisplayHandler {
                 width: stream.size.0,
                 height: stream.size.1,
                 framerate: 60,
-                use_dmabuf: true,
+                use_dmabuf,
                 buffer_count: 3,
                 preferred_format: Some(lamco_pipewire::PixelFormat::BGRx),
+                dmabuf_passthrough: false,
             };
 
             let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
@@ -401,17 +447,13 @@ impl LamcoDisplayHandler {
         let update_receiver = Arc::new(Mutex::new(Some(update_receiver)));
 
         let gfx_server_handle = gfx_server_handle.unwrap_or_else(|| Arc::new(RwLock::new(None)));
-        let gfx_handler_state = gfx_handler_state.unwrap_or_else(|| Arc::new(RwLock::new(None)));
 
         debug!(
             "Display handler created: {}x{}, {} streams, EGFX={}",
             initial_width,
             initial_height,
             stream_info.len(),
-            gfx_server_handle
-                .try_read()
-                .map(|g| g.is_some())
-                .unwrap_or(false)
+            gfx_handler_state.is_some()
         );
 
         // Bounded channel for client-initiated resize requests
@@ -425,6 +467,9 @@ impl LamcoDisplayHandler {
             update_sender,
             update_receiver,
             graphics_tx, // Passed from constructor for Phase 1 multiplexer
+            capture_node: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                stream_info.first().map_or(0, |s| s.node_id),
+            )),
             stream_info,
             gfx_server_handle,
             gfx_handler_state,
@@ -441,9 +486,15 @@ impl LamcoDisplayHandler {
                     .checked_sub(std::time::Duration::from_secs(10))
                     .unwrap_or(Instant::now()),
             ),
-            client_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_active,
+            saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             health_reporter: Arc::new(RwLock::new(None)),
+            pipewire_sensor: Arc::new(RwLock::new(None)),
+            egfx_snapshot: Arc::new(RwLock::new(None)),
+            fps_state: Arc::new(RwLock::new(None)),
+            stream_active_flag: parking_lot::RwLock::new(None),
             direct_channel_mode: false,
+            use_dmabuf,
         })
     }
 
@@ -462,9 +513,10 @@ impl LamcoDisplayHandler {
         stream_info: Vec<StreamInfo>,
         graphics_tx: Option<mpsc::Sender<GraphicsFrame>>,
         gfx_server_handle: Option<Arc<RwLock<Option<GfxServerHandle>>>>,
-        gfx_handler_state: Option<Arc<RwLock<Option<HandlerState>>>>,
+        gfx_handler_state: Option<Arc<SharedHandlerState>>,
         config: Arc<crate::config::Config>,
         service_registry: Arc<ServiceRegistry>,
+        client_active: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self> {
         let size = Arc::new(RwLock::new(DesktopSize {
             width: initial_width,
@@ -494,7 +546,6 @@ impl LamcoDisplayHandler {
         let update_receiver = Arc::new(Mutex::new(Some(update_receiver)));
 
         let gfx_server_handle = gfx_server_handle.unwrap_or_else(|| Arc::new(RwLock::new(None)));
-        let gfx_handler_state = gfx_handler_state.unwrap_or_else(|| Arc::new(RwLock::new(None)));
 
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel(4);
 
@@ -505,6 +556,9 @@ impl LamcoDisplayHandler {
             update_sender,
             update_receiver,
             graphics_tx,
+            capture_node: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                stream_info.first().map_or(0, |s| s.node_id),
+            )),
             stream_info,
             gfx_server_handle,
             gfx_handler_state,
@@ -521,9 +575,15 @@ impl LamcoDisplayHandler {
                     .checked_sub(std::time::Duration::from_secs(10))
                     .unwrap_or(Instant::now()),
             ),
-            client_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_active,
+            saw_real_disconnect: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             health_reporter: Arc::new(RwLock::new(None)),
+            pipewire_sensor: Arc::new(RwLock::new(None)),
+            egfx_snapshot: Arc::new(RwLock::new(None)),
+            fps_state: Arc::new(RwLock::new(None)),
+            stream_active_flag: parking_lot::RwLock::new(None),
             direct_channel_mode: true,
+            use_dmabuf: false, // direct channel is always CPU-resident
         })
     }
 
@@ -544,6 +604,15 @@ impl LamcoDisplayHandler {
         *self.health_reporter.write().await = Some(reporter);
     }
 
+    /// Set the shared stream active flag for Portal input coupling.
+    ///
+    /// The display handler updates this flag on PipeWire state transitions.
+    /// The Portal session handle reads it before attempting input injection,
+    /// preventing hundreds of futile D-Bus calls when the stream is paused.
+    pub fn set_stream_active_flag(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        *self.stream_active_flag.write() = Some(flag);
+    }
+
     /// Set clipboard manager reference for disconnect cleanup
     ///
     /// When client disconnects (detected via reconnection), the display handler
@@ -556,6 +625,22 @@ impl LamcoDisplayHandler {
         info!("Clipboard manager reference set for disconnect cleanup");
     }
 
+    /// Tell the clipboard orchestrator the RDP client disconnected, so it drops
+    /// its Ready latch, clears per-connection state, and releases local
+    /// clipboard ownership. Best-effort — a missing manager is not fatal.
+    pub async fn notify_clipboard_disconnect(&self) {
+        let mgr_opt = self.clipboard_manager.read().await.clone();
+        if let Some(mgr) = mgr_opt {
+            let tx = mgr.lock().await.event_sender();
+            if let Err(e) = tx
+                .send(crate::clipboard::ClipboardEvent::RdpDisconnect)
+                .await
+            {
+                warn!("Failed to notify clipboard of RDP disconnect: {e}");
+            }
+        }
+    }
+
     /// Signal that the client has disconnected.
     ///
     /// The pipeline loop checks `client_active` and skips encoding/sending when
@@ -564,7 +649,99 @@ impl LamcoDisplayHandler {
     pub fn on_client_disconnect(&self) {
         self.client_active
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        // Record that a real disconnect happened so the next connect-start reset
+        // in updates() drives clipboard teardown. A resize-driven
+        // DeactivationReactivation leaves this false and is left alone.
+        self.saw_real_disconnect
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         info!("Client disconnect signaled to pipeline - frame processing paused");
+    }
+
+    /// Rebind the capture pipeline to a new PipeWire node after a session
+    /// re-establishment (the `PerConnection` lifecycle re-creates the compositor
+    /// session, which yields a fresh node). Destroys the stream on the old node
+    /// and creates one on the new node; a no-op if the node is unchanged (the
+    /// common first-connection case, where the startup session is reused).
+    ///
+    /// NOTE: this does not rewrite `stream_info`, so a client resize *after* a
+    /// rebind still references the startup node. Revisit if per-connection
+    /// resize on the Mutter-direct path becomes a requirement.
+    pub async fn rebind_capture_node(
+        &self,
+        old_node: u32,
+        new_node: u32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if old_node == new_node {
+            // Not a no-op: the re-established session's stream can land on the
+            // same node id as the stopped one. The old PipeWire stream is dead,
+            // so we still Destroy + Create to reconnect to the new source.
+            debug!(
+                "[capture-rebind] Node id {new_node} reused by re-established session — recreating stream"
+            );
+        }
+        info!(
+            old_node,
+            new_node, width, height, "[capture-rebind] Rebinding capture pipeline to new node"
+        );
+
+        // Destroy the stream on the old (now-defunct) node.
+        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let mgr = self.pipewire_thread.lock().await;
+            if let Err(e) = mgr.send_command(PipeWireThreadCommand::DestroyStream {
+                stream_id: old_node,
+                response_tx: resp_tx,
+            }) {
+                warn!("[capture-rebind] Failed to send DestroyStream for old node {old_node}: {e}");
+            } else {
+                match resp_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(Ok(())) => info!("[capture-rebind] Old stream {old_node} destroyed"),
+                    Ok(Err(e)) => warn!("[capture-rebind] DestroyStream({old_node}) failed: {e}"),
+                    Err(_) => warn!("[capture-rebind] DestroyStream({old_node}) timeout"),
+                }
+            }
+        }
+
+        // Create a stream on the re-established node.
+        let config = lamco_pipewire::StreamConfig {
+            name: "monitor-0".to_string(),
+            width,
+            height,
+            framerate: 60,
+            use_dmabuf: self.use_dmabuf,
+            buffer_count: 3,
+            preferred_format: Some(lamco_pipewire::PixelFormat::BGRx),
+            dmabuf_passthrough: false,
+        };
+        let (resp_tx2, resp_rx2) = std::sync::mpsc::sync_channel(1);
+        let mgr = self.pipewire_thread.lock().await;
+        if let Err(e) = mgr.send_command(PipeWireThreadCommand::CreateStream {
+            stream_id: new_node,
+            node_id: new_node,
+            config,
+            response_tx: resp_tx2,
+        }) {
+            warn!("[capture-rebind] Failed to send CreateStream for new node {new_node}: {e}");
+            return false;
+        }
+        match resp_rx2.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => {
+                self.capture_node
+                    .store(new_node, std::sync::atomic::Ordering::Relaxed);
+                info!("[capture-rebind] New stream {new_node} created at {width}x{height}");
+                true
+            }
+            Ok(Err(e)) => {
+                warn!("[capture-rebind] CreateStream({new_node}) failed: {e}");
+                false
+            }
+            Err(_) => {
+                warn!("[capture-rebind] CreateStream({new_node}) timeout");
+                false
+            }
+        }
     }
 
     /// Set graphics queue sender for priority multiplexing
@@ -580,6 +757,30 @@ impl LamcoDisplayHandler {
     ///
     /// This must be called after the RDP server is built, passing a clone of
     /// `event_sender()` from the server. Required for EGFX frame sending.
+    /// Set EGFX snapshot for encoding adaptation feedback loop
+    pub async fn set_egfx_snapshot(
+        &self,
+        snapshot: Arc<parking_lot::RwLock<crate::health::performance::EgfxSnapshot>>,
+    ) {
+        *self.egfx_snapshot.write().await = Some(snapshot);
+    }
+
+    /// Set FPS controller snapshot handle for D-Bus/GUI live-metrics reporting
+    pub async fn set_fps_state(
+        &self,
+        state: Arc<parking_lot::RwLock<crate::health::performance::FpsSnapshot>>,
+    ) {
+        *self.fps_state.write().await = Some(state);
+    }
+
+    /// Set PipeWire sensor for version-adaptive health monitoring
+    pub async fn set_pipewire_sensor(
+        &self,
+        sensor: Arc<crate::health::sensors::pipewire::PipeWireSensor>,
+    ) {
+        *self.pipewire_sensor.write().await = Some(sensor);
+    }
+
     pub async fn set_server_event_sender(&self, sender: mpsc::UnboundedSender<ServerEvent>) {
         *self.server_event_tx.write().await = Some(sender);
         info!("Server event sender configured for EGFX routing");
@@ -657,8 +858,8 @@ impl LamcoDisplayHandler {
             return false;
         }
 
-        if let Some(state) = self.gfx_handler_state.read().await.as_ref() {
-            state.is_ready
+        if let Some(ref state) = self.gfx_handler_state {
+            state.is_ready.load(std::sync::atomic::Ordering::Acquire)
         } else {
             false
         }
@@ -666,8 +867,10 @@ impl LamcoDisplayHandler {
 
     /// Check if AVC420 (H.264) codec is available
     pub async fn is_avc_supported(&self) -> bool {
-        if let Some(state) = self.gfx_handler_state.read().await.as_ref() {
-            state.is_avc420_enabled
+        if let Some(ref state) = self.gfx_handler_state {
+            state
+                .client_supports_avc420
+                .load(std::sync::atomic::Ordering::Acquire)
         } else {
             false
         }
@@ -686,18 +889,132 @@ impl LamcoDisplayHandler {
             return "client connected, waiting for EGFX channel";
         }
 
-        if let Some(state) = self.gfx_handler_state.read().await.as_ref() {
-            if !state.is_ready {
+        if let Some(ref state) = self.gfx_handler_state {
+            if !state.is_ready.load(std::sync::atomic::Ordering::Acquire) {
                 return "EGFX channel open, negotiating capabilities";
             }
-            if !state.is_avc420_enabled {
+            if !state
+                .client_supports_avc420
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
                 return "EGFX ready, no AVC420 - using bitmap fallback";
             }
         } else {
-            return "EGFX channel open, initializing handler state";
+            return "EGFX not configured";
         }
 
         "ready" // Should not reach here if is_egfx_ready() is false
+    }
+
+    /// Set up EGFX surface for frame delivery (shared by AVC and V8 paths).
+    ///
+    /// Creates the EGFX surface (ResetGraphics + CreateSurface + MapSurfaceToOutput),
+    /// sends setup PDUs to the client, and returns an EgfxFrameSender.
+    /// Returns None if gfx_server_handle or server_event_tx is unavailable.
+    async fn setup_egfx_surface(
+        &self,
+        frame_width: u32,
+        frame_height: u32,
+        aligned_width: u16,
+        aligned_height: u16,
+    ) -> Option<EgfxFrameSender> {
+        let gfx_handle = self.gfx_server_handle.read().await.clone()?;
+        let event_tx = self.server_event_tx.read().await.clone()?;
+
+        // Create primary surface for EGFX rendering
+        // Must be done BEFORE sending any frames
+        // MS-RDPEGFX REQUIRES 16-pixel alignment!
+        {
+            info!(
+                "Aligning surface: {}x{} -> {}x{} (16-pixel boundary)",
+                frame_width, frame_height, aligned_width, aligned_height
+            );
+
+            #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            let mut server = gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
+
+            // Set desktop size BEFORE creating surface.
+            // This prevents desktop size mismatch when ResetGraphics is auto-sent.
+            // Desktop = actual resolution, Surface = aligned resolution.
+            server.set_output_dimensions(frame_width as u16, frame_height as u16);
+            info!(
+                "EGFX desktop dimensions set: {}x{} (actual)",
+                frame_width, frame_height
+            );
+
+            // Create surface with ALIGNED dimensions
+            // create_surface() will auto-send ResetGraphics using output_dimensions
+            if let Some(surface_id) = server.create_surface(aligned_width, aligned_height) {
+                info!(
+                    "EGFX surface {} created ({}x{} aligned)",
+                    surface_id, aligned_width, aligned_height
+                );
+                // Map surface to output at origin (0,0)
+                if server.map_surface_to_output(surface_id, 0, 0) {
+                    info!("EGFX surface {} mapped to output", surface_id);
+                } else {
+                    warn!("Failed to map EGFX surface to output");
+                }
+
+                // Send the CreateSurface and MapSurfaceToOutput PDUs to client
+                let channel_id = server.channel_id();
+                let dvc_messages = server.drain_output();
+                if !dvc_messages.is_empty() {
+                    info!(
+                        "EGFX: drain_output returned {} DVC messages for surface setup",
+                        dvc_messages.len()
+                    );
+                    for (i, msg) in dvc_messages.iter().enumerate() {
+                        info!("  DVC msg {}: {} bytes", i, msg.size());
+                    }
+
+                    if let Some(ch_id) = channel_id {
+                        use ironrdp_dvc::encode_dvc_messages;
+                        use ironrdp_server::EgfxServerMessage;
+                        use ironrdp_svc::ChannelFlags;
+
+                        match encode_dvc_messages(ch_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                        {
+                            Ok(svc_messages) => {
+                                info!(
+                                    "EGFX: Encoded {} SVC messages for DVC channel {}",
+                                    svc_messages.len(),
+                                    ch_id
+                                );
+                                let msg = EgfxServerMessage::SendMessages {
+                                    messages: svc_messages,
+                                };
+                                let _ = event_tx.send(ServerEvent::Egfx(msg));
+                                info!("EGFX surface PDUs sent to client");
+                            }
+                            Err(e) => {
+                                error!("EGFX: Failed to encode DVC messages: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                warn!("Failed to create EGFX surface - server may not be ready");
+                return None;
+            }
+        }
+
+        #[expect(
+            clippy::expect_used,
+            reason = "invariant: gfx_handler_state is set during EGFX init; caller gated on EGFX active"
+        )]
+        let sender = EgfxFrameSender::new(
+            gfx_handle,
+            Arc::clone(
+                self.gfx_handler_state
+                    .as_ref()
+                    .expect("gfx_handler_state must be Some when EGFX is initialized"),
+            ),
+            event_tx,
+        );
+        info!("EGFX frame sender initialized");
+
+        Some(sender)
     }
 
     /// Update the desktop size
@@ -754,13 +1071,21 @@ impl LamcoDisplayHandler {
     ///   with OpenH264 and sent through the EGFX channel for better quality.
     /// - **RemoteFX**: Fallback path when H.264 is not available, converts to
     ///   bitmap and sends through standard display update channel.
-    #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     pub fn start_pipeline(self: Arc<Self>) {
         let handler = Arc::clone(&self);
 
         tokio::spawn(async move {
             info!("🎬 Starting display update pipeline task");
 
+            // Detect if the compositor's display GPU is virgl (virtio-gpu with
+            // GL acceleration). virgl produces 180-rotated MemFd buffers via KDE's
+            // portal because KWin's grabTexture() mishandles the GL Y-axis convention.
+            //
+            // Two detection paths:
+            // 1. Capability system's GpuInfo (from glxinfo — may report llvmpipe
+            //    if the server process forces software rendering)
+            // 2. sysfs DRM driver check (env-independent, checks the actual
+            //    display GPU by finding cards with connected outputs)
             // === ADAPTIVE FPS CONTROLLER (Premium Feature) ===
             // Dynamically adjusts frame rate based on screen activity:
             // - Static screen: 5 FPS (saves CPU/bandwidth)
@@ -810,6 +1135,26 @@ impl LamcoDisplayHandler {
             };
             let mut latency_governor = LatencyGovernor::new(latency_mode);
 
+            // === ENCODING ADAPTATION (Closed-Loop QP Control) ===
+            // Uses EGFX client feedback (queue_depth, QoE) to adjust encoding quality.
+            // Disabled by default — opt-in via config [egfx.encoding_adaptation] enabled=true
+            let adaptation_config = self.config.egfx.encoding_adaptation.clone();
+            let mut encoding_adaptation =
+                self.egfx_snapshot.read().await.as_ref().map(|snapshot| {
+                    crate::performance::EncodingAdaptation::new(
+                        adaptation_config.clone(),
+                        Arc::clone(snapshot),
+                    )
+                });
+            if let Some(ref adapt) = encoding_adaptation
+                && adapt.is_enabled()
+            {
+                info!(
+                    "🎛️ Encoding adaptation enabled: base_qp={}, interval={}ms",
+                    adaptation_config.base_qp, adaptation_config.evaluation_interval_ms
+                );
+            }
+
             // Log service-aware performance feature status
             let damage_level = self
                 .service_registry
@@ -831,10 +1176,52 @@ impl LamcoDisplayHandler {
             let legacy_fps = self.config.performance.adaptive_fps.max_fps;
             let mut frame_regulator = FrameRateRegulator::new(legacy_fps);
             let mut frames_sent = 0u64;
+            // frames_dropped counts ONLY genuine backpressure drops — frames the
+            // L4 flow controller throttled because the client can't keep up.
+            // Frames merely skipped by frame-rate pacing go to frames_paced and
+            // must NOT feed the L2 drop-rate: capture rate > send rate is normal
+            // under high activity, and counting it as "drops" false-fires the L2
+            // STRESS-IDR (wasteful keyframes) when nothing is actually wrong.
             let mut frames_dropped = 0u64;
+            let mut frames_paced = 0u64;
             let mut egfx_frames_sent = 0u64;
 
             let mut loop_iterations = 0u64;
+
+            // L2 stress detector: track frames_dropped + frames_sent over a
+            // rolling 1-second window. When drop_rate sustains > 50% AND the
+            // encoder hasn't emitted an IDR in the last 1500ms, we request an
+            // early IDR. This breaks the P-slice chain before mstsc's decoder
+            // can desync from a long sequence of arrival-delayed predictions
+            // (which is what triggers the mid-session CapsAdvertise recovery
+            // sequence — see L1).
+            //
+            // Snapshot fields: window_start_at_ms is a monotonic-ish millis
+            // counter (Instant::now() differences); the dropped/sent_at_start
+            // are the counter values at window open.
+            let stress_window_ms: u64 = 1000;
+            let stress_drop_rate_threshold: f64 = 0.50;
+            let stress_min_idr_gap_ms: u64 = 1500;
+            let stress_cooldown_ms: u64 = 1000;
+            let stress_started_at = std::time::Instant::now();
+            let mut stress_window_start = stress_started_at;
+            let mut stress_window_dropped_at_start = 0u64;
+            let mut stress_window_sent_at_start = 0u64;
+            let mut stress_last_trigger = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(60))
+                .unwrap_or_else(std::time::Instant::now);
+
+            // L3 FIX: aux-omission shrinks under stress.
+            // The configured avc444_max_aux_interval (default 30 frames) is
+            // the worst-case staleness for chroma during steady state. Under
+            // stress we shrink it so aux refreshes faster, reducing the
+            // window where main-channel decoder errors can persist.
+            //
+            // We track the original config value at encoder-create time and
+            // restore it after stress_recovery_ms with no further triggers.
+            let stress_recovery_ms: u64 = 5000;
+            let mut stress_active = false;
+            let mut stress_original_aux_interval: u32 = 0; // set when stress first activates
 
             // EGFX/H.264 encoder - created lazily when EGFX becomes ready
             // Supports both AVC420 (4:2:0) and AVC444 (4:4:4) based on client negotiation
@@ -904,7 +1291,30 @@ impl LamcoDisplayHandler {
             // to the health monitor. Recovery is reported when frames resume.
             let mut last_frame_time = std::time::Instant::now();
             let mut video_stall_reported = false;
-            let stall_threshold = std::time::Duration::from_secs(3);
+            // Damage-driven capture sends no frames while the desktop is static,
+            // so a short window false-positives on normal idle (reading, etc.).
+            // Use a longer window so only a genuinely stuck stream is flagged.
+            let stall_threshold = std::time::Duration::from_secs(10);
+
+            // Pace the "Processing frame" INFO log so low-throughput sessions
+            // are not silent: log on every 30th frame OR when >2s elapsed since
+            // last log, whichever comes first. Under 1fps effective delivery
+            // the time-based branch dominates.
+            let mut last_processing_log = std::time::Instant::now();
+            let processing_log_interval = std::time::Duration::from_secs(2);
+
+            // Damage-source / adaptive-fps telemetry cadence. Frame-count-based
+            // gating (frames_sent.is_multiple_of(N)) is unsafe here: frames_sent
+            // increments before the latency governor's Skip/WaitForMore continues
+            // and the empty-damage continue, so a stable throttle pattern can put
+            // every Nth-count frame on a skipped iteration -- deterministically,
+            // if the skip period shares a factor with N. Observed in practice:
+            // this fired ZERO times across an entire 12s sustained-high-activity
+            // session with frames_sent crossing 60/120/180. Time-based gating
+            // fires on whatever frame is actually being processed when the
+            // interval elapses, independent of skip patterns.
+            let mut last_telemetry_log = std::time::Instant::now();
+            let telemetry_log_interval = std::time::Duration::from_secs(2);
 
             // Zero-frame detection: if we never receive ANY frame within 10 seconds
             // of session start, something is fundamentally wrong (e.g., ext-capture
@@ -946,7 +1356,25 @@ impl LamcoDisplayHandler {
                 info!("Pipeline acquired resize receiver for client-initiated resolution changes");
             }
 
+            // Per-iteration timing diagnostics. The heartbeat (every 1000
+            // iterations) tells us throughput, but not WHERE time goes inside
+            // each iteration. When the client connects and the loop slows to
+            // <30 iter/sec from 200/sec idle, we need per-iteration tail
+            // latency to know if it's the no-frame async-lock path, the
+            // damage-bailout path, or the encode+send path. WARN above 50ms
+            // because that's already over the 33ms 30fps budget.
+            let mut last_iter_start = std::time::Instant::now();
             loop {
+                let prev_iter_elapsed = last_iter_start.elapsed();
+                if prev_iter_elapsed >= std::time::Duration::from_millis(50) && loop_iterations > 0
+                {
+                    warn!(
+                        prev_iter_ms = prev_iter_elapsed.as_millis() as u64,
+                        loop_iterations, "Display pipeline iteration slow"
+                    );
+                }
+                last_iter_start = std::time::Instant::now();
+
                 loop_iterations += 1;
                 if loop_iterations.is_multiple_of(1000) {
                     if pts_interval_count > 0 {
@@ -1005,9 +1433,13 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
-                        // 1. Destroy existing PipeWire stream
-                        if let Some(stream) = handler.stream_info.first() {
-                            let node_id = stream.node_id;
+                        // 1. Destroy existing PipeWire stream. Use the live
+                        // capture node — a session re-establishment may have
+                        // rebound it away from the startup node in stream_info.
+                        if !handler.stream_info.is_empty() {
+                            let node_id = handler
+                                .capture_node
+                                .load(std::sync::atomic::Ordering::Relaxed);
                             let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
                             let destroy_cmd = PipeWireThreadCommand::DestroyStream {
                                 stream_id: node_id,
@@ -1042,14 +1474,16 @@ impl LamcoDisplayHandler {
 
                             if destroy_ok {
                                 // 2. Create new stream at requested resolution
+                                let use_dmabuf_for_resize = self.use_dmabuf;
                                 let stream_config = lamco_pipewire::StreamConfig {
                                     name: "monitor-0".to_string(),
                                     width: req.width as u32,
                                     height: req.height as u32,
                                     framerate: 60,
-                                    use_dmabuf: true,
+                                    use_dmabuf: use_dmabuf_for_resize,
                                     buffer_count: 3,
                                     preferred_format: Some(lamco_pipewire::PixelFormat::BGRx),
+                                    dmabuf_passthrough: false,
                                 };
 
                                 let (resp_tx2, resp_rx2) = std::sync::mpsc::sync_channel(1);
@@ -1127,18 +1561,36 @@ impl LamcoDisplayHandler {
                 let frame = {
                     let thread_mgr = handler.pipewire_thread.lock().await;
 
-                    // Forward PipeWire stream state changes to health monitor
+                    // Forward PipeWire stream state changes to health monitor and sensor
+                    let pw_sensor = handler.pipewire_sensor.read().await.clone();
                     if let Some(ref reporter) = *handler.health_reporter.read().await {
                         for event in thread_mgr.drain_state_events() {
                             let health_state = match event.state {
                                 lamco_pipewire::PwStreamState::Streaming => {
+                                    // Notify Portal session that stream is active (input OK)
+                                    if let Some(ref flag) = *handler.stream_active_flag.read() {
+                                        flag.store(true, std::sync::atomic::Ordering::Release);
+                                    }
+                                    if let Some(ref sensor) = pw_sensor {
+                                        sensor.set_stream_state(2);
+                                    }
                                     crate::health::VideoStreamState::Streaming
                                 }
                                 lamco_pipewire::PwStreamState::Paused => {
+                                    // Notify Portal session that stream is paused (input will fail)
+                                    if let Some(ref flag) = *handler.stream_active_flag.read() {
+                                        flag.store(false, std::sync::atomic::Ordering::Release);
+                                    }
+                                    if let Some(ref sensor) = pw_sensor {
+                                        sensor.set_stream_state(1);
+                                    }
                                     crate::health::VideoStreamState::Paused
                                 }
                                 lamco_pipewire::PwStreamState::Error(ref msg) => {
                                     warn!("PipeWire stream error: {}", msg);
+                                    if let Some(ref sensor) = pw_sensor {
+                                        sensor.set_stream_state(0);
+                                    }
                                     crate::health::VideoStreamState::Error
                                 }
                                 lamco_pipewire::PwStreamState::Unconnected => {
@@ -1149,6 +1601,9 @@ impl LamcoDisplayHandler {
                                         warn!(
                                             "WAYLAND_DISPLAY is not set - this is likely the cause"
                                         );
+                                    }
+                                    if let Some(ref sensor) = pw_sensor {
+                                        sensor.set_stream_state(0);
                                     }
                                     continue;
                                 }
@@ -1161,10 +1616,16 @@ impl LamcoDisplayHandler {
                         }
                     }
 
-                    thread_mgr.try_recv_frame()
+                    let frame = thread_mgr.try_recv_frame();
+                    if frame.is_some()
+                        && let Some(ref sensor) = pw_sensor
+                    {
+                        sensor.increment_frames();
+                    }
+                    frame
                 };
 
-                let frame = match frame {
+                let mut frame = match frame {
                     Some(f) => {
                         // Always cache the latest frame for replay on EGFX init.
                         // Clone is cheap: VideoFrame.data is Arc<Vec<u8>>.
@@ -1244,9 +1705,14 @@ impl LamcoDisplayHandler {
                             zero_frame_reported = false;
                             frames_sent = 0;
                             frames_dropped = 0;
+                            frames_paced = 0;
                             egfx_frames_sent = 0;
                             video_encoder = None;
                             egfx_sender = None;
+                            // New client needs fresh EGFX surface setup
+                            handler
+                                .egfx_needs_init
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
                             info!("Pipeline state reset for new client connection");
                         }
                         debug!("Received frame from PipeWire");
@@ -1257,7 +1723,19 @@ impl LamcoDisplayHandler {
                         // exists) and haven't gotten one for 3+ seconds, the stream may be
                         // stuck. Static desktops normally produce no frames (damage-driven),
                         // so we only flag this after we've seen at least one frame.
-                        if cached_frame.is_some() && !video_stall_reported {
+                        // Damage-driven capture legitimately delivers no frames
+                        // while the desktop is idle; PipeWire pauses the stream in
+                        // that case and that pause is already surfaced to health.
+                        // Only treat missing frames as a stall while the stream is
+                        // still meant to be streaming — otherwise a static desktop
+                        // flaps the session between healthy and degraded every time
+                        // the user stops interacting.
+                        let stream_streaming = handler
+                            .stream_active_flag
+                            .read()
+                            .as_ref()
+                            .is_none_or(|f| f.load(std::sync::atomic::Ordering::Acquire));
+                        if stream_streaming && cached_frame.is_some() && !video_stall_reported {
                             let elapsed = last_frame_time.elapsed();
                             if elapsed > stall_threshold {
                                 video_stall_reported = true;
@@ -1292,6 +1770,11 @@ impl LamcoDisplayHandler {
                             }
                         }
 
+                        // DMA-BUF zero-data is fixed at the source in lamco-pipewire
+                        // ≥0.4.4 (MOD_LINEAR negotiation, lamco-admin/lamco-wayland#5),
+                        // so the old detect-zeros-and-reconnect-with-MemFd fallback is gone.
+                        // The virtual-GPU MemFd gate in server/mod.rs remains as defense.
+
                         // No fresh frame from PipeWire. Check if we should replay
                         // the cached frame for EGFX initialization.
                         //
@@ -1305,7 +1788,10 @@ impl LamcoDisplayHandler {
 
                         // Also reset per-connection state from the None arm,
                         // in case PipeWire hasn't delivered a frame yet
-                        if client_waiting && !was_client_active {
+                        if !client_waiting {
+                            // Client disconnected while in no-frame path
+                            was_client_active = false;
+                        } else if client_waiting && !was_client_active {
                             was_client_active = true;
                             session_start = std::time::Instant::now();
                             egfx_gate_bypassed = false;
@@ -1313,9 +1799,13 @@ impl LamcoDisplayHandler {
                             zero_frame_reported = false;
                             frames_sent = 0;
                             frames_dropped = 0;
+                            frames_paced = 0;
                             egfx_frames_sent = 0;
                             video_encoder = None;
                             egfx_sender = None;
+                            handler
+                                .egfx_needs_init
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
                             info!("Pipeline state reset for new client connection (no-frame path)");
                         }
 
@@ -1323,7 +1813,38 @@ impl LamcoDisplayHandler {
                             .egfx_needs_init
                             .load(std::sync::atomic::Ordering::Relaxed);
 
-                        if client_waiting && needs_init && handler.is_egfx_ready().await {
+                        // Log EGFX readiness check periodically during reconnection wait
+                        if client_waiting && needs_init && !handler.is_egfx_ready().await {
+                            static EGFX_WAIT_COUNTER: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let count = EGFX_WAIT_COUNTER
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if count.is_multiple_of(200) {
+                                // Log every ~1 second (200 * 5ms)
+                                let has_tx = handler.server_event_tx.read().await.is_some();
+                                let has_handle = handler.gfx_server_handle.read().await.is_some();
+                                let state_ready =
+                                    handler.gfx_handler_state.as_ref().is_some_and(|s| {
+                                        s.is_ready.load(std::sync::atomic::Ordering::Acquire)
+                                    });
+                                debug!(
+                                    "⏳ EGFX not ready (wait #{count}): tx={has_tx}, handle={has_handle}, state_ready={state_ready}"
+                                );
+                            }
+                        }
+
+                        // Replay the cached frame ONLY when the EGFX path can actually
+                        // consume it — i.e. EGFX is ready AND the client has confirmed
+                        // AVC support. Without the AVC check, this branch fires on
+                        // every iteration during the brief window between EGFX-ready
+                        // and AVC-detected (~17ms in practice), causing 9× redundant
+                        // replays of the same cached frame_id at INFO before the
+                        // encoder init block actually runs.
+                        if client_waiting
+                            && needs_init
+                            && handler.is_egfx_ready().await
+                            && handler.is_avc_supported().await
+                        {
                             if let Some(ref cached) = cached_frame {
                                 info!(
                                     "📦 Replaying cached frame for EGFX init ({}x{}, frame {})",
@@ -1350,24 +1871,64 @@ impl LamcoDisplayHandler {
                 };
 
                 if !should_process {
-                    frames_dropped += 1;
-                    if frames_dropped.is_multiple_of(30) {
+                    frames_paced += 1;
+                    if frames_paced.is_multiple_of(30) {
                         let current_fps = if adaptive_fps_enabled {
                             adaptive_fps.current_fps()
                         } else {
                             30
                         };
                         info!(
-                            "Frame rate regulation: dropped {} frames, sent {}, target_fps={}",
-                            frames_dropped, frames_sent, current_fps
+                            "Frame rate regulation: paced {} frames, sent {}, target_fps={}",
+                            frames_paced, frames_sent, current_fps
                         );
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                     continue;
                 }
 
+                // === BUFFER TRANSFORM ===
+                // Apply orientation correction to the raw pixel data BEFORE
+                // it enters either the EGFX or bitmap/RemoteFX path. Both paths
+                // consume the same frame data, so the transform must happen here.
+                let mut transform_value =
+                    resolve_transform(&self.config.display.frame_transform, frame.transform());
+                if transform_value == 0 && frame.is_bottom_up() {
+                    transform_value = 6; // vertical flip for negative stride
+                }
+                if transform_value != 0 {
+                    let pixel_data = match &frame.buffer {
+                        lamco_pipewire::FrameBuffer::Memory(data) => data,
+                        lamco_pipewire::FrameBuffer::DmaBuf(_) => {
+                            tracing::warn!("Cannot transform DMA-BUF frame on CPU");
+                            continue;
+                        }
+                    };
+                    let (transformed, new_w, new_h, new_stride) = apply_frame_transform(
+                        pixel_data,
+                        frame.width,
+                        frame.height,
+                        frame.stride,
+                        transform_value,
+                        4,
+                    );
+                    frame = VideoFrame {
+                        buffer: lamco_pipewire::FrameBuffer::Memory(std::sync::Arc::new(
+                            transformed,
+                        )),
+                        width: new_w,
+                        height: new_h,
+                        stride: new_stride,
+                        ..frame
+                    };
+                }
+
                 frames_sent += 1;
-                if frames_sent.is_multiple_of(30) || frames_sent < 10 {
+                let elapsed_since_log = last_processing_log.elapsed();
+                if frames_sent.is_multiple_of(30)
+                    || frames_sent < 10
+                    || elapsed_since_log >= processing_log_interval
+                {
                     let activity = if adaptive_fps_enabled {
                         format!(
                             " [activity={:?}, fps={}]",
@@ -1387,6 +1948,7 @@ impl LamcoDisplayHandler {
                         frames_dropped,
                         activity
                     );
+                    last_processing_log = std::time::Instant::now();
                 }
 
                 // === WAIT FOR EGFX ===
@@ -1428,7 +1990,7 @@ impl LamcoDisplayHandler {
                 // For V8 clients (no AVC), clear immediately since they never
                 // enter the EGFX setup block and a stuck flag causes infinite
                 // cached frame replay.
-                let needs_init = if !egfx_gate_bypassed {
+                let mut needs_init = if !egfx_gate_bypassed {
                     handler
                         .egfx_needs_init
                         .load(std::sync::atomic::Ordering::SeqCst)
@@ -1436,9 +1998,178 @@ impl LamcoDisplayHandler {
                     false
                 };
 
+                // L2 FIX: stress-triggered early IDR.
+                // When the rolling-window drop rate exceeds threshold and the
+                // encoder hasn't emitted an IDR recently, ask it for one. The
+                // working theory is that under sustained drop pressure, late-
+                // arriving P-slices accumulate decoder-side desync risk; an
+                // unprompted IDR breaks the prediction chain and forces a
+                // clean reference, reducing the probability that mstsc's
+                // decoder gives up and triggers the L1 recovery sequence.
+                //
+                // Cooldown prevents flapping: after a stress-triggered IDR,
+                // we wait stress_cooldown_ms before evaluating again.
+                if video_encoder.is_some() {
+                    let now = std::time::Instant::now();
+                    let window_elapsed_ms =
+                        now.duration_since(stress_window_start).as_millis() as u64;
+                    if window_elapsed_ms >= stress_window_ms {
+                        let dropped_in_window =
+                            frames_dropped.saturating_sub(stress_window_dropped_at_start);
+                        let sent_in_window =
+                            frames_sent.saturating_sub(stress_window_sent_at_start);
+                        let cooldown_elapsed_ms =
+                            now.duration_since(stress_last_trigger).as_millis() as u64;
+                        let ms_since_last_idr = video_encoder
+                            .as_ref()
+                            .map_or(u64::MAX, VideoEncoder::ms_since_last_idr);
+
+                        let stress_eval = pipeline_decisions::evaluate_stress_idr_trigger(
+                            dropped_in_window,
+                            sent_in_window,
+                            stress_drop_rate_threshold,
+                            cooldown_elapsed_ms,
+                            stress_cooldown_ms,
+                            ms_since_last_idr,
+                            stress_min_idr_gap_ms,
+                        );
+                        let drop_rate = stress_eval.drop_rate;
+                        let should_trigger = stress_eval.should_trigger;
+
+                        if should_trigger {
+                            if let Some(ref mut enc) = video_encoder {
+                                enc.request_idr();
+                            }
+                            warn!(
+                                drop_rate = drop_rate,
+                                dropped_in_window,
+                                sent_in_window,
+                                ms_since_last_idr,
+                                cooldown_elapsed_ms,
+                                "EGFX L2 STRESS-IDR: drop rate exceeded threshold — early IDR requested to break P-slice chain"
+                            );
+                            stress_last_trigger = now;
+
+                            // L3: shrink aux-omission interval while stress is active.
+                            // Only meaningful for AVC444 (AVC420 has no aux), and
+                            // only the first trigger captures the original value to
+                            // restore later.
+                            if let Some(VideoEncoder::Avc444(ref mut enc444)) = video_encoder
+                                && !stress_active
+                            {
+                                let prev = enc444.aux_max_interval();
+                                stress_original_aux_interval = prev;
+                                let shrunk = (prev / 2).max(5);
+                                enc444.set_aux_max_interval(shrunk);
+                                warn!(
+                                    from = prev,
+                                    to = shrunk,
+                                    "EGFX L3 STRESS-AUX: shrinking aux-omission interval until stress clears"
+                                );
+                                stress_active = true;
+                            }
+                        }
+
+                        // L3: restore aux-omission interval after recovery period.
+                        let since_last_trigger_ms =
+                            now.duration_since(stress_last_trigger).as_millis() as u64;
+                        if stress_active && since_last_trigger_ms > stress_recovery_ms {
+                            if let Some(VideoEncoder::Avc444(ref mut enc444)) = video_encoder
+                                && stress_original_aux_interval > 0
+                                && enc444.aux_max_interval() != stress_original_aux_interval
+                            {
+                                enc444.set_aux_max_interval(stress_original_aux_interval);
+                                info!(
+                                    restored_to = stress_original_aux_interval,
+                                    since_last_trigger_ms,
+                                    "EGFX L3: stress cleared, aux-omission interval restored to baseline"
+                                );
+                            }
+                            stress_active = false;
+                            stress_original_aux_interval = 0;
+                        }
+
+                        // Slide the window forward
+                        stress_window_start = now;
+                        stress_window_dropped_at_start = frames_dropped;
+                        stress_window_sent_at_start = frames_sent;
+                    }
+                }
+
+                // L1 FIX: mid-session CapsAdvertise re-init.
+                // If LamcoGraphicsHandler::capabilities_advertise saw a second
+                // CapsAdvertise from the client (decoder-recovery sequence),
+                // we tear down the surface state via IronRDP's resize() and
+                // then proceed through the normal needs_init path to recreate
+                // the encoder + surface and emit a fresh IDR.
+                let needs_full_reinit = if let Some(ref state) = handler.gfx_handler_state {
+                    state
+                        .needs_full_reinit
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                } else {
+                    false
+                };
+                if needs_full_reinit {
+                    // L1 RE-INIT — upstream ironrdp-egfx has now silently cleared
+                    // server-side surface/frame state and re-armed reset_graphics_sent
+                    // inside handle_capabilities_advertise (no DeleteSurface PDU emitted,
+                    // because mstsc has already cleared its own state on its side).
+                    // All we need to do downstream is force the standard needs_init
+                    // path to run: recreate the H.264 encoder and call
+                    // setup_egfx_surface() to issue CreateSurface + MapSurfaceToOutput.
+                    // ResetGraphics will auto-emit from create_surface() since the
+                    // upstream change cleared reset_graphics_sent.
+                    //
+                    // Previous attempt called server.resize(w, h) here. That emitted
+                    // DeleteSurface(id=0) before ResetGraphics — but the client had
+                    // already cleared surface 0 from its own state on CapsAdvertise,
+                    // so it treated the stray DeleteSurface as a protocol violation
+                    // and TCP RST'd within 27ms. Lesson: client-initiated re-init
+                    // expects only ResetGraphics + CreateSurface + MapSurfaceToOutput,
+                    // not the server-initiated DeleteSurface sequence used by resize().
+                    warn!(
+                        "EGFX L1 RE-INIT: client re-advertised caps mid-session — \
+                         upstream cleared server state; signaling display loop to \
+                         recreate encoder + surface and emit fresh IDR"
+                    );
+                    handler
+                        .egfx_needs_init
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    needs_init = true;
+
+                    // L1+L2 INTERACTION FIX: reset the L2 stress detector's
+                    // rolling window to baseline. Without this, the
+                    // accumulated frames_dropped from BEFORE the re-init
+                    // continues to count, immediately re-triggering L2 on
+                    // Frame #1 — yielding two IDRs back-to-back (the L1
+                    // forced first-frame IDR and L2's stress-IDR). Observed
+                    // in round 5 log: 17 stress IDRs fired in the 19.5s
+                    // post-reinit window, contributing to mstsc decoder
+                    // giving up.
+                    let now = std::time::Instant::now();
+                    stress_window_start = now;
+                    stress_window_dropped_at_start = frames_dropped;
+                    stress_window_sent_at_start = frames_sent;
+                    stress_last_trigger = now;
+                    if stress_active {
+                        info!(
+                            "EGFX L1 RE-INIT: also resetting L2 stress state \
+                             (was active, would have over-triggered on Frame #1)"
+                        );
+                        stress_active = false;
+                        stress_original_aux_interval = 0;
+                    }
+
+                    // Note: SharedHandlerState.has_surface / primary_surface_id are
+                    // ALREADY reset by LamcoGraphicsHandler::capabilities_advertise
+                    // when the re-advertise was detected — see egfx/handler.rs. No
+                    // additional reset needed here.
+                }
+
                 let is_avc = !egfx_gate_bypassed && handler.is_avc_supported().await;
-                if needs_init && !is_avc {
-                    // V8 client: clear flag now, no EGFX setup needed
+                let is_egfx = !egfx_gate_bypassed && handler.is_egfx_ready().await;
+                if needs_init && !is_avc && !is_egfx {
+                    // Non-EGFX client: clear flag, no EGFX setup needed
                     handler
                         .egfx_needs_init
                         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1504,53 +2235,51 @@ impl LamcoDisplayHandler {
                         // Determine codec based on config preference and client capabilities
                         // Config codec setting: "auto", "avc420", "avc444"
                         let client_supports_avc444 =
-                            if let Some(state) = handler.gfx_handler_state.read().await.as_ref() {
-                                state.is_avc444_enabled
+                            if let Some(ref state) = handler.gfx_handler_state {
+                                state
+                                    .is_avc444_enabled
+                                    .load(std::sync::atomic::Ordering::Acquire)
                             } else {
                                 false
                             };
 
                         // Resolve codec preference from config
                         let codec_pref = self.config.egfx.codec.to_lowercase();
-                        let avc444_enabled = match codec_pref.as_str() {
-                            "avc420" => {
-                                info!("Codec preference: AVC420 forced by config");
-                                false
-                            }
-                            "avc444" => {
-                                if client_supports_avc444 && self.config.egfx.avc444_enabled {
-                                    info!("Codec preference: AVC444 requested and supported");
-                                    true
-                                } else if !client_supports_avc444 {
-                                    info!(
-                                        "Codec preference: AVC444 requested but client doesn't support it, using AVC420"
-                                    );
-                                    false
-                                } else {
-                                    info!(
-                                        "Codec preference: AVC444 requested but disabled in config, using AVC420"
-                                    );
-                                    false
+                        let (avc444_enabled, codec_reason) =
+                            pipeline_decisions::resolve_avc444_enabled(
+                                &codec_pref,
+                                client_supports_avc444,
+                                self.config.egfx.avc444_enabled,
+                            );
+                        info!("{codec_reason}");
+
+                        // Build encoder diagnostics ONCE per encoder construction.
+                        // Wrapped in Arc so both encoders (AVC444 / AVC420 fallback)
+                        // can share a single dump-file and single self-test decoder.
+                        // None when both config flags are off — zero per-frame cost.
+                        let encoder_diagnostics: Option<
+                            std::sync::Arc<crate::egfx::encode_diagnostics::EncodeDiagnostics>,
+                        > = {
+                            let cfg = &self.config.diagnostics;
+                            let need = cfg.dump_h264_to.is_some() || cfg.decode_self_test;
+                            if need {
+                                match crate::egfx::encode_diagnostics::EncodeDiagnostics::new(
+                                    cfg.dump_h264_to.as_deref(),
+                                    cfg.decode_self_test,
+                                ) {
+                                    Ok(d) => {
+                                        info!("🔬 Encoder diagnostics: {}", d.summary());
+                                        Some(std::sync::Arc::new(d))
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Encoder diagnostics requested but init failed: {e:#} — continuing without"
+                                        );
+                                        None
+                                    }
                                 }
-                            }
-                            _ => {
-                                // "auto" or unrecognized: use best available
-                                if self.config.egfx.avc444_enabled && client_supports_avc444 {
-                                    info!(
-                                        "Codec preference: auto → AVC444 (client supports, enabled in config)"
-                                    );
-                                    true
-                                } else if !self.config.egfx.avc444_enabled {
-                                    info!(
-                                        "Codec preference: auto → AVC420 (AVC444 disabled in config)"
-                                    );
-                                    false
-                                } else {
-                                    info!(
-                                        "Codec preference: auto → AVC420 (client doesn't support AVC444)"
-                                    );
-                                    false
-                                }
+                            } else {
+                                None
                             }
                         };
 
@@ -1569,6 +2298,7 @@ impl LamcoDisplayHandler {
                                     encoder.configure_periodic_idr(
                                         self.config.egfx.periodic_idr_interval,
                                     );
+                                    encoder.set_diagnostics(encoder_diagnostics.clone());
 
                                     video_encoder = Some(VideoEncoder::Avc444(encoder));
                                     info!(
@@ -1583,7 +2313,8 @@ impl LamcoDisplayHandler {
                                     );
                                     // Fall through to AVC420
                                     match Avc420Encoder::new(config) {
-                                        Ok(encoder) => {
+                                        Ok(mut encoder) => {
+                                            encoder.set_diagnostics(encoder_diagnostics.clone());
                                             video_encoder = Some(VideoEncoder::Avc420(encoder));
                                             info!(
                                                 "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
@@ -1602,7 +2333,8 @@ impl LamcoDisplayHandler {
                         } else {
                             // Use AVC420 (standard 4:2:0 chroma)
                             match Avc420Encoder::new(config) {
-                                Ok(encoder) => {
+                                Ok(mut encoder) => {
+                                    encoder.set_diagnostics(encoder_diagnostics.clone());
                                     video_encoder = Some(VideoEncoder::Avc420(encoder));
                                     info!(
                                         "✅ AVC420 encoder initialized for {}×{} (aligned)",
@@ -1617,150 +2349,98 @@ impl LamcoDisplayHandler {
                                 }
                             }
                         }
+                        drop(encoder_diagnostics);
 
-                        // Only create EGFX surface when we have an encoder.
-                        // Without an encoder, frames go via RemoteFX bitmaps and
-                        // an orphan EGFX surface would put the client in mixed mode.
+                        // Create EGFX surface regardless of encoder availability.
+                        // Once EGFX is negotiated, ALL frames go through WireToSurface1.
+                        // With an encoder: AVC420/AVC444 codec. Without: Uncompressed.
+                        // Per MS-RDPEGFX spec, clients in EGFX mode ignore FastPath bitmaps.
                         if video_encoder.is_none() {
-                            info!(
-                                "No H.264 encoder available, using RemoteFX bitmap path (no EGFX surface)"
-                            );
-                        } else if let (Some(gfx_handle), Some(event_tx)) = (
-                            handler.gfx_server_handle.read().await.clone(),
-                            handler.server_event_tx.read().await.clone(),
-                        ) {
-                            // Create primary surface for EGFX rendering
-                            // Must be done BEFORE sending any frames
-                            // MS-RDPEGFX REQUIRES 16-pixel alignment!
-                            {
-                                info!(
-                                    "📐 Aligning surface: {}×{} → {}×{} (16-pixel boundary)",
-                                    frame.width, frame.height, aligned_width, aligned_height
-                                );
-
-                                let mut server =
-                                    gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
-
-                                // CRITICAL FIX: Set desktop size BEFORE creating surface
-                                // This prevents desktop size mismatch when ResetGraphics is auto-sent
-                                // Desktop = actual resolution (800×600)
-                                // Surface = aligned resolution (800×608)
-                                server
-                                    .set_output_dimensions(frame.width as u16, frame.height as u16);
-                                info!(
-                                    "✅ EGFX desktop dimensions set: {}×{} (actual)",
-                                    frame.width, frame.height
-                                );
-
-                                // Create surface with ALIGNED dimensions
-                                // create_surface() will auto-send ResetGraphics using output_dimensions
-                                if let Some(surface_id) =
-                                    server.create_surface(aligned_width, aligned_height)
-                                {
-                                    info!(
-                                        "✅ EGFX surface {} created ({}×{} aligned)",
-                                        surface_id, aligned_width, aligned_height
-                                    );
-                                    // Map surface to output at origin (0,0)
-                                    if server.map_surface_to_output(surface_id, 0, 0) {
-                                        info!("✅ EGFX surface {} mapped to output", surface_id);
-                                    } else {
-                                        warn!("Failed to map EGFX surface to output");
-                                    }
-
-                                    // Send the CreateSurface and MapSurfaceToOutput PDUs to client
-                                    let channel_id = server.channel_id();
-                                    let dvc_messages = server.drain_output();
-                                    if !dvc_messages.is_empty() {
-                                        info!(
-                                            "EGFX: drain_output returned {} DVC messages for surface setup",
-                                            dvc_messages.len()
-                                        );
-                                        // Log the size of each DVC message (GfxPdu)
-                                        for (i, msg) in dvc_messages.iter().enumerate() {
-                                            info!("  DVC msg {}: {} bytes", i, msg.size());
-                                        }
-
-                                        if let Some(ch_id) = channel_id {
-                                            use ironrdp_dvc::encode_dvc_messages;
-                                            use ironrdp_server::EgfxServerMessage;
-                                            use ironrdp_svc::ChannelFlags;
-
-                                            match encode_dvc_messages(
-                                                ch_id,
-                                                dvc_messages,
-                                                ChannelFlags::SHOW_PROTOCOL,
-                                            ) {
-                                                Ok(svc_messages) => {
-                                                    info!(
-                                                        "EGFX: Encoded {} SVC messages for DVC channel {}",
-                                                        svc_messages.len(),
-                                                        ch_id
-                                                    );
-                                                    let msg = EgfxServerMessage::SendMessages {
-                                                        messages: svc_messages,
-                                                    };
-                                                    let _ = event_tx.send(ServerEvent::Egfx(msg));
-                                                    info!("✅ EGFX surface PDUs sent to client");
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        "EGFX: Failed to encode DVC messages: {:?}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    warn!(
-                                        "Failed to create EGFX surface - server may not be ready"
-                                    );
-                                }
-                            }
-
-                            let sender = EgfxFrameSender::new(
-                                gfx_handle,
-                                handler.gfx_handler_state.clone(),
-                                event_tx,
-                            );
+                            info!("No H.264 encoder available, using EGFX uncompressed path");
+                        }
+                        if let Some(sender) = handler
+                            .setup_egfx_surface(
+                                frame.width,
+                                frame.height,
+                                aligned_width,
+                                aligned_height,
+                            )
+                            .await
+                        {
                             egfx_sender = Some(sender);
-                            info!("✅ EGFX frame sender initialized");
-
-                            // Setup succeeded: clear the init flag so we don't
-                            // repeat encoder/surface creation on every frame
                             handler
                                 .egfx_needs_init
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
-
-                            // Force first frame to be sent regardless of damage detection
-                            // This ensures reconnecting clients see the screen immediately
                             force_first_frame = true;
-                            info!(
-                                "📺 First frame after init will be forced (bypass damage detection)"
-                            );
+                            info!("EGFX surface setup complete (AVC path)");
                         }
                     }
 
-                    // Try to send via EGFX if encoder is available
+                    // Try to send via EGFX H.264 if encoder is available
                     if let (Some(encoder), Some(sender)) = (&mut video_encoder, &egfx_sender) {
+                        // CLOSED-LOOP FLOW CONTROL (Layer 4 / GrdRdpGfxFrameController equivalent)
+                        // — see src/egfx/flow_controller.rs.
+                        //
+                        // Before encoding the next frame, ask the flow controller whether
+                        // we should pause. The controller engages throttling when unacked
+                        // frame count exceeds an RTT-adaptive threshold (avoiding client
+                        // decoder saturation that causes mstsc to give up under load).
+                        //
+                        // Throttle path: drop the frame at the encoder boundary, log
+                        // periodically so operators can see flow control engaged.
+                        let throttle = handler.gfx_handler_state.as_ref().is_some_and(|s| {
+                            s.flow_controller
+                                .lock()
+                                .ok()
+                                .is_some_and(|fc| fc.should_throttle())
+                        });
+                        if throttle {
+                            frames_dropped += 1;
+                            if frames_dropped.is_multiple_of(60) {
+                                if let Some(ref s) = handler.gfx_handler_state
+                                    && let Ok(fc) = s.flow_controller.lock()
+                                {
+                                    info!(
+                                        unacked = fc.unacked_count(),
+                                        activate_th = fc.activate_th(),
+                                        avg_rtt_us = fc.avg_rtt().as_micros() as u64,
+                                        state = ?fc.state(),
+                                        "EGFX L4 flow controller: throttling encoder \
+                                         (waiting for client to drain unacked frames)"
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+
                         use crate::egfx::align_to_16;
 
-                        // Use PipeWire PTS when available, fall back to synthetic timing
-                        let timestamp_ms = if frame.pts > 0 {
-                            frame.pts / 1_000_000 // nanoseconds → milliseconds
-                        } else {
-                            let frame_interval_ms =
-                                1000 / u64::from(self.config.video.target_fps.max(1));
-                            frames_sent * frame_interval_ms
+                        let timestamp_ms = pipeline_decisions::compute_timestamp_ms(
+                            frame.pts,
+                            frames_sent,
+                            self.config.video.target_fps,
+                        );
+
+                        // Extract CPU-resident pixel data.
+                        // DMA-BUF passthrough frames (future) will take a different path
+                        // through the hardware encoder directly.
+                        let pixel_data = match &frame.buffer {
+                            lamco_pipewire::FrameBuffer::Memory(data) => {
+                                std::sync::Arc::clone(data)
+                            }
+                            lamco_pipewire::FrameBuffer::DmaBuf(_) => {
+                                trace!("Skipping DMA-BUF frame in software encode path");
+                                frames_dropped += 1;
+                                continue;
+                            }
                         };
 
                         // PipeWire sometimes sends zero-size buffers
                         let expected_size = (frame.width * frame.height * 4) as usize;
-                        if frame.data.len() < expected_size {
+                        if pixel_data.len() < expected_size {
                             trace!(
                                 "Skipping invalid frame: size={}, expected={} for {}×{}",
-                                frame.data.len(),
+                                pixel_data.len(),
                                 expected_size,
                                 frame.width,
                                 frame.height
@@ -1784,6 +2464,23 @@ impl LamcoDisplayHandler {
                             force_first_frame = false;
                         }
 
+                        // Decided once per iteration, before the skip/continue points
+                        // below, so the compositor-hint probe and the log block it
+                        // feeds agree on the same frame. See last_telemetry_log's
+                        // declaration for why this is time- not frame-count-gated.
+                        let should_log_telemetry =
+                            last_telemetry_log.elapsed() >= telemetry_log_interval;
+
+                        // Which source produced damage_regions this frame — logged
+                        // periodically below so activity-classification behavior can be
+                        // correlated with the Wayland damage protocol in use (compositor
+                        // hints differ in reported granularity between e.g. wlr-screencopy
+                        // and ext-image-copy-capture-v1; see adaptive_fps.rs module docs).
+                        let mut damage_source = "forced";
+                        // Periodic pixel-diff cross-check against compositor-hint damage,
+                        // populated only on the same 60-frame cadence as the debug log below.
+                        let mut compositor_vs_pixel_diff: Option<f32> = None;
+
                         let damage_regions = if force_full_frame {
                             // Force full frame - either periodic IDR or first frame after init
                             if periodic_idr_due {
@@ -1792,42 +2489,77 @@ impl LamcoDisplayHandler {
                                 );
                             }
                             vec![DamageRegion::full_frame(frame.width, frame.height)]
+                        } else if !frame.damage_regions.is_empty() {
+                            // Compositor-provided damage (authoritative, zero CPU cost).
+                            // Use PipeWire damage hints from wlr-screencopy or ext-image-copy-capture.
+                            damage_source = "compositor-hint";
+                            if let Some(ref mut detector) = damage_detector_opt {
+                                if should_log_telemetry {
+                                    // Calibration probe: run the real pixel-diff detector
+                                    // instead of the cheap reference-only update, so we can
+                                    // log how far this protocol's damage hints diverge from
+                                    // an actual pixel diff. detect() updates the reference
+                                    // frame as a side effect, same as update_reference()
+                                    // would have -- this is not extra drift, just a ~2-3ms
+                                    // probe once every 60 frames.
+                                    let probe_regions =
+                                        detector.detect(&pixel_data, frame.width, frame.height);
+                                    compositor_vs_pixel_diff =
+                                        Some(pipeline_decisions::compute_damage_ratio(
+                                            &probe_regions,
+                                            frame.width,
+                                            frame.height,
+                                        ));
+                                } else {
+                                    // Keep DamageDetector reference frame synchronized for
+                                    // seamless fallback, without the cost of a full diff.
+                                    detector.update_reference(&pixel_data);
+                                }
+                            }
+                            frame
+                                .damage_regions
+                                .iter()
+                                .map(|r| DamageRegion::from(*r))
+                                .collect()
                         } else if let Some(ref mut detector) = damage_detector_opt {
-                            // Damage tracking enabled - detect changed regions
-                            detector.detect(&frame.data, frame.width, frame.height)
+                            // Fallback: pixel-diff damage detection (SIMD, ~2-3ms at 1080p)
+                            damage_source = "pixel-diff";
+                            detector.detect(&pixel_data, frame.width, frame.height)
                         } else {
                             // Damage tracking disabled - use full frame
+                            damage_source = "disabled";
                             vec![DamageRegion::full_frame(frame.width, frame.height)]
                         };
 
-                        let damage_ratio = if !damage_regions.is_empty() {
-                            let frame_area = (frame.width * frame.height) as u64;
-                            let damage_area: u64 = damage_regions
-                                .iter()
-                                .map(super::super::damage::DamageRegion::area)
-                                .sum();
-                            damage_area as f32 / frame_area as f32
-                        } else {
-                            0.0
-                        };
+                        let damage_ratio = pipeline_decisions::compute_damage_ratio(
+                            &damage_regions,
+                            frame.width,
+                            frame.height,
+                        );
 
                         if adaptive_fps_enabled {
                             adaptive_fps.update(damage_ratio);
                         }
 
-                        let encoding_decision = latency_governor.should_encode_frame(damage_ratio);
-                        match encoding_decision {
-                            EncodingDecision::Skip => {
-                                frames_dropped += 1;
-                                continue;
+                        // Bypass latency governor for forced frames (init IDR, periodic IDR).
+                        // The governor may skip based on timing, but forced frames MUST be sent
+                        // immediately -- the client has no display content without them.
+                        if !force_full_frame {
+                            let encoding_decision =
+                                latency_governor.should_encode_frame(damage_ratio);
+                            match encoding_decision {
+                                EncodingDecision::Skip => {
+                                    frames_dropped += 1;
+                                    continue;
+                                }
+                                EncodingDecision::WaitForMore => {
+                                    continue;
+                                }
+                                EncodingDecision::EncodeNow
+                                | EncodingDecision::EncodeKeepalive
+                                | EncodingDecision::EncodeBatch
+                                | EncodingDecision::EncodeTimeout => {}
                             }
-                            EncodingDecision::WaitForMore => {
-                                continue;
-                            }
-                            EncodingDecision::EncodeNow
-                            | EncodingDecision::EncodeKeepalive
-                            | EncodingDecision::EncodeBatch
-                            | EncodingDecision::EncodeTimeout => {}
                         }
 
                         if damage_regions.is_empty() {
@@ -1848,50 +2580,86 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
-                        if frames_sent.is_multiple_of(60) {
+                        if should_log_telemetry {
+                            last_telemetry_log = std::time::Instant::now();
                             if let Some(ref detector) = damage_detector_opt {
                                 let stats = detector.stats();
                                 debug!(
-                                    "🎯 Damage: {} regions, {:.1}% of frame, avg {:.1}ms detection",
+                                    "🎯 Damage: {} regions, {:.1}% of frame, avg {:.1}ms detection, source={damage_source}",
                                     damage_regions.len(),
                                     damage_ratio * 100.0,
                                     stats.avg_detection_time_ms
                                 );
                             }
+                            if let Some(pixel_diff_ratio) = compositor_vs_pixel_diff {
+                                let delta_pct = (damage_ratio - pixel_diff_ratio) * 100.0;
+                                debug!(
+                                    "🎯 Damage source cross-check: compositor-hint={:.1}% pixel-diff={:.1}% delta={delta_pct:+.1}pp",
+                                    damage_ratio * 100.0,
+                                    pixel_diff_ratio * 100.0
+                                );
+                            }
                             if adaptive_fps_enabled {
                                 debug!(
-                                    "🎛️ Adaptive FPS: activity={:?}, fps={}, latency_mode={:?}",
+                                    "🎛️ Adaptive FPS: activity={:?}, fps={}, latency_mode={:?}, damage_source={damage_source}",
                                     adaptive_fps.activity_level(),
                                     adaptive_fps.current_fps(),
                                     latency_governor.mode()
                                 );
+                                if let Some(ref state) = *self.fps_state.read().await {
+                                    let fps_stats = adaptive_fps.stats();
+                                    let mut snap = state.write();
+                                    snap.enabled = true;
+                                    snap.current_fps = adaptive_fps.current_fps();
+                                    snap.activity_level =
+                                        format!("{:?}", adaptive_fps.activity_level());
+                                    snap.damage_source = damage_source.to_string();
+                                    snap.frames_processed = fps_stats.frames_processed;
+                                    snap.frames_skipped = fps_stats.frames_skipped;
+                                    snap.time_at_static = fps_stats.time_at_static;
+                                    snap.time_at_low = fps_stats.time_at_low;
+                                    snap.time_at_medium = fps_stats.time_at_medium;
+                                    snap.time_at_high = fps_stats.time_at_high;
+                                }
                             }
                         }
 
                         // MS-RDPEGFX REQUIRES 16-pixel alignment
                         // Frame from PipeWire may not be aligned (e.g., 800×600)
                         // Must align dimensions AND pad frame data
-                        let aligned_width = align_to_16(frame.width as u32);
-                        let aligned_height = align_to_16(frame.height as u32);
+                        // (Transform already applied above, before the EGFX/bitmap fork)
+                        let aligned_width = align_to_16(frame.width);
+                        let aligned_height = align_to_16(frame.height);
 
-                        let frame_data = if aligned_width != frame.width as u32
-                            || aligned_height != frame.height as u32
-                        {
-                            Self::pad_frame_to_aligned(
-                                &frame.data,
-                                frame.width,
-                                frame.height,
-                                aligned_width,
-                                aligned_height,
-                            )
-                        } else {
-                            (*frame.data).clone()
-                        };
+                        let frame_data =
+                            if aligned_width != frame.width || aligned_height != frame.height {
+                                Self::pad_frame_to_aligned(
+                                    &pixel_data,
+                                    frame.width,
+                                    frame.height,
+                                    aligned_width,
+                                    aligned_height,
+                                )
+                            } else {
+                                (*pixel_data).clone()
+                            };
+
+                        // Update adaptive QP from client feedback before encoding
+                        if let Some(ref mut adapt) = encoding_adaptation {
+                            let qp = adapt.adapted_qp();
+                            sender.set_qp(qp);
+                        }
 
                         // OpenH264's encode() is synchronous and CPU-bound.
                         // On slow hardware (e.g., QEMU VMs) it can block for seconds.
                         // block_in_place tells tokio this thread is occupied so the
                         // runtime can schedule other tasks on remaining threads.
+                        //
+                        // Time the encode so the operator can see when software
+                        // encoding is the throughput bottleneck. Per-frame INFO
+                        // when over the soft threshold; DEBUG for routine
+                        // (consistent with the Processing-frame log policy).
+                        let encode_start = std::time::Instant::now();
                         let encode_result = tokio::task::block_in_place(|| {
                             encoder.encode_bgra(
                                 &frame_data,
@@ -1900,6 +2668,29 @@ impl LamcoDisplayHandler {
                                 timestamp_ms,
                             )
                         });
+                        let encode_elapsed = encode_start.elapsed();
+                        // Soft threshold: 100ms is the upper bound for 30fps
+                        // delivery (one frame budget). Above that, the encoder
+                        // is the limiting factor.
+                        if encode_elapsed >= std::time::Duration::from_millis(100) {
+                            info!(
+                                "⏱ Encoder slow: {} ms for {}x{} {} (force_idr={}) — software encode may be throughput bottleneck",
+                                encode_elapsed.as_millis(),
+                                aligned_width,
+                                aligned_height,
+                                encoder.codec_name(),
+                                force_full_frame,
+                            );
+                        } else {
+                            debug!(
+                                encode_ms = encode_elapsed.as_millis() as u64,
+                                width = aligned_width,
+                                height = aligned_height,
+                                codec = encoder.codec_name(),
+                                force_idr = force_full_frame,
+                                "Encoder timing"
+                            );
+                        }
                         match encode_result {
                             Ok(Some(encoded_frame)) => {
                                 let send_result = match encoded_frame {
@@ -1942,15 +2733,38 @@ impl LamcoDisplayHandler {
                                                 egfx_frames_sent, codec
                                             );
                                         }
+                                        // Notify flow controller that this frame is now
+                                        // in flight (unacked). Will update state machine
+                                        // and may engage throttling on subsequent iterations.
+                                        if let Some(ref s) = handler.gfx_handler_state
+                                            && let Ok(mut fc) = s.flow_controller.lock()
+                                        {
+                                            fc.unack_frame(_frame_id, 1);
+                                        }
                                         continue; // Frame sent via EGFX, skip RemoteFX path
                                     }
                                     Err(e) => {
                                         // CRITICAL: Once EGFX is active, NEVER fall back to RemoteFX!
-                                        // Mixing codecs causes display conflicts - EGFX surface invisible
-                                        trace!(
-                                            "EGFX send failed: {} - dropping frame (no RemoteFX fallback)",
-                                            e
-                                        );
+                                        // Mixing codecs causes display conflicts - EGFX surface invisible.
+                                        //
+                                        // Backpressure rejections are expected when the client falls
+                                        // behind and need DEBUG visibility — at TRACE they were
+                                        // invisible to the operator. Other SendError variants
+                                        // (NotReady, NoSurface, ChannelClosed, EncodingFailed) are
+                                        // less expected and get WARN.
+                                        match &e {
+                                            crate::server::egfx_sender::SendError::Backpressure => {
+                                                debug!(
+                                                    "EGFX send rejected (backpressure): client behind on FrameAcknowledge, frame dropped"
+                                                );
+                                            }
+                                            _ => {
+                                                warn!(
+                                                    "EGFX send failed: {} - frame dropped (no RemoteFX fallback)",
+                                                    e
+                                                );
+                                            }
+                                        }
                                         frames_dropped += 1;
                                         continue; // Drop frame, don't fall through to RemoteFX
                                     }
@@ -1971,6 +2785,121 @@ impl LamcoDisplayHandler {
                                 continue; // Drop frame, don't fall through to RemoteFX
                             }
                         }
+                    } else if let Some(ref sender) = egfx_sender {
+                        // EGFX uncompressed fallback: no H.264 encoder but EGFX surface exists.
+                        // Send raw pixels via WireToSurface1 with Codec1Type::Uncompressed.
+                        // Per MS-RDPEGFX, clients in EGFX mode ignore FastPath bitmaps,
+                        // so all frame delivery must go through WireToSurface1.
+                        let pixel_bytes = match &frame.buffer {
+                            lamco_pipewire::FrameBuffer::Memory(data) => data,
+                            lamco_pipewire::FrameBuffer::DmaBuf(_) => {
+                                trace!("Skipping DMA-BUF frame in uncompressed path");
+                                frames_dropped += 1;
+                                continue;
+                            }
+                        };
+
+                        // PipeWire BGRx [B,G,R,X] is identical to RDP XRGB_8888 on
+                        // little-endian: the 32-bit value 0xXXRRGGBB stores as [BB,GG,RR,XX].
+                        // No pixel format conversion needed.
+                        let timestamp_ms = (frame.pts / 1_000_000) as u32;
+                        match sender
+                            .send_uncompressed_frame(
+                                pixel_bytes,
+                                frame.width as u16,
+                                frame.height as u16,
+                                timestamp_ms,
+                            )
+                            .await
+                        {
+                            Ok(frame_id) => {
+                                egfx_frames_sent += 1;
+                                last_frame_time = std::time::Instant::now();
+                                if !first_frame_received {
+                                    first_frame_received = true;
+                                    session_start = std::time::Instant::now();
+                                }
+                                if egfx_frames_sent <= 3 || egfx_frames_sent.is_multiple_of(30) {
+                                    info!(
+                                        "EGFX uncompressed: sent frame {} ({}x{})",
+                                        frame_id, frame.width, frame.height
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                debug!("EGFX uncompressed send failed: {}", e);
+                                frames_dropped += 1;
+                            }
+                        }
+                        continue;
+                    }
+                } else if !egfx_gate_bypassed && handler.is_egfx_ready().await {
+                    // Non-AVC EGFX client (V8 only): setup surface and send uncompressed.
+                    // This path handles clients that negotiate EGFX but don't advertise
+                    // AVC420 support (e.g., rdpdo, ironrdp-web, minimal clients).
+                    if needs_init {
+                        use crate::egfx::align_to_16;
+                        let aligned_width = align_to_16(frame.width) as u16;
+                        let aligned_height = align_to_16(frame.height) as u16;
+                        if let Some(sender) = handler
+                            .setup_egfx_surface(
+                                frame.width,
+                                frame.height,
+                                aligned_width,
+                                aligned_height,
+                            )
+                            .await
+                        {
+                            egfx_sender = Some(sender);
+                            handler
+                                .egfx_needs_init
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            force_first_frame = true;
+                            info!("EGFX surface setup complete (V8 uncompressed path)");
+                        }
+                    }
+
+                    if let Some(ref sender) = egfx_sender {
+                        let pixel_bytes = match &frame.buffer {
+                            lamco_pipewire::FrameBuffer::Memory(data) => data,
+                            lamco_pipewire::FrameBuffer::DmaBuf(_) => {
+                                trace!("Skipping DMA-BUF frame in uncompressed path");
+                                frames_dropped += 1;
+                                continue;
+                            }
+                        };
+
+                        // PipeWire BGRx = RDP XRGB_8888 on little-endian. No conversion needed.
+                        let timestamp_ms = (frame.pts / 1_000_000) as u32;
+                        match sender
+                            .send_uncompressed_frame(
+                                pixel_bytes,
+                                frame.width as u16,
+                                frame.height as u16,
+                                timestamp_ms,
+                            )
+                            .await
+                        {
+                            Ok(frame_id) => {
+                                egfx_frames_sent += 1;
+                                last_frame_time = std::time::Instant::now();
+                                if !first_frame_received {
+                                    first_frame_received = true;
+                                    session_start = std::time::Instant::now();
+                                }
+                                if egfx_frames_sent <= 3 || egfx_frames_sent.is_multiple_of(30) {
+                                    info!(
+                                        "EGFX V8 uncompressed: sent frame {} ({}x{})",
+                                        frame_id, frame.width, frame.height
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                debug!("EGFX V8 uncompressed send failed: {}", e);
+                                frames_dropped += 1;
+                            }
+                        }
+                        continue;
                     }
                 }
 
@@ -2148,24 +3077,22 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             self.egfx_needs_init
                 .store(true, std::sync::atomic::Ordering::SeqCst);
 
-            // Clear handler state to force waiting for NEW EGFX channel negotiation.
+            // Reset handler state atomics to force waiting for NEW EGFX channel negotiation.
             // The new connection's GfxServerFactory.build_server_with_handle() will
-            // create fresh state when the client's EGFX DVC channel is established.
-            // Must use write().await (not try_write) — a silent failure here leaves
-            // stale is_ready=true state, preventing EGFX reinit for the new client.
-            {
-                let mut state = self.gfx_handler_state.write().await;
-                *state = None;
-                info!("Cleared gfx_handler_state for new EGFX negotiation");
+            // update these atomics when the client's EGFX DVC channel is established.
+            if let Some(ref state) = self.gfx_handler_state {
+                state.reset();
+                info!("Reset gfx_handler_state atomics for new EGFX negotiation");
             }
 
-            // Clear stale server handle — it points to the old client's
-            // GraphicsPipelineServer and would cause create_surface to fail
-            // or send PDUs to a dead session
+            // NOTE: Do NOT clear gfx_server_handle here. The GfxServerFactory's
+            // build_server_with_handle() already replaced it with the new client's
+            // handle BEFORE updates() is called. Clearing it here would destroy
+            // the new handle, causing is_egfx_ready() to return false indefinitely.
             {
-                let mut handle = self.gfx_server_handle.write().await;
-                *handle = None;
-                info!("Cleared gfx_server_handle for new client");
+                let handle = self.gfx_server_handle.read().await;
+                let has_handle = handle.is_some();
+                info!("gfx_server_handle after factory: {has_handle} (preserved for new client)");
             }
 
             // Reset bitmap converter so the new client gets a full initial frame.
@@ -2187,17 +3114,32 @@ impl RdpServerDisplay for LamcoDisplayHandler {
                 }
             }
 
-            // Notify input handler about reconnection
-            // The input handler is shared across connections but needs to reset internal state
-            // (keyboard modifiers, mouse button state) when a new client connects
+            // Reset internal state for reconnection
             if let Some(ref handler) = *self.input_handler.read().await {
                 handler.notify_reconnection().await;
             }
 
-            // On reconnect, the clipboard provider manages its own state cleanup.
-            if self.clipboard_manager.read().await.is_some() {
-                info!("Reconnection detected - clipboard provider handles state reset");
+            // Connect-start clipboard reset — ONLY on a genuine reconnection.
+            // This updates() reset block ALSO runs on a same-connection
+            // DeactivationReactivation (display resize): that preserves the
+            // CLIPRDR channel and emits no new Ready, so tearing the latch down
+            // here would suppress every Linux→Windows paste until the client next
+            // copies. saw_real_disconnect (set by on_client_disconnect) gates it,
+            // and also re-drives teardown if the disconnect-time emission was lost.
+            if self
+                .saw_real_disconnect
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.notify_clipboard_disconnect().await;
             }
+        }
+
+        // Activate deferred input subsystem (EIS) if not already active.
+        // This is idempotent — activate_input() returns Ok immediately if already active.
+        if let Some(ref handler) = *self.input_handler.read().await
+            && let Err(e) = handler.activate_input().await
+        {
+            warn!("Failed to activate EIS input: {}", e);
         }
 
         // Signal pipeline that a client is now consuming frames
@@ -2323,6 +3265,11 @@ impl RdpServerDisplay for LamcoDisplayHandler {
 /// Allows the handler to be cloned for use with IronRDP's builder pattern.
 /// All internal state is Arc'd so cloning is cheap and maintains shared state.
 impl Clone for LamcoDisplayHandler {
+    // This is hand-written rather than derived because `last_resize_time` and
+    // `stream_active_flag` are not `Clone` (they wrap fresh locks). The exhaustive
+    // `Self { .. }` literal below — no `..rest` — is the drift guard the audit
+    // (L1) asked for: adding a field to the struct without cloning it here is a
+    // hard `E0063: missing field` error, so the two cannot silently diverge.
     fn clone(&self) -> Self {
         Self {
             size: Arc::clone(&self.size),
@@ -2334,7 +3281,7 @@ impl Clone for LamcoDisplayHandler {
             stream_info: self.stream_info.clone(),
             // EGFX fields
             gfx_server_handle: Arc::clone(&self.gfx_server_handle),
-            gfx_handler_state: Arc::clone(&self.gfx_handler_state),
+            gfx_handler_state: self.gfx_handler_state.as_ref().map(Arc::clone),
             server_event_tx: Arc::clone(&self.server_event_tx),
             config: Arc::clone(&self.config), // Clone config Arc
             service_registry: Arc::clone(&self.service_registry), // Clone service registry Arc
@@ -2349,8 +3296,15 @@ impl Clone for LamcoDisplayHandler {
                     .unwrap_or(Instant::now()),
             ),
             client_active: Arc::clone(&self.client_active),
+            capture_node: Arc::clone(&self.capture_node),
+            saw_real_disconnect: Arc::clone(&self.saw_real_disconnect),
             health_reporter: Arc::clone(&self.health_reporter),
+            pipewire_sensor: Arc::clone(&self.pipewire_sensor),
+            egfx_snapshot: Arc::clone(&self.egfx_snapshot),
+            fps_state: Arc::clone(&self.fps_state),
+            stream_active_flag: parking_lot::RwLock::new(self.stream_active_flag.read().clone()),
             direct_channel_mode: self.direct_channel_mode,
+            use_dmabuf: self.use_dmabuf,
         }
     }
 }
@@ -2380,6 +3334,190 @@ impl RdpServerDisplayUpdates for DisplayUpdatesStream {
             }
         }
     }
+}
+
+// =============================================================================
+// BUFFER TRANSFORM SUPPORT
+// =============================================================================
+
+/// Resolve the effective transform value from config and PipeWire metadata.
+///
+/// Config takes precedence: if set to anything other than "auto", it overrides
+/// the PipeWire metadata value.
+fn resolve_transform(config_value: &str, pw_transform: u32) -> u32 {
+    match config_value {
+        "auto" => pw_transform,
+        "none" => 0,
+        "90" => 1,
+        "180" => 2,
+        "270" => 3,
+        "flipped" => 4,
+        "flipped-90" => 5,
+        "flipped-180" => 6,
+        "flipped-270" => 7,
+        _ => {
+            warn!(
+                "Unknown frame_transform config value '{}', using auto",
+                config_value
+            );
+            pw_transform
+        }
+    }
+}
+
+/// Apply a buffer transform to pixel data.
+///
+/// Implements all 8 values from the SPA/wl_output transform spec using
+/// three primitive operations: flip_vertical, flip_horizontal, transpose.
+///
+/// Returns (transformed_data, new_width, new_height, new_stride).
+/// For 90/270 rotations, width and height are swapped.
+fn apply_frame_transform(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    transform: u32,
+    bpp: u32,
+) -> (Vec<u8>, u32, u32, u32) {
+    if transform == 0 {
+        return (data.to_vec(), width, height, stride);
+    }
+
+    debug!(
+        "Applying buffer transform {} to {}x{} frame",
+        transform, width, height
+    );
+
+    match transform {
+        // 180: flip_vertical + flip_horizontal
+        2 => {
+            let mut buf = data.to_vec();
+            flip_vertical(&mut buf, width, height, stride);
+            flip_horizontal(&mut buf, width, height, stride, bpp);
+            (buf, width, height, stride)
+        }
+        // Flipped (4): flip_horizontal only
+        4 => {
+            let mut buf = data.to_vec();
+            flip_horizontal(&mut buf, width, height, stride, bpp);
+            (buf, width, height, stride)
+        }
+        // Flipped180 (6): flip_vertical only — single-pass reverse-order copy
+        6 => {
+            let stride = stride as usize;
+            let height = height as usize;
+            let mut buf = Vec::with_capacity(stride * height);
+            for row in (0..height).rev() {
+                let start = row * stride;
+                buf.extend_from_slice(&data[start..start + stride]);
+            }
+            (buf, width, height as u32, stride as u32)
+        }
+        // 90 CCW (1): transpose + flip_horizontal
+        1 => {
+            let (transposed, new_stride) = transpose(data, width, height, stride, bpp);
+            let mut buf = transposed;
+            flip_horizontal(&mut buf, height, width, new_stride, bpp);
+            (buf, height, width, new_stride)
+        }
+        // 270 CCW (3): transpose + flip_vertical
+        3 => {
+            let (transposed, new_stride) = transpose(data, width, height, stride, bpp);
+            let mut buf = transposed;
+            flip_vertical(&mut buf, height, width, new_stride);
+            (buf, height, width, new_stride)
+        }
+        // Flipped90 (5): transpose only
+        5 => {
+            let (transposed, new_stride) = transpose(data, width, height, stride, bpp);
+            (transposed, height, width, new_stride)
+        }
+        // Flipped270 (7): flip_horizontal + transpose
+        7 => {
+            let mut buf = data.to_vec();
+            flip_horizontal(&mut buf, width, height, stride, bpp);
+            let (transposed, new_stride) = transpose(&buf, width, height, stride, bpp);
+            (transposed, height, width, new_stride)
+        }
+        _ => {
+            warn!(
+                "Unknown transform value {}, returning data unchanged",
+                transform
+            );
+            (data.to_vec(), width, height, stride)
+        }
+    }
+}
+
+/// Reverse row order in-place.
+fn flip_vertical(data: &mut [u8], _width: u32, height: u32, stride: u32) {
+    let stride = stride as usize;
+    let height = height as usize;
+    let mut top = 0usize;
+    let mut bottom = (height - 1) * stride;
+
+    while top < bottom {
+        // Swap rows in-place
+        for i in 0..stride {
+            data.swap(top + i, bottom + i);
+        }
+        top += stride;
+        bottom -= stride;
+    }
+}
+
+/// Reverse pixel order within each row in-place.
+fn flip_horizontal(data: &mut [u8], width: u32, height: u32, stride: u32, bpp: u32) {
+    let width = width as usize;
+    let height = height as usize;
+    let stride = stride as usize;
+    let bpp = bpp as usize;
+
+    for row in 0..height {
+        let row_start = row * stride;
+        let mut left = 0usize;
+        let mut right = width - 1;
+
+        while left < right {
+            let l_off = row_start + left * bpp;
+            let r_off = row_start + right * bpp;
+
+            for b in 0..bpp {
+                data.swap(l_off + b, r_off + b);
+            }
+            left += 1;
+            right -= 1;
+        }
+    }
+}
+
+/// Transpose image: swap rows and columns.
+/// Output dimensions are height x width (swapped).
+/// Returns (new_data, new_stride).
+fn transpose(data: &[u8], width: u32, height: u32, stride: u32, bpp: u32) -> (Vec<u8>, u32) {
+    let width = width as usize;
+    let height = height as usize;
+    let stride = stride as usize;
+    let bpp = bpp as usize;
+
+    // Output is height-wide and width-tall
+    let new_width = height;
+    let new_stride = new_width * bpp;
+    let new_height = width;
+
+    let mut out = vec![0u8; new_stride * new_height];
+
+    for y in 0..height {
+        for x in 0..width {
+            let src_off = y * stride + x * bpp;
+            let dst_off = x * new_stride + y * bpp;
+
+            out[dst_off..dst_off + bpp].copy_from_slice(&data[src_off..src_off + bpp]);
+        }
+    }
+
+    (out, new_stride as u32)
 }
 
 #[cfg(test)]

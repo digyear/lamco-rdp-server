@@ -7,7 +7,17 @@ use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use reis::ei;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
+
+/// Region defining the coordinate space for an absolute pointer device.
+/// Provided by the compositor via EIS Device::Region events.
+#[derive(Debug, Clone)]
+pub struct DeviceRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
 
 /// Tracked data for an EIS device (keyboard, pointer, touchscreen, etc.)
 #[derive(Default)]
@@ -16,6 +26,8 @@ pub struct DeviceData {
     pub device_type: Option<ei::device::DeviceType>,
     pub interfaces: HashMap<String, reis::Object>,
     pub seat: Option<ei::Seat>,
+    /// Regions for absolute pointer devices (defines coordinate space)
+    pub regions: Vec<DeviceRegion>,
 }
 
 impl DeviceData {
@@ -29,7 +41,11 @@ impl DeviceData {
 pub struct EisDevices {
     pub all: Mutex<HashMap<ei::Device, DeviceData>>,
     pub keyboard: Mutex<Option<ei::Device>>,
+    /// Device with ei_pointer (relative motion)
     pub pointer: Mutex<Option<ei::Device>>,
+    /// Device with ei_pointer_absolute (absolute coordinates).
+    /// KDE creates separate devices for relative and absolute pointers.
+    pub pointer_absolute: Mutex<Option<ei::Device>>,
     pub touch: Mutex<Option<ei::Device>>,
     pub last_serial: Mutex<u32>,
 }
@@ -40,9 +56,19 @@ impl EisDevices {
             all: Mutex::new(HashMap::new()),
             keyboard: Mutex::new(None),
             pointer: Mutex::new(None),
+            pointer_absolute: Mutex::new(None),
             touch: Mutex::new(None),
             last_serial: Mutex::new(initial_serial),
         }
+    }
+
+    /// Clear all device state for EIS session recovery.
+    pub async fn clear(&self) {
+        self.all.lock().await.clear();
+        *self.keyboard.lock().await = None;
+        *self.pointer.lock().await = None;
+        *self.pointer_absolute.lock().await = None;
+        *self.touch.lock().await = None;
     }
 }
 
@@ -56,8 +82,14 @@ pub fn current_time_us() -> u64 {
 }
 
 /// Helper: get device + interface + serial, flush frame after closure.
+/// Helper: get device + interface + serial, flush frame after closure.
+///
+/// Accepts `RwLock<Option<ei::Context>>` for the libei strategy (deferred EIS
+/// activation) and `RwLock<ei::Context>` for mutter_direct (always active).
+/// Both work because the mutter_direct context is wrapped in Option at call
+/// sites via `.as_ref()`.
 async fn with_device_interface<T: reis::Interface>(
-    context: &ei::Context,
+    context: &RwLock<Option<ei::Context>>,
     device_lock: &Mutex<Option<ei::Device>>,
     devices: &EisDevices,
     device_name: &str,
@@ -82,20 +114,25 @@ async fn with_device_interface<T: reis::Interface>(
 
     let serial = *devices.last_serial.lock().await;
     device.frame(serial, current_time_us());
-    context.flush()?;
+    let ctx = context.read().await;
+    let ctx_ref = ctx
+        .as_ref()
+        .ok_or_else(|| anyhow!("EIS context not initialized"))?;
+    ctx_ref.flush()?;
     Ok(())
 }
 
 // === Keyboard ===
 
 pub async fn eis_keyboard_keycode(
-    context: &ei::Context,
+    context: &RwLock<Option<ei::Context>>,
     devices: &EisDevices,
     keycode: i32,
     pressed: bool,
 ) -> Result<()> {
-    // EIS keycodes offset by 8 from evdev
-    let eis_keycode = (keycode - 8) as u32;
+    // EIS Keyboard::key() takes Linux evdev keycodes directly.
+    // The input handler already converts RDP scancodes to evdev via lamco-rdp-input.
+    let eis_keycode = keycode as u32;
     let state = if pressed {
         ei::keyboard::KeyState::Press
     } else {
@@ -111,18 +148,47 @@ pub async fn eis_keyboard_keycode(
 // === Pointer (absolute) ===
 
 pub async fn eis_pointer_motion_absolute(
-    context: &ei::Context,
+    context: &RwLock<Option<ei::Context>>,
     devices: &EisDevices,
     x: f64,
     y: f64,
 ) -> Result<()> {
+    // Apply EIS device region offset if available.
+    // The EIS device may have multiple regions (one per compositor output).
+    // KDE creates a virtual output for ScreenCast — its region has a
+    // non-zero offset (e.g., 1280,0) relative to the real display.
+    // We need the region that ISN'T at (0,0) since the PipeWire stream
+    // captures the virtual output, not the primary display.
+    let (offset_x, offset_y) = {
+        let abs_device = devices.pointer_absolute.lock().await;
+        if let Some(ref dev) = *abs_device {
+            let devs = devices.all.lock().await;
+            if let Some(data) = devs.get(dev) {
+                // Prefer the region with non-zero offset (virtual output).
+                // If all regions are at (0,0), use (0,0) — the stream
+                // captures the primary display directly.
+                data.regions
+                    .iter()
+                    .find(|r| r.x > 0 || r.y > 0)
+                    .map_or((0.0, 0.0), |r| (r.x as f64, r.y as f64))
+            } else {
+                (0.0, 0.0)
+            }
+        } else {
+            (0.0, 0.0)
+        }
+    };
+
+    let abs_x = x + offset_x;
+    let abs_y = y + offset_y;
+
     with_device_interface::<ei::PointerAbsolute>(
         context,
-        &devices.pointer,
+        &devices.pointer_absolute,
         devices,
-        "pointer",
+        "pointer_absolute",
         |ptr| {
-            ptr.motion_absolute(x as f32, y as f32);
+            ptr.motion_absolute(abs_x as f32, abs_y as f32);
         },
     )
     .await
@@ -131,7 +197,7 @@ pub async fn eis_pointer_motion_absolute(
 // === Pointer (relative) ===
 
 pub async fn eis_pointer_motion_relative(
-    context: &ei::Context,
+    context: &RwLock<Option<ei::Context>>,
     devices: &EisDevices,
     dx: f64,
     dy: f64,
@@ -145,7 +211,7 @@ pub async fn eis_pointer_motion_relative(
 // === Button ===
 
 pub async fn eis_pointer_button(
-    context: &ei::Context,
+    context: &RwLock<Option<ei::Context>>,
     devices: &EisDevices,
     button: i32,
     pressed: bool,
@@ -166,7 +232,7 @@ pub async fn eis_pointer_button(
 // === Scroll ===
 
 pub async fn eis_pointer_axis(
-    context: &ei::Context,
+    context: &RwLock<Option<ei::Context>>,
     devices: &EisDevices,
     dx: f64,
     dy: f64,
@@ -185,7 +251,7 @@ pub async fn eis_pointer_axis(
 // === Touch ===
 
 pub async fn eis_touch_down(
-    context: &ei::Context,
+    context: &RwLock<Option<ei::Context>>,
     devices: &EisDevices,
     slot: u32,
     x: f64,
@@ -204,7 +270,7 @@ pub async fn eis_touch_down(
 }
 
 pub async fn eis_touch_motion(
-    context: &ei::Context,
+    context: &RwLock<Option<ei::Context>>,
     devices: &EisDevices,
     slot: u32,
     x: f64,
@@ -222,7 +288,11 @@ pub async fn eis_touch_motion(
     .await
 }
 
-pub async fn eis_touch_up(context: &ei::Context, devices: &EisDevices, slot: u32) -> Result<()> {
+pub async fn eis_touch_up(
+    context: &RwLock<Option<ei::Context>>,
+    devices: &EisDevices,
+    slot: u32,
+) -> Result<()> {
     with_device_interface::<ei::Touchscreen>(
         context,
         &devices.touch,
@@ -253,11 +323,13 @@ pub async fn assign_device_roles(
         tracing::info!("[eis] Keyboard device ready");
     }
 
-    if data.interface::<ei::Pointer>().is_some()
-        || data.interface::<ei::PointerAbsolute>().is_some()
-    {
+    if data.interface::<ei::PointerAbsolute>().is_some() {
+        *devices.pointer_absolute.lock().await = Some(device.clone());
+        tracing::info!("[eis] Pointer absolute device ready");
+    }
+    if data.interface::<ei::Pointer>().is_some() {
         *devices.pointer.lock().await = Some(device.clone());
-        tracing::info!("[eis] Pointer device ready");
+        tracing::info!("[eis] Pointer relative device ready");
     }
 
     if data.interface::<ei::Touchscreen>().is_some() {

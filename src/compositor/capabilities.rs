@@ -198,6 +198,9 @@ pub struct CompositorCapabilities {
 
     /// Clipboard manager detection (Klipper, CopyQ, etc.)
     pub clipboard_manager: Option<crate::services::DetectedSystemClipboardManager>,
+
+    /// Encoding capabilities detected at startup (VA-API, NVENC, OpenH264)
+    pub encoding: Option<crate::capabilities::probes::encoding::EncodingCapabilities>,
 }
 
 impl CompositorCapabilities {
@@ -234,6 +237,7 @@ impl CompositorCapabilities {
             credential_storage_accessible,
             credential_encryption,
             clipboard_manager: None, // Will be set by async probing
+            encoding: None,          // Will be set by encoding probe
         }
     }
 
@@ -372,6 +376,7 @@ mod tests {
             credential_storage_accessible: true,
             credential_encryption: crate::session::EncryptionType::Aes256Gcm,
             clipboard_manager: None,
+            encoding: None,
         };
 
         assert!(caps.has_protocol("wl_compositor", 1));

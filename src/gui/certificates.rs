@@ -39,9 +39,10 @@ pub enum KeySize {
 
 impl Default for CertGenParams {
     fn default() -> Self {
-        let hostname = hostname::get()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "localhost".to_string());
+        let hostname = hostname::get().map_or_else(
+            |_| "localhost".to_string(),
+            |h| h.to_string_lossy().to_string(),
+        );
 
         Self {
             common_name: hostname.clone(),

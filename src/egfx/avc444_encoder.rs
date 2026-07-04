@@ -186,9 +186,6 @@ pub struct Avc444Encoder {
     /// Sum of encoding times (for average calculation)
     total_encode_time_ms: f64,
 
-    /// Cached SPS/PPS (shared across both subframes with single encoder)
-    cached_sps_pps: Option<Vec<u8>>,
-
     /// Current H.264 level
     current_level: Option<super::h264_level::H264Level>,
 
@@ -248,6 +245,11 @@ pub struct Avc444Encoder {
     /// Flag to force aux inclusion on next frame (set when periodic IDR fires)
     /// This bypasses aux omission to ensure BOTH streams refresh together
     force_aux_on_next_frame: bool,
+
+    /// Optional diagnostics — TRACE NAL hex dump (always-on within encoder),
+    /// H.264 file dump (config-gated), and decoder self-test (config-gated).
+    /// None when both opt-in flags are off (zero per-frame cost).
+    diagnostics: Option<std::sync::Arc<super::encode_diagnostics::EncodeDiagnostics>>,
 }
 
 #[cfg(feature = "h264")]
@@ -279,22 +281,27 @@ impl Avc444Encoder {
             (ColorMatrix::BT601 | ColorMatrix::OpenH264, _) => openh264_compat::VuiConfig::bt601(),
         };
 
-        // Build version-aware encoder config
         // High complexity for better text sharpness, scene change detect disabled
-        // for bandwidth optimization. Full QP range (0-51) for optimal quality.
+        // so IDRs come from our periodic-IDR scheduler rather than OpenH264's heuristic.
         let compat_config = openh264_compat::EncoderConfig {
             bitrate_bps: config.bitrate_kbps * 1000,
             max_frame_rate: config.max_fps,
             usage_type: openh264_compat::ffi_types::SCREEN_CONTENT_REAL_TIME,
+            num_threads: config.encoder_threads,
             enable_skip_frame: config.enable_skip_frame,
+            max_qp: config.qp_max as i32,
+            min_qp: config.qp_min as i32,
             complexity: openh264_compat::HIGH_COMPLEXITY,
-            enable_scene_change_detect: false, // Disable auto-IDR for bandwidth optimization
+            enable_scene_change_detect: false,
             level_idc: level.map(|l| l.to_openh264_level_idc()),
             vui,
             ..openh264_compat::EncoderConfig::default()
         };
 
-        info!("AVC444: High complexity, OpenH264 default QP (0-51), VUI enabled");
+        info!(
+            "AVC444: High complexity, QP [{}, {}], VUI enabled",
+            config.qp_min, config.qp_max
+        );
 
         // Create SINGLE encoder for both Main and Aux (MS-RDPEGFX spec compliant)
         let api = super::encoder::load_openh264_api()?;
@@ -329,7 +336,6 @@ impl Avc444Encoder {
             frame_count: 0,
             bytes_encoded: 0,
             total_encode_time_ms: 0.0,
-            cached_sps_pps: None,
             current_level: level,
             // DIAGNOSTIC FLAG: Force all keyframes to disable P-frame inter-prediction
             force_all_keyframes: false, // Re-enabled P-frames with temporal logging
@@ -347,7 +353,19 @@ impl Avc444Encoder {
             periodic_idr_interval_secs: 5, // Default 5 seconds
             force_next_idr: false,
             force_aux_on_next_frame: false,
+            diagnostics: None,
         })
+    }
+
+    /// Attach encoder diagnostics. Called once after construction by the
+    /// display handler when the operator has enabled diagnostics in config.
+    /// Mirrors `Avc420Encoder::set_diagnostics` so both encoders share the
+    /// same opt-in surface from the caller's perspective.
+    pub fn set_diagnostics(
+        &mut self,
+        diagnostics: Option<std::sync::Arc<super::encode_diagnostics::EncodeDiagnostics>>,
+    ) {
+        self.diagnostics = diagnostics;
     }
 
     /// Create encoder with specific color matrix
@@ -402,6 +420,46 @@ impl Avc444Encoder {
                 self.max_aux_interval, force_idr_on_return
             );
         }
+    }
+
+    /// Shrink the aux-omission interval temporarily for stress recovery.
+    ///
+    /// AVC444's aux-stream omission saves bandwidth when consecutive frames
+    /// have similar chroma — by default we omit aux for up to `max_aux_interval`
+    /// frames. Under load this delays full-chroma refresh, increasing the
+    /// window during which a decoder error in main can persist.
+    ///
+    /// Under detected stress (called from the display loop's stress-IDR
+    /// trigger path), shrink the effective interval so aux refreshes more
+    /// frequently. The cap is the original configured value — we never
+    /// extend, only shrink.
+    ///
+    /// Returns the previous interval so the caller can restore later.
+    pub fn set_aux_max_interval(&mut self, max_interval: u32) -> u32 {
+        let prev = self.max_aux_interval;
+        self.max_aux_interval = max_interval.clamp(1, 120);
+        if self.max_aux_interval != prev {
+            debug!(
+                from = prev,
+                to = self.max_aux_interval,
+                "AVC444: aux max_interval changed"
+            );
+        }
+        prev
+    }
+
+    /// Current aux-omission interval (frames). Used by stress logic to decide
+    /// whether to shrink or restore.
+    pub fn aux_max_interval(&self) -> u32 {
+        self.max_aux_interval
+    }
+
+    /// Elapsed time since the last IDR, in milliseconds.
+    ///
+    /// Used by display-loop stress detection to decide whether an early-IDR
+    /// request is worthwhile (vs. one already pending or just-emitted).
+    pub fn ms_since_last_idr(&self) -> u64 {
+        self.last_idr_time.elapsed().as_millis() as u64
     }
 
     /// Configure periodic IDR keyframe insertion
@@ -472,15 +530,23 @@ impl Avc444Encoder {
             return true;
         }
 
-        // Check periodic interval
+        // Check periodic interval. The timer is GATED on a frame arriving at
+        // the encoder — if the pipeline is backpressured or PipeWire pauses,
+        // the next "fire" only happens when the next frame comes through.
+        // Log the delta between configured interval and actual elapsed so
+        // operators can tell "5s timer fired late" from "5s timer broken."
         if self.periodic_idr_interval_secs > 0 {
             let elapsed = self.last_idr_time.elapsed();
-            if elapsed >= std::time::Duration::from_secs(self.periodic_idr_interval_secs as u64) {
+            let target = std::time::Duration::from_secs(self.periodic_idr_interval_secs as u64);
+            if elapsed >= target {
+                let drift_ms = elapsed.saturating_sub(target).as_millis();
                 self.last_idr_time = std::time::Instant::now();
                 self.force_aux_on_next_frame = true; // Force aux to clear ALL artifacts
                 info!(
-                    "Forcing periodic IDR ({}s elapsed) - BOTH Main and Aux will refresh to clear artifacts",
-                    elapsed.as_secs()
+                    "Forcing periodic IDR (elapsed={}ms, target={}ms, drift={}ms over schedule) — BOTH Main and Aux refreshing",
+                    elapsed.as_millis(),
+                    target.as_millis(),
+                    drift_ms,
                 );
                 return true;
             }
@@ -575,7 +641,7 @@ impl Avc444Encoder {
 
         let main_is_keyframe = main_encoded.is_keyframe();
         let main_frame_type_str = if main_is_keyframe { "IDR" } else { "P" };
-        let mut stream1_data = main_encoded.to_vec();
+        let stream1_data = main_encoded.to_vec();
 
         // === PHASE 1: AUXILIARY STREAM (CONDITIONALLY ENCODED) ===
         //
@@ -709,16 +775,39 @@ impl Avc444Encoder {
             );
         }
 
-        // Handle SPS/PPS caching for main stream P-frames.
-        // Cached SPS/PPS from the latest IDR is prepended to P-frames so the
-        // Windows MFT decoder always has parameter context.
-        stream1_data = self.handle_sps_pps(stream1_data, main_is_keyframe);
+        // Option A — always-on per-NAL hex dump at TRACE. Main and Aux both
+        // get dumped so SPS/PPS differences between the two are visible.
+        super::encode_diagnostics::log_nal_hex_dump(
+            stream1_data.as_slice(),
+            self.frame_count,
+            "AVC444-Main",
+        );
+        if let Some(ref aux_data) = stream2_data_opt {
+            super::encode_diagnostics::log_nal_hex_dump(aux_data, self.frame_count, "AVC444-Aux");
+        }
 
-        // Aux stream keeps its own SPS/PPS intact. Per ITU-H.264 Annex B, each
-        // independently decoded bitstream needs SPS/PPS preceding IDR slices.
-        // The VersionedEncoder FFI layer can produce different SPS parameter
-        // bytes between sequential encode calls even with CONSTANT_ID strategy,
-        // so stripping aux SPS/PPS and relying on main's parameters is unsafe.
+        // Options B + D — config-gated dump file + decoder self-test. Apply
+        // ONLY to the Main stream: it carries the luma + half chroma and is
+        // a structurally valid H.264 bitstream on its own. The Aux stream
+        // carries the remaining chroma planes packed as luma — also valid
+        // H.264 syntactically, so we self-test it too for parser sanity,
+        // but we DO NOT dump it to the same file (would interleave two
+        // unrelated streams). If a separate Aux dump is wanted later, add a
+        // second config field.
+        if let Some(d) = &self.diagnostics {
+            d.dump_frame(stream1_data.as_slice());
+            d.self_test(stream1_data.as_slice(), "AVC444-Main");
+            if let Some(ref aux_data) = stream2_data_opt {
+                d.self_test(aux_data, "AVC444-Aux");
+            }
+        }
+
+        // SPS/PPS handling: IDR frames contain SPS/PPS as part of Annex B bitstream.
+        // Do NOT prepend SPS/PPS to P-frames: MSTSC's MFT decoder interprets
+        // unexpected SPS/PPS as parameter changes requiring reinitialization,
+        // causing DVC Close during rapid frame sequences (window drag).
+        // Aux stream also keeps its own SPS/PPS intact per ITU-H.264 Annex B.
+        // See docs/bugs/AVC444-V140-REGRESSION.md for full analysis.
 
         // Update statistics
         self.frame_count += 1;
@@ -770,87 +859,6 @@ impl Avc444Encoder {
 
     /// Handle SPS/PPS for main stream (cache on IDR, prepend on P-frame)
     ///
-    /// With single encoder, SPS/PPS is shared across both subframes.
-    /// Cache from main stream IDRs, prepend to main stream P-frames.
-    #[expect(
-        clippy::unwrap_used,
-        reason = "cached_sps_pps is always Some when keyframe has been seen"
-    )]
-    fn handle_sps_pps(&mut self, mut data: Vec<u8>, is_keyframe: bool) -> Vec<u8> {
-        if is_keyframe {
-            // Cache SPS/PPS from this IDR
-            if let Some(sps_pps) = Self::extract_sps_pps(&data) {
-                self.cached_sps_pps = Some(sps_pps);
-                trace!(
-                    "Cached SPS/PPS ({} bytes) from IDR",
-                    self.cached_sps_pps.as_ref().unwrap().len()
-                );
-            }
-        } else if let Some(ref sps_pps) = self.cached_sps_pps {
-            // Prepend cached SPS/PPS to P-frame
-            let mut combined = sps_pps.clone();
-            combined.extend_from_slice(&data);
-            data = combined;
-            trace!("Prepended SPS/PPS to P-frame");
-        }
-        data
-    }
-
-    /// Extract SPS and PPS NAL units from Annex B bitstream
-    fn extract_sps_pps(data: &[u8]) -> Option<Vec<u8>> {
-        let mut sps_pps = Vec::new();
-        let mut i = 0;
-
-        while i < data.len() {
-            // Find start code
-            let start_code_len =
-                if i + 4 <= data.len() && data[i..i + 4] == [0x00, 0x00, 0x00, 0x01] {
-                    4
-                } else if i + 3 <= data.len() && data[i..i + 3] == [0x00, 0x00, 0x01] {
-                    3
-                } else {
-                    i += 1;
-                    continue;
-                };
-
-            let nal_start = i + start_code_len;
-            if nal_start >= data.len() {
-                break;
-            }
-
-            let nal_type = data[nal_start] & 0x1F;
-
-            // Find next start code
-            let mut nal_end = data.len();
-            let mut j = nal_start + 1;
-            while j + 2 < data.len() {
-                if (data[j..j + 3] == [0x00, 0x00, 0x01])
-                    || (j + 3 < data.len() && data[j..j + 4] == [0x00, 0x00, 0x00, 0x01])
-                {
-                    nal_end = j;
-                    break;
-                }
-                j += 1;
-            }
-
-            // NAL type 7 = SPS, NAL type 8 = PPS
-            if nal_type == 7 || nal_type == 8 {
-                sps_pps.extend_from_slice(&data[i..nal_end]);
-            }
-
-            i = nal_end;
-            if i == data.len() {
-                break;
-            }
-        }
-
-        if sps_pps.is_empty() {
-            None
-        } else {
-            Some(sps_pps)
-        }
-    }
-
     /// Force next frame to be a keyframe (IDR) in both subframes
     ///
     /// With single encoder, this affects the next encode() call.
@@ -1291,247 +1299,6 @@ mod tests {
 
         let stats = encoder.stats();
         assert!(stats.frames_encoded >= 1, "No frames encoded");
-    }
-
-    #[test]
-    fn test_extract_sps_pps() {
-        // Test data with SPS (NAL type 7) and PPS (NAL type 8)
-        let data = vec![
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e, // SPS
-            0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80, // PPS
-            0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, // IDR slice
-        ];
-
-        #[cfg(feature = "h264")]
-        {
-            let sps_pps = Avc444Encoder::extract_sps_pps(&data);
-            assert!(sps_pps.is_some());
-            let headers = sps_pps.unwrap();
-            // Should contain both SPS and PPS
-            assert!(headers.len() > 8);
-        }
-    }
-
-    #[cfg(feature = "h264")]
-    #[test]
-    #[allow(deprecated)]
-    fn test_with_color_matrix() {
-        // Test explicit BT.601 on HD resolution (override auto-detection)
-        let config = EncoderConfig {
-            width: Some(1920),
-            height: Some(1080),
-            ..Default::default()
-        };
-        let encoder =
-            require_openh264!(Avc444Encoder::with_color_matrix(config, ColorMatrix::BT601));
-        assert_eq!(encoder.color_matrix(), ColorMatrix::BT601);
-    }
-
-    #[cfg(feature = "h264")]
-    #[test]
-    fn test_720p_hd_edge_case() {
-        // 1280×720 is exactly at HD threshold (should use BT.709)
-        let config = EncoderConfig {
-            width: Some(1280),
-            height: Some(720),
-            ..Default::default()
-        };
-        let encoder = require_openh264!(Avc444Encoder::new(config));
-        assert_eq!(encoder.color_matrix(), ColorMatrix::BT709);
-    }
-
-    #[cfg(feature = "h264")]
-    #[test]
-    fn test_below_720p_sd() {
-        // 1279×719 is just below HD threshold (should use BT.601)
-        let config = EncoderConfig {
-            width: Some(1279),
-            height: Some(719),
-            ..Default::default()
-        };
-        let encoder = require_openh264!(Avc444Encoder::new(config));
-        assert_eq!(encoder.color_matrix(), ColorMatrix::BT601);
-    }
-
-    #[cfg(feature = "h264")]
-    #[test]
-    fn test_timing_breakdown() {
-        let config = EncoderConfig::default();
-        let mut encoder = require_openh264!(Avc444Encoder::new(config));
-
-        let width = 64u32;
-        let height = 64u32;
-        let bgra_data = vec![128u8; (width * height * 4) as usize];
-
-        let result = encoder.encode_bgra(&bgra_data, width, height, 0);
-        assert!(result.is_ok());
-
-        if let Ok(Some(frame)) = result {
-            // Verify timing breakdown is populated
-            assert!(frame.timing.total_ms >= 0.0);
-            assert!(frame.timing.color_convert_ms >= 0.0);
-            assert!(frame.timing.packing_ms >= 0.0);
-            assert!(frame.timing.encoding_ms >= 0.0);
-
-            // Total should be sum of parts (with some tolerance for measurement)
-            let sum =
-                frame.timing.color_convert_ms + frame.timing.packing_ms + frame.timing.encoding_ms;
-            assert!((frame.timing.total_ms - sum).abs() < 1.0);
-        }
-    }
-
-    #[cfg(feature = "h264")]
-    #[test]
-    fn test_encoder_level() {
-        // 1080p should get an appropriate H.264 level
-        let config = EncoderConfig {
-            width: Some(1920),
-            height: Some(1080),
-            max_fps: 30.0,
-            ..Default::default()
-        };
-        let encoder = require_openh264!(Avc444Encoder::new(config));
-        assert!(encoder.level().is_some());
-    }
-
-    #[cfg(feature = "h264")]
-    #[test]
-    fn test_1080p_encoding() {
-        // Test encoding a 1080p frame
-        let config = EncoderConfig {
-            width: Some(1920),
-            height: Some(1080),
-            bitrate_kbps: 8000,
-            ..Default::default()
-        };
-        let mut encoder = require_openh264!(Avc444Encoder::new(config));
-
-        let width = 1920u32;
-        let height = 1080u32;
-        let bgra_data = vec![100u8; (width * height * 4) as usize];
-
-        let result = encoder.encode_bgra(&bgra_data, width, height, 0);
-        assert!(result.is_ok(), "1080p encoding failed: {:?}", result.err());
-
-        if let Ok(Some(frame)) = result {
-            assert!(!frame.stream1_data.is_empty());
-            // stream2_data is Option<Vec<u8>> - may be None with aux omission
-            if let Some(ref stream2) = frame.stream2_data {
-                assert!(!stream2.is_empty());
-            }
-            // 1080p keyframe should be substantial but not enormous
-            assert!(frame.total_size > 1000, "1080p frame too small");
-            assert!(
-                frame.total_size < 10_000_000,
-                "1080p frame unreasonably large"
-            );
-        }
-    }
-
-    #[cfg(feature = "h264")]
-    #[test]
-    fn test_force_keyframe_produces_idr() {
-        let config = EncoderConfig::default();
-        let mut encoder = require_openh264!(Avc444Encoder::new(config));
-
-        let width = 64u32;
-        let height = 64u32;
-        let bgra_data = vec![64u8; (width * height * 4) as usize];
-
-        // First frame is always keyframe
-        let result1 = encoder.encode_bgra(&bgra_data, width, height, 0);
-        assert!(result1.is_ok());
-        if let Ok(Some(frame)) = result1 {
-            assert!(frame.is_keyframe, "First frame should be keyframe");
-        }
-
-        // Encode a few P-frames
-        for i in 1..5 {
-            let _ = encoder.encode_bgra(&bgra_data, width, height, i * 33);
-        }
-
-        // Force keyframe and verify
-        encoder.force_keyframe();
-        let result = encoder.encode_bgra(&bgra_data, width, height, 200);
-        assert!(result.is_ok());
-        if let Ok(Some(frame)) = result {
-            assert!(frame.is_keyframe, "Forced frame should be keyframe");
-        }
-    }
-
-    #[cfg(feature = "h264")]
-    #[test]
-    fn test_stats_after_encoding() {
-        let config = EncoderConfig {
-            bitrate_kbps: 3000,
-            ..Default::default()
-        };
-        let mut encoder = require_openh264!(Avc444Encoder::new(config));
-
-        let width = 64u32;
-        let height = 64u32;
-        let bgra_data = vec![200u8; (width * height * 4) as usize];
-
-        // Encode several frames
-        for i in 0..10 {
-            let _ = encoder.encode_bgra(&bgra_data, width, height, i * 33);
-        }
-
-        let stats = encoder.stats();
-        assert!(
-            stats.frames_encoded >= 1,
-            "Should have encoded at least 1 frame"
-        );
-        assert!(stats.bytes_encoded > 0, "Should have bytes encoded");
-        assert!(
-            stats.avg_encode_time_ms > 0.0,
-            "Should have non-zero encode time"
-        );
-        assert_eq!(stats.bitrate_kbps, 6000, "Bitrate should be 2× configured");
-    }
-
-    #[test]
-    fn test_extract_sps_pps_3byte_start_code() {
-        // Test with only 3-byte start codes
-        #[cfg(feature = "h264")]
-        {
-            let data = vec![
-                0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e, // SPS (3-byte)
-                0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80, // PPS (3-byte)
-            ];
-            let sps_pps = Avc444Encoder::extract_sps_pps(&data);
-            assert!(sps_pps.is_some());
-        }
-    }
-
-    #[test]
-    fn test_extract_sps_pps_empty() {
-        // Test with no SPS/PPS
-        #[cfg(feature = "h264")]
-        {
-            let data = vec![
-                0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, // IDR only
-            ];
-            let sps_pps = Avc444Encoder::extract_sps_pps(&data);
-            assert!(sps_pps.is_none());
-        }
-    }
-
-    #[test]
-    fn test_extract_sps_pps_sps_only() {
-        // Test with only SPS (no PPS)
-        #[cfg(feature = "h264")]
-        {
-            let data = vec![
-                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e, // SPS only
-                0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, // IDR slice
-            ];
-            let sps_pps = Avc444Encoder::extract_sps_pps(&data);
-            assert!(sps_pps.is_some());
-            // Should contain just the SPS
-            let headers = sps_pps.unwrap();
-            assert!(headers.len() >= 8);
-        }
     }
 
     #[cfg(feature = "h264")]

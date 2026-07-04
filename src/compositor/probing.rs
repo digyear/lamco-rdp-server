@@ -91,6 +91,10 @@ pub async fn probe_capabilities() -> Result<CompositorCapabilities> {
         crate::services::DetectedSystemClipboardManager::detect(&capabilities.compositor).await;
     capabilities.clipboard_manager = Some(clipboard_manager);
 
+    // Step 7: Probe encoding capabilities (OpenH264, VA-API, NVENC)
+    let encoding_caps = crate::capabilities::probes::encoding::EncodingProbe::probe().await;
+    capabilities.encoding = Some(encoding_caps);
+
     // Log summary
     capabilities.log_summary();
 
@@ -362,8 +366,7 @@ fn is_process_running(name: &str) -> bool {
         .arg("-x")
         .arg(name)
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Detect Smithay-based compositor from running processes (jay, xfwl4, etc.)

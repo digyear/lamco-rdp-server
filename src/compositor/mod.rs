@@ -64,9 +64,7 @@ pub use profiles::{CompositorProfile, Quirk};
 /// Check if we're running in a Wayland session
 pub fn is_wayland_session() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok()
-        || std::env::var("XDG_SESSION_TYPE")
-            .map(|v| v == "wayland")
-            .unwrap_or(false)
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v == "wayland")
 }
 
 pub fn wayland_display() -> Option<String> {

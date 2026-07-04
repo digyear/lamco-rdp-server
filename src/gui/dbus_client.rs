@@ -24,7 +24,7 @@ const SERVICE_NAME: &str = "io.lamco.RdpServer";
     default_service = "io.lamco.RdpServer",
     default_path = "/io/lamco/RdpServer"
 )]
-trait Manager {
+pub(crate) trait Manager {
     // Properties
     #[zbus(property)]
     fn version(&self) -> zbus::Result<String>;
@@ -60,6 +60,53 @@ trait Manager {
     fn get_connections(&self) -> zbus::Result<Vec<(String, String, String, u64)>>;
 
     fn disconnect_client(&self, client_id: &str, reason: &str) -> zbus::Result<bool>;
+
+    // Signals emitted by the server
+    #[zbus(signal)]
+    fn server_state_changed(
+        &self,
+        old_status: &str,
+        new_status: &str,
+        message: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn performance_updated(
+        &self,
+        fps: u32,
+        latency_ms: f32,
+        queue_depth: u32,
+        encoder_backend: &str,
+        activity_level: &str,
+        current_qp: u32,
+        adaptation_enabled: bool,
+        damage_source: &str,
+        sensor_count: u32,
+        bitrate_kbps: u32,
+        health_video: &str,
+        health_input: &str,
+        health_clipboard: &str,
+        health_session: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn client_connected(
+        &self,
+        client_id: &str,
+        peer_address: &str,
+        timestamp: u64,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn client_disconnected(
+        &self,
+        client_id: &str,
+        reason: &str,
+        duration_seconds: u64,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn config_reloaded(&self, config_path: &str) -> zbus::Result<()>;
 }
 
 /// D-Bus client for managing the server
@@ -74,15 +121,17 @@ impl DbusClient {
     /// Try to connect to an existing D-Bus server
     ///
     /// Returns None if no server is available on the bus.
+    /// First checks GetNameOwner (which does NOT trigger bus activation),
+    /// then creates the proxy only if someone already owns the name.
     pub async fn try_connect() -> Option<Self> {
         let connection = Connection::session().await.ok()?;
 
+        // Check if anyone owns the well-known name without triggering activation
         let dbus_proxy = zbus::fdo::DBusProxy::new(&connection).await.ok()?;
-        let names = dbus_proxy.list_names().await.ok()?;
-
-        if !names.iter().any(|n| n.as_str() == SERVICE_NAME) {
-            return None;
-        }
+        dbus_proxy
+            .get_name_owner(SERVICE_NAME.try_into().expect("valid bus name"))
+            .await
+            .ok()?;
 
         let proxy = ManagerProxy::new(&connection).await.ok()?;
 
@@ -97,16 +146,16 @@ impl DbusClient {
     pub async fn connect() -> Result<Self, String> {
         let connection = Connection::session()
             .await
-            .map_err(|e| format!("Failed to connect to session bus: {}", e))?;
+            .map_err(|e| format!("Failed to connect to session bus: {e}"))?;
 
         let proxy = ManagerProxy::new(&connection)
             .await
-            .map_err(|e| format!("Failed to create proxy: {}", e))?;
+            .map_err(|e| format!("Failed to create proxy: {e}"))?;
 
         let _ = proxy
             .status()
             .await
-            .map_err(|e| format!("Service not responding: {}", e))?;
+            .map_err(|e| format!("Service not responding: {e}"))?;
 
         Ok(Self {
             connection,
@@ -124,14 +173,14 @@ impl DbusClient {
         self.proxy
             .version()
             .await
-            .map_err(|e| format!("Failed to get version: {}", e))
+            .map_err(|e| format!("Failed to get version: {e}"))
     }
 
     pub async fn status(&self) -> Result<String, String> {
         self.proxy
             .status()
             .await
-            .map_err(|e| format!("Failed to get status: {}", e))
+            .map_err(|e| format!("Failed to get status: {e}"))
     }
 
     pub async fn is_running(&self) -> bool {
@@ -142,14 +191,14 @@ impl DbusClient {
         self.proxy
             .listen_address()
             .await
-            .map_err(|e| format!("Failed to get address: {}", e))
+            .map_err(|e| format!("Failed to get address: {e}"))
     }
 
     pub async fn active_connections(&self) -> Result<u32, String> {
         self.proxy
             .active_connections()
             .await
-            .map_err(|e| format!("Failed to get connections: {}", e))
+            .map_err(|e| format!("Failed to get connections: {e}"))
     }
 
     pub async fn uptime(&self) -> Result<Duration, String> {
@@ -157,7 +206,7 @@ impl DbusClient {
             .proxy
             .uptime()
             .await
-            .map_err(|e| format!("Failed to get uptime: {}", e))?;
+            .map_err(|e| format!("Failed to get uptime: {e}"))?;
         Ok(Duration::from_secs(secs))
     }
 
@@ -165,7 +214,7 @@ impl DbusClient {
         self.proxy
             .get_config()
             .await
-            .map_err(|e| format!("Failed to get config: {}", e))
+            .map_err(|e| format!("Failed to get config: {e}"))
     }
 
     /// Update the server configuration
@@ -174,7 +223,7 @@ impl DbusClient {
             .proxy
             .set_config(config)
             .await
-            .map_err(|e| format!("D-Bus call failed: {}", e))?;
+            .map_err(|e| format!("D-Bus call failed: {e}"))?;
 
         if success { Ok(()) } else { Err(error) }
     }
@@ -185,7 +234,7 @@ impl DbusClient {
             .proxy
             .reload_config()
             .await
-            .map_err(|e| format!("D-Bus call failed: {}", e))?;
+            .map_err(|e| format!("D-Bus call failed: {e}"))?;
 
         if success { Ok(()) } else { Err(error) }
     }
@@ -196,7 +245,7 @@ impl DbusClient {
             .proxy
             .get_statistics()
             .await
-            .map_err(|e| format!("Failed to get statistics: {}", e))?;
+            .map_err(|e| format!("Failed to get statistics: {e}"))?;
 
         Ok(ServerStats {
             frames_encoded: extract_u64(&stats, "frames_encoded"),
@@ -213,7 +262,7 @@ impl DbusClient {
             .proxy
             .get_connections()
             .await
-            .map_err(|e| format!("Failed to get connections: {}", e))?;
+            .map_err(|e| format!("Failed to get connections: {e}"))?;
 
         Ok(conns
             .into_iter()
@@ -231,7 +280,7 @@ impl DbusClient {
         self.proxy
             .disconnect_client(client_id, reason)
             .await
-            .map_err(|e| format!("Failed to disconnect client: {}", e))
+            .map_err(|e| format!("Failed to disconnect client: {e}"))
     }
 
     /// Get service registry (all services with levels)
@@ -240,7 +289,7 @@ impl DbusClient {
             .proxy
             .get_service_registry()
             .await
-            .map_err(|e| format!("Failed to get service registry: {}", e))?;
+            .map_err(|e| format!("Failed to get service registry: {e}"))?;
 
         Ok(services
             .into_iter()
@@ -252,16 +301,29 @@ impl DbusClient {
             .collect())
     }
 
-    /// Check if D-Bus service is available
+    /// Check if D-Bus service is currently active (name owned on the bus).
+    ///
+    /// Uses GetNameOwner which does NOT trigger bus activation - it only
+    /// checks if someone has already claimed the well-known name.
     pub async fn is_service_available() -> bool {
-        if let Ok(connection) = Connection::session().await {
-            if let Ok(dbus_proxy) = zbus::fdo::DBusProxy::new(&connection).await {
-                if let Ok(names) = dbus_proxy.list_names().await {
-                    return names.iter().any(|n| n.as_str() == SERVICE_NAME);
-                }
-            }
-        }
-        false
+        let Ok(connection) = Connection::session().await else {
+            return false;
+        };
+        let Ok(dbus_proxy) = zbus::fdo::DBusProxy::new(&connection).await else {
+            return false;
+        };
+        // GetNameOwner returns the unique name of the owner, or an error if
+        // no one owns it. Unlike method calls to the service name, this does
+        // NOT trigger bus activation.
+        dbus_proxy
+            .get_name_owner(SERVICE_NAME.try_into().expect("valid bus name"))
+            .await
+            .is_ok()
+    }
+
+    /// Clone the underlying proxy for use in signal subscriptions
+    pub(crate) fn clone_proxy(&self) -> ManagerProxy<'static> {
+        self.proxy.clone()
     }
 
     /// Send a synthetic log message (for GUI display)

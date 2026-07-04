@@ -102,6 +102,10 @@ pub struct Args {
     ///   lamco-rdp-server --generate-config > config.toml
     #[arg(long)]
     pub generate_config: bool,
+
+    /// Print third-party license notices (including Cisco OpenH264) and exit
+    #[arg(long)]
+    pub licenses: bool,
 }
 
 #[tokio::main]
@@ -126,6 +130,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Print third-party license notices and exit
+    if args.licenses {
+        print!("{}", lamco_rdp_server::third_party::notices());
+        return Ok(());
+    }
+
     // Resolve config path: CLI flag, then Flatpak-aware default, then /etc fallback
     let config_path = args.config.clone().unwrap_or_else(|| {
         let dir = lamco_rdp_server::config::get_cert_config_dir();
@@ -138,11 +148,22 @@ async fn main() -> Result<()> {
     });
 
     // Load configuration first (needed for logging settings).
-    // Figment merges defaults -> TOML file -> env vars, so a missing file
-    // just means all values come from defaults (no error, just a warning).
-    let config = Config::load(&config_path).unwrap_or_else(|e| {
-        eprintln!("WARNING: Config load failed, using defaults: {e:#}");
-        Config::default()
+    //
+    // `Config::load` returns Ok with all-defaults when the file does not
+    // exist (cheap path for users who haven't created a config yet). It
+    // only returns Err when the file IS present but has a parse/schema
+    // error — silently falling back to defaults there is dangerous: it
+    // masks user mistakes (a typo in `[security]` would discard every
+    // value the user wrote without any visible error). So treat Err as
+    // fatal and surface the real error.
+    let mut config = Config::load(&config_path).unwrap_or_else(|e| {
+        eprintln!("ERROR: Failed to load config from '{config_path}': {e:#}");
+        eprintln!();
+        eprintln!("The file exists but its contents could not be parsed against the config schema.");
+        eprintln!("Common causes: missing required fields, wrong types, deprecated keys.");
+        eprintln!("Run `lamco-rdp-server --generate-config > /tmp/config.toml` to print a working default,");
+        eprintln!("then diff against your file. Or pass --config /path/to/working-config.toml.");
+        std::process::exit(1);
     });
 
     // Machine-readable output modes: skip logging banner to keep stdout clean
@@ -194,7 +215,20 @@ async fn main() -> Result<()> {
         return grant_permission_flow().await;
     }
 
+    // Ensure TLS certificate material exists (self-generating a self-signed
+    // pair if missing). Runs here — after logging is initialized so the
+    // self-heal is visible in the log, and after the read-only subcommands
+    // above have returned so a capability probe never generates certs.
+    config.ensure_tls_material()?;
+
     lamco_rdp_server::runtime::log_startup_diagnostics();
+
+    // Initialize capability system (GPU, encoding, input, etc.)
+    // Used by the display handler for buffer transform decisions and
+    // by the D-Bus interface for capability queries.
+    if let Err(e) = lamco_rdp_server::capabilities::Capabilities::initialize().await {
+        warn!("Capability probing failed: {e} — proceeding with defaults");
+    }
 
     // Apply CLI overrides to config (config already loaded above for logging)
     let config = config.with_overrides(args.listen.clone(), args.port);
@@ -254,9 +288,33 @@ async fn main() -> Result<()> {
             dbus_state,
         );
         info!("D-Bus signal relay started");
+
+        // Wire health monitoring sources into D-Bus manager
+        if let Some(health_sub) = server.health_subscriber()
+            && let Err(e) = lamco_rdp_server::dbus::wire_health_sources(
+                dbus_conn,
+                server.snapshot_collector(),
+                health_sub,
+            )
+            .await
+        {
+            tracing::warn!("Failed to wire health sources to D-Bus: {e}");
+        }
     }
 
     info!("Starting server");
+
+    // Publish PID file so the GUI (and any other supervisor) can detect us
+    // even when we were launched outside the GUI's process tree (systemd,
+    // SSH+nohup, etc.). Without this the GUI's check_pid_file() returns
+    // None and the GUI shows "Start Server" while a server is already
+    // listening. Best-effort: a failure here logs but doesn't abort startup.
+    let pid_path = lamco_rdp_server::runtime::pidfile::path();
+    if let Err(e) = lamco_rdp_server::runtime::pidfile::write(&pid_path) {
+        warn!("PID file write failed at {:?}: {e:#}", pid_path);
+    } else {
+        info!("PID file written: {:?}", pid_path);
+    }
 
     // Get shutdown channels BEFORE run() consumes the server.
     // Quit event closes the active RDP connection gracefully (TLS CloseNotify).
@@ -301,7 +359,15 @@ async fn main() -> Result<()> {
         }
     });
 
-    if let Err(e) = server.run().await {
+    let run_result = server.run().await;
+
+    // Remove the PID file regardless of how the server exited (graceful or
+    // error). A stale PID file is mostly harmless — the GUI's
+    // check_pid_file() does kill(pid, 0) liveness verification — but we
+    // clean up on the happy path to avoid noise.
+    lamco_rdp_server::runtime::pidfile::remove(&pid_path);
+
+    if let Err(e) = run_result {
         error!("Server exited with error: {e:#}");
         eprintln!("{}", lamco_rdp_server::runtime::format_user_error(&e));
         return Err(e);
@@ -753,9 +819,17 @@ fn init_logging(
         tracing_subscriber::EnvFilter::new(format!(
             "lamco={log_level},lamco_portal={log_level},lamco_rdp={log_level},lamco_video={log_level},\
              ironrdp_cliprdr={log_level},ironrdp_egfx={log_level},ironrdp_dvc={log_level},ironrdp_server={log_level},\
-             ironrdp=info,ashpd={log_level},zbus=info,warn"
+             ironrdp=info,xdg_desktop_portal_generic={log_level},ashpd={log_level},zbus=info,warn"
         ))
     });
+
+    // Failures below happen before the tracing subscriber is initialized (it's
+    // initialized further down using log_file, computed here), so tracing::warn!
+    // would be silently dropped if called inline. eprintln! keeps the failure
+    // visible immediately on stderr; the same text is replayed through tracing
+    // once the subscriber is live so it reaches the GUI's log panel with correct
+    // WARN classification instead of being swallowed as unlabeled stderr text.
+    let mut deferred_warnings: Vec<String> = Vec::new();
 
     // CLI --log-file overrides config.log_dir.
     // In Flatpak, always log to the sandbox data directory even if log_dir isn't
@@ -774,10 +848,9 @@ fn init_logging(
 
         if let Some(log_dir) = resolved {
             if let Err(e) = fs::create_dir_all(&log_dir) {
-                eprintln!(
-                    "Warning: Cannot create log directory {}: {e}",
-                    log_dir.display()
-                );
+                let msg = format!("Cannot create log directory {}: {e}", log_dir.display());
+                eprintln!("Warning: {msg}");
+                deferred_warnings.push(msg);
                 None
             } else {
                 let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
@@ -800,9 +873,9 @@ fn init_logging(
         .and_then(|path| match File::create(path) {
             Ok(f) => Some((f, path.clone())),
             Err(e) => {
-                eprintln!(
-                    "Warning: Cannot create log file {path:?}: {e} — logging to console only"
-                );
+                let msg = format!("Cannot create log file {path:?}: {e} — logging to console only");
+                eprintln!("Warning: {msg}");
+                deferred_warnings.push(msg);
                 None
             }
         });
@@ -879,6 +952,12 @@ fn init_logging(
                     .init();
             }
         }
+    }
+
+    // Replay pre-init failures now that the subscriber is live, so they carry
+    // correct WARN severity instead of being indistinguishable stderr text.
+    for msg in deferred_warnings {
+        warn!("{msg}");
     }
 
     Ok(())

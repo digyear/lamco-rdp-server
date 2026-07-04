@@ -182,6 +182,24 @@ pub async fn start_service(
     Ok(connection)
 }
 
+/// Wire health monitoring sources into the D-Bus manager after session setup.
+///
+/// Call this after the session is established and health infrastructure is ready.
+/// The D-Bus manager then exposes real subsystem health via `get_health()`.
+pub async fn wire_health_sources(
+    connection: &Connection,
+    snapshot_collector: Arc<crate::health::snapshot_collector::SnapshotCollector>,
+    health_subscriber: crate::health::HealthSubscriber,
+) -> Result<(), zbus::Error> {
+    let iface_ref: zbus::object_server::InterfaceRef<RdpServerManager> =
+        connection.object_server().interface(OBJECT_PATH).await?;
+    let manager = iface_ref.get().await;
+    manager.set_snapshot_collector(snapshot_collector).await;
+    manager.set_health_subscriber(health_subscriber).await;
+    tracing::info!("D-Bus manager wired with health monitoring sources");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

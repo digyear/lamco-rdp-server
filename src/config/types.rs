@@ -24,16 +24,23 @@ pub struct ServerConfig {
     /// RDP clients can see the desktop but cannot control it.
     #[serde(default)]
     pub view_only: bool,
+
+    /// Per-transport configuration. Back-compat: if absent, a default-enabled
+    /// TCP transport is synthesized from `listen_addr`. See
+    /// `crate::transport::TransportsConfig`.
+    #[serde(default)]
+    pub transports: crate::transport::TransportsConfig,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:3389".to_string(),
+            listen_addr: "[::]:3389".to_string(),
             max_connections: 10,
             session_timeout: 0,
             use_portals: true,
             view_only: false,
+            transports: crate::transport::TransportsConfig::default(),
         }
     }
 }
@@ -64,6 +71,24 @@ pub struct SecurityConfig {
 
     /// Require TLS 1.3 or higher
     pub require_tls_13: bool,
+
+    /// CredSSP credentials, pre-set for the NTLM challenge-response.
+    ///
+    /// IronRDP's acceptor requires a known username/password to drive the
+    /// CredSSP NTLM exchange (the server must compute the challenge against
+    /// the password). Set this when running security_mode="hybrid" without
+    /// PAM. Leave None for tls-only operation.
+    #[serde(default)]
+    pub credssp_credentials: Option<CredsspCredentials>,
+}
+
+/// Pre-loaded credentials used by IronRDP's CredSSP/NTLM acceptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredsspCredentials {
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 fn default_security_mode() -> String {
@@ -79,6 +104,7 @@ impl Default for SecurityConfig {
             security_mode: "auto".to_string(),
             auth_method: "none".to_string(),
             require_tls_13: false,
+            credssp_credentials: None,
         }
     }
 }
@@ -298,6 +324,27 @@ pub struct ClipboardConfig {
     /// Default: None (automatic selection based on environment)
     #[serde(default)]
     pub strategy_override: Option<String>,
+
+    /// File transfer mode: "auto", "fuse", "staging", "portal"
+    ///
+    /// Controls how clipboard files from Windows are materialized on Linux:
+    /// - "auto" (default): FUSE in native mode, staging in Flatpak
+    /// - "fuse": Force FUSE virtual filesystem (on-demand fetch, native only)
+    /// - "staging": Force staging download (download all upfront, universal)
+    /// - "portal": Portal FileTransfer (not yet implemented)
+    ///
+    /// Default: None (auto-detect)
+    #[serde(default)]
+    pub file_transfer_mode: Option<String>,
+
+    /// Download directory for staging file transfer.
+    ///
+    /// Files downloaded from the RDP clipboard are placed here. Only used when
+    /// the file transfer mode is "staging" (or auto-selects staging).
+    ///
+    /// Default: ~/Downloads
+    #[serde(default)]
+    pub file_transfer_download_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ClipboardConfig {
@@ -311,6 +358,8 @@ impl Default for ClipboardConfig {
             allow_fallback: true,
             kde_syncselection_hint: false,
             strategy_override: None,
+            file_transfer_mode: None,
+            file_transfer_download_dir: None,
         }
     }
 }
@@ -656,7 +705,14 @@ impl Default for CursorPredictorConfig {
 }
 
 /// Logging configuration
+///
+/// `#[serde(default)]` at the struct level means partial `[logging]` sections
+/// in user configs are tolerated: any field a user omits falls back to the
+/// `Default::default()` value below. This matches the rest of the Config
+/// schema where top-level sections are optional and missing fields don't
+/// invalidate the file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoggingConfig {
     /// Log level ("trace", "debug", "info", "warn", "error")
     pub level: String,
@@ -893,6 +949,10 @@ pub struct EgfxConfig {
     #[serde(default = "default_aux_threshold")]
     pub avc444_aux_change_threshold: f32,
 
+    /// Encoding adaptation: closed-loop QP adjustment from client feedback
+    #[serde(default)]
+    pub encoding_adaptation: crate::performance::EncodingAdaptationConfig,
+
     /// Force auxiliary IDR when reintroducing after omission
     /// true: Safe mode, but with single encoder forces Main to IDR too!
     /// false: Required for single encoder to allow Main P-frames (PRODUCTION)
@@ -957,6 +1017,7 @@ impl Default for EgfxConfig {
             avc444_max_aux_interval: 30,      // 1 second @ 30fps
             avc444_aux_change_threshold: 0.05, // 5% pixels changed
             avc444_force_aux_idr_on_return: false, // Must be false for single encoder
+            encoding_adaptation: crate::performance::EncodingAdaptationConfig::default(),
         }
     }
 }
@@ -1091,8 +1152,9 @@ impl Default for DamageTrackingConfig {
 /// Hardware encoding configuration
 ///
 /// Supports multiple GPU backends:
-/// - VA-API: Intel (iHD/i965) and AMD (radeonsi) GPUs
+/// - Vulkan Video: cross-vendor (NVIDIA, Intel, AMD) via VK_KHR_video_encode_h264
 /// - NVENC: NVIDIA GPUs via Video Codec SDK
+/// - VA-API: Intel (iHD/i965) and AMD (radeonsi) GPUs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareEncodingConfig {
     /// Enable hardware-accelerated encoding
@@ -1101,7 +1163,7 @@ pub struct HardwareEncodingConfig {
     /// VA-API device path (for Intel/AMD GPUs)
     pub vaapi_device: PathBuf,
 
-    /// Enable zero-copy DMA-BUF path (VA-API only)
+    /// Enable zero-copy DMA-BUF path when hardware encoder supports it
     pub enable_dmabuf_zerocopy: bool,
 
     /// Fallback to software encoding if hardware fails
@@ -1115,12 +1177,36 @@ pub struct HardwareEncodingConfig {
 
     /// Prefer NVENC over VA-API when both are available
     /// NVENC typically has lower latency but requires NVIDIA GPU
+    /// Ignored when backend_priority is set.
     #[serde(default = "default_prefer_nvenc")]
     pub prefer_nvenc: bool,
+
+    /// Backend priority order. First available backend wins.
+    /// Valid values: "vulkan-video", "nvenc", "vaapi"
+    /// When empty or absent, uses default: vulkan-video > nvenc > vaapi.
+    #[serde(default = "default_backend_priority")]
+    pub backend_priority: Vec<String>,
+
+    /// Vulkan device selection: "auto" (default), "discrete", "integrated",
+    /// or a substring of the device name (e.g. "RTX 4060")
+    #[serde(default = "default_vulkan_device")]
+    pub vulkan_device: String,
 }
 
 fn default_prefer_nvenc() -> bool {
-    true // NVENC preferred when available (lower latency)
+    true
+}
+
+fn default_backend_priority() -> Vec<String> {
+    vec![
+        "vulkan-video".to_string(),
+        "nvenc".to_string(),
+        "vaapi".to_string(),
+    ]
+}
+
+fn default_vulkan_device() -> String {
+    "auto".to_string()
 }
 
 impl Default for HardwareEncodingConfig {
@@ -1132,6 +1218,8 @@ impl Default for HardwareEncodingConfig {
             fallback_to_software: true,
             quality_preset: "balanced".to_string(),
             prefer_nvenc: true,
+            backend_priority: default_backend_priority(),
+            vulkan_device: default_vulkan_device(),
         }
     }
 }
@@ -1148,8 +1236,22 @@ pub struct DisplayConfig {
     /// DPI scaling support
     pub dpi_aware: bool,
 
-    /// Allow orientation changes
-    pub allow_rotation: bool,
+    /// Buffer transform handling.
+    ///
+    /// Controls how PipeWire buffer orientation metadata (SPA_META_VideoTransform)
+    /// is applied before encoding.
+    ///
+    /// Values:
+    /// - `"auto"` (default): Read transform from PipeWire metadata, apply if non-zero
+    /// - `"none"`: Force no transform (ignore PipeWire metadata)
+    /// - `"90"`, `"180"`, `"270"`: Force specific rotation
+    /// - `"flipped"`, `"flipped-90"`, `"flipped-180"`, `"flipped-270"`: Force flip+rotation
+    #[serde(default = "default_frame_transform")]
+    pub frame_transform: String,
+}
+
+fn default_frame_transform() -> String {
+    "auto".to_string()
 }
 
 impl Default for DisplayConfig {
@@ -1158,7 +1260,7 @@ impl Default for DisplayConfig {
             allow_resize: true,
             allowed_resolutions: vec![],
             dpi_aware: false,
-            allow_rotation: false,
+            frame_transform: default_frame_transform(),
         }
     }
 }
@@ -1293,6 +1395,10 @@ pub struct GuiStateConfig {
     pub cursor_expanded: bool,
     #[serde(default)]
     pub cursor_predictor_expanded: bool,
+    #[serde(default)]
+    pub multimon_expanded: bool,
+    #[serde(default)]
+    pub logging_expanded: bool,
 
     /// Log viewer preferences
     #[serde(default = "default_true")]
@@ -1329,6 +1435,71 @@ impl Default for NotificationConfig {
     }
 }
 
+/// Monitoring and metrics exposure configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    /// Enable performance snapshot collection
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Interval for periodic performance snapshots (seconds).
+    /// Controls D-Bus PerformanceUpdated signal frequency.
+    #[serde(default = "default_snapshot_interval")]
+    pub snapshot_interval_secs: u32,
+
+    /// Bind address for the HTTP metrics server (Prometheus + /health).
+    /// Only used when the `metrics-server` feature is enabled.
+    #[serde(default = "default_metrics_bind")]
+    pub metrics_bind: String,
+}
+
+fn default_snapshot_interval() -> u32 {
+    5
+}
+
+fn default_metrics_bind() -> String {
+    "127.0.0.1:9100".to_string()
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            snapshot_interval_secs: default_snapshot_interval(),
+            metrics_bind: default_metrics_bind(),
+        }
+    }
+}
+
+// =============================================================================
+// Encoder diagnostics (Option A always-on; B and D opt-in here)
+// =============================================================================
+
+/// Encoder diagnostics — off by default. Opt-in for debugging encoder output.
+///
+/// `dump_h264_to`: when set, every encoded frame's raw Annex B bytes are
+/// appended to this file. The result is a valid H.264 elementary stream that
+/// can be analyzed offline with `ffmpeg -i <file> -f null -` or `ffprobe`.
+/// One file per server start; rotate manually if it grows large.
+///
+/// `decode_self_test`: when true, every encoded frame is also decoded by an
+/// in-process OpenH264 decoder. Decoder rejection emits a WARN with bytes
+/// length and frame label. Confirms that the encoder produced parseable
+/// H.264 independent of any RDP client's decoder.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DiagnosticsConfig {
+    /// Path to a file that will receive raw Annex B H.264 bytes for every
+    /// encoded frame (Main stream for AVC444, single stream for AVC420).
+    /// `None` disables. Parent directory must exist.
+    #[serde(default)]
+    pub dump_h264_to: Option<std::path::PathBuf>,
+
+    /// Pass every encoded frame through an in-process OpenH264 decoder.
+    /// `false` disables. Cost: one extra decode per encode.
+    #[serde(default)]
+    pub decode_self_test: bool,
+}
+
 fn default_log_filter() -> String {
     "info".to_string()
 }
@@ -1347,6 +1518,8 @@ impl Default for GuiStateConfig {
             advanced_video_expanded: false,
             cursor_expanded: true,
             cursor_predictor_expanded: false,
+            multimon_expanded: false,
+            logging_expanded: false,
             log_auto_scroll: true,
             log_filter_level: "info".to_string(),
             close_stops_server: true,

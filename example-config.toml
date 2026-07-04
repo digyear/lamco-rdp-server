@@ -7,6 +7,9 @@
 #
 # Or specify with --config flag
 
+# Configuration format version (for future migration support)
+# config_version = 1
+
 # =============================================================================
 # Server Settings
 # =============================================================================
@@ -52,6 +55,18 @@ auth_method = "none"
 
 # Require TLS 1.3 (more secure but may have compatibility issues)
 require_tls_13 = false
+
+# Pre-loaded CredSSP credentials (required for security_mode = "hybrid" without
+# PAM). IronRDP's acceptor needs to know the expected password to run the NTLM
+# challenge-response; without it the server errors out with
+# "no credentials while doing credssp" and clients see an EOF mid-handshake.
+#
+# Leave this section out for tls-only operation.
+#
+# [security.credssp_credentials]
+# username = "your-user"
+# password = "your-password"
+# domain = ""  # optional
 
 # =============================================================================
 # Video Configuration
@@ -139,6 +154,16 @@ allowed_types = []
 protocol = "auto"
 # Allow fallback to alternative clipboard protocol if preferred is unavailable
 allow_fallback = true
+
+# File transfer mode: "auto", "fuse", "staging", "portal"
+# - "auto": FUSE in native mode, staging in Flatpak
+# - "fuse": Force FUSE virtual filesystem (on-demand fetch, native only)
+# - "staging": Force staging download (download all upfront, universal)
+# file_transfer_mode = "auto"
+# Download directory for staging file transfer
+# file_transfer_download_dir = "~/Downloads"
+# Strategy override (for development/testing): "portal", "mutter", "data_control", "wl_clipboard"
+# strategy_override = ""
 
 # [EXPERIMENTAL] Include x-kde-syncselection hint for Klipper
 # When enabled on KDE Plasma, adds "application/x-kde-syncselection" to clipboard
@@ -244,6 +269,27 @@ avc444_enable_aux_omission = true
 avc444_max_aux_interval = 5
 avc444_aux_change_threshold = 0.01
 avc444_force_aux_idr_on_return = true
+
+# Encoding adaptation: closed-loop QP adjustment from EGFX client feedback.
+# When enabled, the server dynamically adjusts H.264 quality (QP) based on
+# client decode queue depth. This prevents overwhelming slow clients while
+# maximizing quality for fast clients.
+[egfx.encoding_adaptation]
+# Enable adaptive QP (disabled by default — opt-in after validation)
+enabled = false
+# Base QP value (used when queue is normal, replaces hardcoded default)
+base_qp = 22
+# Minimum QP (highest quality)
+min_qp = 18
+# Maximum QP (lowest quality, used under severe backpressure)
+max_qp = 42
+# Minimum interval between adaptation evaluations (ms)
+# Prevents rapid oscillation — lower values are more responsive but riskier
+evaluation_interval_ms = 500
+# Queue depth threshold for moderate backpressure (QP +4)
+moderate_queue_threshold = 3
+# Queue depth threshold for severe backpressure (QP +10)
+severe_queue_threshold = 6
 
 # =============================================================================
 # Damage Tracking Configuration
@@ -356,6 +402,27 @@ buffer_pool_size = 8
 enable_simd = true
 damage_threshold = 0.01
 enable_statistics = true
+
+# =============================================================================
+# Notification Configuration (Flatpak portal notifications)
+# =============================================================================
+[notifications]
+# Notify on server errors
+on_error = true
+# Notify on TLS certificate expiry warnings
+on_cert_expiry = true
+
+# =============================================================================
+# Monitoring and Metrics Configuration
+# =============================================================================
+[monitoring]
+# Enable performance snapshot collection and D-Bus PerformanceUpdated signals
+enabled = true
+# Interval for periodic performance snapshots to D-Bus subscribers (seconds)
+snapshot_interval_secs = 5
+# HTTP metrics server bind address (Prometheus + /health endpoint)
+# Only active when the metrics-server feature is enabled
+metrics_bind = "127.0.0.1:9100"
 
 # =============================================================================
 # GUI State (Persisted between sessions)

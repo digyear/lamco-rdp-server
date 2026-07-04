@@ -52,6 +52,33 @@ pub enum ServerEvent {
 
     /// Session type determined (emitted once during initialization)
     SessionTypeChanged { session_type: String },
+
+    /// Periodic performance metrics update (from SnapshotCollector)
+    PerformanceUpdated {
+        fps: u32,
+        latency_ms: f32,
+        queue_depth: u32,
+        encoder_backend: String,
+        activity_level: String,
+        /// Encoding adaptation: current QP (0 = adaptation not active)
+        current_qp: u32,
+        /// Encoding adaptation: whether adaptive QP is enabled
+        adaptation_enabled: bool,
+        /// Damage source: "compositor", "pixel-diff", or "full-frame"
+        damage_source: String,
+        /// Number of registered health sensors
+        sensor_count: u32,
+        /// Current bitrate in kbps (from encoder)
+        bitrate_kbps: u32,
+        /// Per-subsystem health: video
+        health_video: String,
+        /// Per-subsystem health: input
+        health_input: String,
+        /// Per-subsystem health: clipboard
+        health_clipboard: String,
+        /// Per-subsystem health: session
+        health_session: String,
+    },
 }
 
 /// Create an event channel for server events.
@@ -165,6 +192,45 @@ pub fn start_signal_relay(
                         warn!("Failed to emit health state_changed signal: {e}");
                     }
                 }
+
+                ServerEvent::PerformanceUpdated {
+                    fps,
+                    latency_ms,
+                    queue_depth,
+                    encoder_backend,
+                    activity_level,
+                    current_qp,
+                    adaptation_enabled,
+                    damage_source,
+                    sensor_count,
+                    bitrate_kbps,
+                    health_video,
+                    health_input,
+                    health_clipboard,
+                    health_session,
+                } => {
+                    if let Err(e) = emit_performance_updated(
+                        &connection,
+                        *fps,
+                        *latency_ms,
+                        *queue_depth,
+                        encoder_backend,
+                        activity_level,
+                        *current_qp,
+                        *adaptation_enabled,
+                        damage_source,
+                        *sensor_count,
+                        *bitrate_kbps,
+                        health_video,
+                        health_input,
+                        health_clipboard,
+                        health_session,
+                    )
+                    .await
+                    {
+                        debug!("Failed to emit performance_updated signal: {e}");
+                    }
+                }
             }
         }
 
@@ -216,6 +282,50 @@ async fn emit_client_disconnected(
         client_id,
         reason,
         duration_seconds,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors D-Bus signal parameter list"
+)]
+async fn emit_performance_updated(
+    connection: &zbus::Connection,
+    fps: u32,
+    latency_ms: f32,
+    queue_depth: u32,
+    encoder_backend: &str,
+    activity_level: &str,
+    current_qp: u32,
+    adaptation_enabled: bool,
+    damage_source: &str,
+    sensor_count: u32,
+    bitrate_kbps: u32,
+    health_video: &str,
+    health_input: &str,
+    health_clipboard: &str,
+    health_session: &str,
+) -> Result<(), zbus::Error> {
+    let iface_ref: InterfaceRef<RdpServerManager> =
+        connection.object_server().interface(OBJECT_PATH).await?;
+
+    RdpServerManager::performance_updated(
+        iface_ref.signal_emitter(),
+        fps,
+        latency_ms,
+        queue_depth,
+        encoder_backend,
+        activity_level,
+        current_qp,
+        adaptation_enabled,
+        damage_source,
+        sensor_count,
+        bitrate_kbps,
+        health_video,
+        health_input,
+        health_clipboard,
+        health_session,
     )
     .await
 }

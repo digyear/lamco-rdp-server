@@ -20,7 +20,7 @@
 
 use ironrdp_rdpsnd::{
     pdu::{AudioFormat, WaveFormat},
-    server::{RdpsndServerHandler, RdpsndServerMessage},
+    server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler, RdpsndServerMessage},
 };
 use ironrdp_server::ServerEvent;
 use tokio::sync::mpsc;
@@ -59,7 +59,7 @@ impl FormatSpec {
 pub struct PipeWireAudioHandler {
     audio_config: AudioConfig,
     formats: Vec<AudioFormat>,
-    selected_format: Option<u16>,
+    selected_format: Option<AudioFormat>,
     encoder: Option<AudioEncoder>,
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     node_id: Option<u32>,
@@ -273,36 +273,47 @@ impl RdpsndServerHandler for PipeWireAudioHandler {
         &self.formats
     }
 
-    fn start(&mut self, client_format: &ironrdp_rdpsnd::pdu::ClientAudioFormatPdu) -> Option<u16> {
+    fn choose_format<'a>(
+        &mut self,
+        common: &'a [NegotiatedFormat],
+    ) -> Option<&'a NegotiatedFormat> {
+        // `common` is already the intersection of get_formats() and what the
+        // client accepted, in our get_formats() preference order (the crate
+        // computes this via exact field equality -- see ironrdp-rdpsnd's
+        // audio_format_eq). This replaces the old client-side manual iteration
+        // + formats_compatible fuzzy-match (which specially tolerated any
+        // client-advertised rate/channels for OPUS): the new crate-owned
+        // negotiation has no such leniency, since the encoder is always built
+        // from our own advertised parameters regardless of what the client
+        // echoes back, and a compliant client echoes an offered entry
+        // verbatim rather than inventing new rate/channel combinations.
+        if common.is_empty() {
+            warn!("No compatible audio format found with client");
+        }
+        common.first()
+    }
+
+    fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        let audio_format = format.format();
         info!(
-            "Client audio format negotiation: {} formats, flags={:?}",
-            client_format.formats.len(),
-            client_format.flags
+            "Selected audio format: {:?} ({}Hz, {} channels)",
+            audio_format.format, audio_format.n_samples_per_sec, audio_format.n_channels
         );
 
-        // Iterate our formats in priority order to find first mutual match
-        for (our_idx, our_fmt) in self.formats.iter().enumerate() {
-            for client_fmt in &client_format.formats {
-                if formats_compatible(our_fmt, client_fmt) {
-                    info!(
-                        "Selected audio format: {:?} ({}Hz, {} channels)",
-                        our_fmt.format, our_fmt.n_samples_per_sec, our_fmt.n_channels
-                    );
-
-                    if let Some(encoder) = self.create_encoder(our_fmt) {
-                        self.selected_format = Some(our_idx as u16);
-                        debug!("Audio encoder created: {}", encoder.name());
-                        self.encoder = Some(encoder);
-                        self.active = true;
-
-                        return Some(our_idx as u16);
-                    }
-                }
+        match self.create_encoder(audio_format) {
+            Some(encoder) => {
+                debug!("Audio encoder created: {}", encoder.name());
+                self.selected_format = Some(audio_format.clone());
+                self.encoder = Some(encoder);
+                self.active = true;
+                Ok(())
             }
+            // create_encoder already logs the specific failure (unsupported
+            // format tag, or the underlying codec constructor's error).
+            None => Err(Box::new(std::io::Error::other(
+                "audio encoder creation failed, see prior log for detail",
+            ))),
         }
-
-        warn!("No compatible audio format found with client");
-        None
     }
 
     fn stop(&mut self) {
@@ -315,22 +326,6 @@ impl RdpsndServerHandler for PipeWireAudioHandler {
         self.active = false;
         self.selected_format = None;
         self.encoder = None;
-    }
-}
-
-fn formats_compatible(server: &AudioFormat, client: &AudioFormat) -> bool {
-    if server.format != client.format {
-        return false;
-    }
-
-    match server.format {
-        // OPUS is flexible on rate/channels during negotiation
-        WaveFormat::OPUS => true,
-        _ => {
-            server.n_channels == client.n_channels
-                && server.n_samples_per_sec == client.n_samples_per_sec
-                && server.bits_per_sample == client.bits_per_sample
-        }
     }
 }
 
@@ -385,54 +380,6 @@ mod tests {
         assert!(!handler.is_active());
         assert!(!handler.can_send_audio());
         assert_eq!(handler.node_id(), Some(42));
-    }
-
-    #[test]
-    fn test_format_compatibility() {
-        let opus1 = AudioFormat {
-            format: WaveFormat::OPUS,
-            n_channels: 2,
-            n_samples_per_sec: 48000,
-            n_avg_bytes_per_sec: 12000,
-            n_block_align: 4,
-            bits_per_sample: 16,
-            data: None,
-        };
-
-        let opus2 = AudioFormat {
-            format: WaveFormat::OPUS,
-            n_channels: 1,
-            n_samples_per_sec: 24000,
-            n_avg_bytes_per_sec: 6000,
-            n_block_align: 2,
-            bits_per_sample: 16,
-            data: None,
-        };
-
-        assert!(formats_compatible(&opus1, &opus2));
-
-        let pcm1 = AudioFormat {
-            format: WaveFormat::PCM,
-            n_channels: 2,
-            n_samples_per_sec: 48000,
-            n_avg_bytes_per_sec: 192000,
-            n_block_align: 4,
-            bits_per_sample: 16,
-            data: None,
-        };
-
-        let pcm2 = AudioFormat {
-            format: WaveFormat::PCM,
-            n_channels: 2,
-            n_samples_per_sec: 44100,
-            n_avg_bytes_per_sec: 176400,
-            n_block_align: 4,
-            bits_per_sample: 16,
-            data: None,
-        };
-
-        assert!(formats_compatible(&pcm1, &pcm1.clone()));
-        assert!(!formats_compatible(&pcm1, &pcm2));
     }
 
     #[test]

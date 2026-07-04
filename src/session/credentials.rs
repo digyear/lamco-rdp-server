@@ -274,8 +274,7 @@ fn check_systemd_creds_accessible() -> bool {
     Command::new("systemd-creds")
         .arg("--help")
         .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|out| out.status.success())
 }
 
 async fn detect_secret_service() -> Result<SecretServiceBackend> {

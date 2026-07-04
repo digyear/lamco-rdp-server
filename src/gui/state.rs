@@ -301,11 +301,58 @@ impl EditStrings {
     }
 
     fn parse_listen_addr(addr: &str) -> (String, String) {
-        let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
-        if parts.len() == 2 {
-            (parts[1].to_string(), parts[0].to_string())
+        if let Ok(sock_addr) = addr.parse::<std::net::SocketAddr>() {
+            match sock_addr {
+                std::net::SocketAddr::V4(v4) => (v4.ip().to_string(), v4.port().to_string()),
+                std::net::SocketAddr::V6(v6) => (format!("[{}]", v6.ip()), v6.port().to_string()),
+            }
         } else {
             (addr.to_string(), "3389".to_string())
+        }
+    }
+}
+
+/// Compose a `listen_addr` string from separate IP and port fields, bracketing
+/// IPv6 so the result is a valid `SocketAddr`. The dual-stack default `[::]` and
+/// bare IPv6 entry both round-trip; IPv4 and partial input are combined as-is so
+/// validation can surface a clear error.
+#[must_use]
+pub(crate) fn compose_listen_addr(ip: &str, port: &str) -> String {
+    let ip = ip.trim();
+    let port = port.trim();
+    let bare = ip
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(ip);
+    if bare.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{bare}]:{port}")
+    } else {
+        format!("{bare}:{port}")
+    }
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use std::net::SocketAddr;
+
+    use super::compose_listen_addr;
+
+    #[test]
+    fn compose_brackets_ipv6_and_round_trips() {
+        for (ip, port, expected) in [
+            ("[::]", "3389", "[::]:3389"), // dual-stack default (bracketed)
+            ("::", "3389", "[::]:3389"),   // bare IPv6 gets bracketed
+            ("2001:db8::1", "3390", "[2001:db8::1]:3390"),
+            ("[2001:db8::1]", "3390", "[2001:db8::1]:3390"),
+            ("0.0.0.0", "3389", "0.0.0.0:3389"), // IPv4 unchanged
+            ("127.0.0.1", "3389", "127.0.0.1:3389"),
+        ] {
+            let addr = compose_listen_addr(ip, port);
+            assert_eq!(addr, expected, "compose({ip:?}, {port:?})");
+            assert!(
+                addr.parse::<SocketAddr>().is_ok(),
+                "composed address must parse as SocketAddr: {addr}"
+            );
         }
     }
 }
@@ -366,6 +413,10 @@ pub struct AppState {
     // User messages (info/warning/error notifications)
     pub messages: Vec<UserMessage>,
 
+    // Whether a FileChooser portal is available (file-browse dialogs work).
+    // False on e.g. wlroots compositors that ship only portal-wlr (ScreenCast).
+    pub file_dialog_available: bool,
+
     // Dialog states
     pub confirm_discard_dialog: bool,
     pub pending_action: Option<PendingAction>,
@@ -376,6 +427,48 @@ pub struct AppState {
 
     // Close behavior: true = closing GUI stops server, false = GUI closes but server keeps running
     pub close_stops_server: bool,
+
+    // Live performance metrics (from D-Bus PerformanceUpdated signal)
+    pub live_metrics: Option<LiveMetrics>,
+
+    // Session health (from D-Bus ServerStateChanged signals with health prefixes)
+    pub session_health: Option<SessionHealth>,
+}
+
+/// Session health state from D-Bus signals
+#[derive(Debug, Clone)]
+pub struct SessionHealth {
+    /// "healthy", "degraded", or "invalid"
+    pub overall: String,
+    /// Detail message from the server_state_changed signal
+    pub detail: String,
+    /// Per-subsystem health states (from PerformanceUpdated signal)
+    pub video: String,
+    pub input: String,
+    pub clipboard: String,
+    pub session: String,
+    pub last_updated: std::time::Instant,
+}
+
+/// Live performance metrics from the server, updated periodically
+#[derive(Debug, Clone)]
+pub struct LiveMetrics {
+    pub fps: u32,
+    pub latency_ms: f32,
+    pub queue_depth: u32,
+    pub encoder_backend: String,
+    pub activity_level: String,
+    /// Encoding adaptation: current QP value (0 = not active)
+    pub current_qp: u32,
+    /// Whether encoding adaptation is enabled
+    pub adaptation_enabled: bool,
+    /// Damage detection source: "compositor", "pixel-diff", or ""
+    pub damage_source: String,
+    /// Number of registered health sensors
+    pub sensor_count: u32,
+    /// Current encoder bitrate in kbps
+    pub bitrate_kbps: u32,
+    pub last_updated: std::time::Instant,
 }
 
 impl AppState {
@@ -409,6 +502,8 @@ impl AppState {
             _ => LogLevel::Info,
         };
         let close_stops_server = gui_state.close_stops_server;
+        let multimon_expanded = gui_state.multimon_expanded;
+        let logging_expanded = gui_state.logging_expanded;
 
         Self {
             config,
@@ -433,19 +528,23 @@ impl AppState {
             cursor_expanded,
             cursor_predictor_expanded,
             egfx_expert_mode,
-            multimon_expanded: false,
-            logging_expanded: false,
+            multimon_expanded,
+            logging_expanded,
             cert_gen_dialog: None,
             log_buffer: Vec::new(),
             log_auto_scroll,
             log_filter_level,
             max_log_lines: 1000,
             messages: Vec::new(),
+            // Assume available until the startup probe reports otherwise.
+            file_dialog_available: true,
             confirm_discard_dialog: false,
             pending_action: None,
             first_run_cert_dialog: false,
             first_run_cert_generating: false,
             close_stops_server,
+            live_metrics: None,
+            session_health: None,
         }
     }
 
@@ -477,6 +576,8 @@ impl AppState {
         self.config.gui_state.advanced_video_expanded = self.advanced_video_expanded;
         self.config.gui_state.cursor_expanded = self.cursor_expanded;
         self.config.gui_state.cursor_predictor_expanded = self.cursor_predictor_expanded;
+        self.config.gui_state.multimon_expanded = self.multimon_expanded;
+        self.config.gui_state.logging_expanded = self.logging_expanded;
         self.config.gui_state.log_auto_scroll = self.log_auto_scroll;
         self.config.gui_state.log_filter_level = match self.log_filter_level {
             LogLevel::Trace => "trace".to_string(),
@@ -590,8 +691,9 @@ impl From<ValidationResult> for ValidationState {
 }
 
 /// Server status from IPC
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum ServerStatus {
+    #[default]
     Unknown,
     Stopped,
     Starting,
@@ -601,12 +703,6 @@ pub enum ServerStatus {
         address: String,
     },
     Error(String),
-}
-
-impl Default for ServerStatus {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl ServerStatus {
@@ -753,7 +849,7 @@ impl std::fmt::Display for DeploymentContext {
             DeploymentContext::Native => write!(f, "Native"),
             DeploymentContext::Flatpak => write!(f, "Flatpak"),
             DeploymentContext::SystemdUser { linger } => {
-                write!(f, "systemd-user (linger: {})", linger)
+                write!(f, "systemd-user (linger: {linger})")
             }
             DeploymentContext::SystemdSystem => write!(f, "systemd-system"),
             DeploymentContext::InitD => write!(f, "init.d"),

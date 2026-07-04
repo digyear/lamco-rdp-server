@@ -34,7 +34,9 @@
 //! ```
 
 mod adaptive_fps;
+pub mod encoding_adaptation;
 mod latency_governor;
 
 pub use adaptive_fps::{AdaptiveFpsConfig, AdaptiveFpsController, DamageRatio};
+pub use encoding_adaptation::{EncodingAdaptation, EncodingAdaptationConfig};
 pub use latency_governor::{EncodingDecision, LatencyGovernor, LatencyMode};

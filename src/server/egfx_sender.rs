@@ -36,7 +36,7 @@ use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
-use crate::{damage::DamageRegion, server::gfx_factory::HandlerState};
+use crate::{damage::DamageRegion, server::gfx_factory::SharedHandlerState};
 
 /// Result type for frame sending operations
 pub(super) type SendResult<T> = Result<T, SendError>;
@@ -48,6 +48,8 @@ pub enum SendError {
     NotReady,
     /// AVC420 codec not supported by client
     Avc420NotSupported,
+    /// AVC444 codec not supported by client (V10+ required)
+    Avc444NotSupported,
     /// No primary surface available
     NoSurface,
     /// Frame dropped due to backpressure
@@ -65,6 +67,7 @@ impl std::fmt::Display for SendError {
         match self {
             SendError::NotReady => write!(f, "EGFX channel not ready"),
             SendError::Avc420NotSupported => write!(f, "AVC420 not supported by client"),
+            SendError::Avc444NotSupported => write!(f, "AVC444 not supported by client"),
             SendError::NoSurface => write!(f, "No primary surface available"),
             SendError::Backpressure => write!(f, "Frame dropped due to backpressure"),
             SendError::ChannelClosed => write!(f, "Server event channel closed"),
@@ -112,19 +115,22 @@ pub struct EgfxFrameSender {
     gfx_server: GfxServerHandle,
 
     /// Handler state for checking readiness (codec support, surface availability)
-    handler_state: Arc<tokio::sync::RwLock<Option<HandlerState>>>,
+    handler_state: Arc<SharedHandlerState>,
 
     /// Channel for sending server events (unbounded for backpressure-free EGFX)
     event_tx: mpsc::UnboundedSender<ServerEvent>,
 
     /// Frame counter for debugging
     frame_count: std::sync::atomic::AtomicU64,
+
+    /// Current QP for encoding (set by EncodingAdaptation, default 22)
+    current_qp: std::sync::atomic::AtomicU32,
 }
 
 impl EgfxFrameSender {
     pub fn new(
         gfx_server: GfxServerHandle,
-        handler_state: Arc<tokio::sync::RwLock<Option<HandlerState>>>,
+        handler_state: Arc<SharedHandlerState>,
         event_tx: mpsc::UnboundedSender<ServerEvent>,
     ) -> Self {
         Self {
@@ -132,34 +138,43 @@ impl EgfxFrameSender {
             handler_state,
             event_tx,
             frame_count: std::sync::atomic::AtomicU64::new(0),
+            current_qp: std::sync::atomic::AtomicU32::new(22),
         }
+    }
+
+    /// Set the current QP for encoding (called by EncodingAdaptation)
+    pub fn set_qp(&self, qp: u32) {
+        self.current_qp
+            .store(qp, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get the current QP
+    fn qp(&self) -> u8 {
+        self.current_qp.load(std::sync::atomic::Ordering::Relaxed) as u8
     }
 
     /// Check if EGFX is ready and AVC420 is supported
-    pub async fn is_ready(&self) -> bool {
-        if let Some(state) = self.handler_state.read().await.as_ref() {
-            state.is_ready && state.is_avc420_enabled
-        } else {
-            false
-        }
+    pub fn is_ready(&self) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        self.handler_state.is_ready.load(Acquire)
+            && self.handler_state.client_supports_avc420.load(Acquire)
     }
 
     /// Check if only EGFX is ready (regardless of codec)
-    pub async fn is_egfx_ready(&self) -> bool {
-        if let Some(state) = self.handler_state.read().await.as_ref() {
-            state.is_ready
-        } else {
-            false
-        }
+    pub fn is_egfx_ready(&self) -> bool {
+        self.handler_state
+            .is_ready
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Get the primary surface ID
-    pub async fn primary_surface_id(&self) -> Option<u16> {
-        self.handler_state
-            .read()
-            .await
-            .as_ref()
-            .and_then(|state| state.primary_surface_id)
+    pub fn primary_surface_id(&self) -> Option<u16> {
+        use std::sync::atomic::Ordering::Acquire;
+        if self.handler_state.has_surface.load(Acquire) {
+            Some(self.handler_state.primary_surface_id.load(Acquire))
+        } else {
+            None
+        }
     }
 
     /// Send an H.264 encoded frame through EGFX
@@ -175,23 +190,21 @@ impl EgfxFrameSender {
         display_height: u16,
         timestamp_ms: u32,
     ) -> SendResult<u32> {
-        let state = self
-            .handler_state
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or(SendError::NotReady)?;
+        use std::sync::atomic::Ordering::Acquire;
 
-        if !state.is_ready {
+        if !self.handler_state.is_ready.load(Acquire) {
             return Err(SendError::NotReady);
         }
 
-        if !state.is_avc420_enabled {
+        if !self.handler_state.client_supports_avc420.load(Acquire) {
             return Err(SendError::Avc420NotSupported);
         }
 
-        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
+        let surface_id = if self.handler_state.has_surface.load(Acquire) {
+            self.handler_state.primary_surface_id.load(Acquire)
+        } else {
+            return Err(SendError::NoSurface);
+        };
 
         // Debug: Parse and log ALL NAL units in the frame (Annex B format)
         {
@@ -311,7 +324,11 @@ impl EgfxFrameSender {
         // Create region covering the DISPLAY area (not the padded encoded area)
         // This ensures only the actual frame is visible, cropping any padding
         // QP 22 is a good balance of quality vs bitrate for RDP
-        let regions = vec![Avc420Region::full_frame(display_width, display_height, 22)];
+        let regions = vec![Avc420Region::full_frame(
+            display_width,
+            display_height,
+            self.qp(),
+        )];
 
         trace!(
             "Region: Display {}×{} from encoded {}×{} (cropping: {}px right, {}px bottom)",
@@ -410,25 +427,21 @@ impl EgfxFrameSender {
         display_height: u16,
         timestamp_ms: u32,
     ) -> SendResult<u32> {
-        let state = self
-            .handler_state
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or(SendError::NotReady)?;
+        use std::sync::atomic::Ordering::Acquire;
 
-        if !state.is_ready {
+        if !self.handler_state.is_ready.load(Acquire) {
             return Err(SendError::NotReady);
         }
 
-        // Note: We check AVC420 capability as a proxy for AVC444
-        // TODO: Add explicit is_avc444_enabled flag when capability negotiation is enhanced
-        if !state.is_avc420_enabled {
-            return Err(SendError::Avc420NotSupported);
+        if !self.handler_state.is_avc444_enabled.load(Acquire) {
+            return Err(SendError::Avc444NotSupported);
         }
 
-        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
+        let surface_id = if self.handler_state.has_surface.load(Acquire) {
+            self.handler_state.primary_surface_id.load(Acquire)
+        } else {
+            return Err(SendError::NoSurface);
+        };
 
         trace!(
             "EGFX AVC444: Sending frame - stream1: {} bytes, stream2: {} bytes, {}x{}",
@@ -438,8 +451,16 @@ impl EgfxFrameSender {
             display_height
         );
 
-        let luma_regions = vec![Avc420Region::full_frame(display_width, display_height, 22)];
-        let chroma_regions = vec![Avc420Region::full_frame(display_width, display_height, 22)];
+        let luma_regions = vec![Avc420Region::full_frame(
+            display_width,
+            display_height,
+            self.qp(),
+        )];
+        let chroma_regions = vec![Avc420Region::full_frame(
+            display_width,
+            display_height,
+            self.qp(),
+        )];
 
         let (frame_id, dvc_messages, channel_id) = {
             let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
@@ -509,16 +530,87 @@ impl EgfxFrameSender {
 
     /// Check if AVC444 is supported by the client
     ///
-    /// Currently returns the same as AVC420 support until explicit AVC444
-    /// capability negotiation is implemented.
-    pub async fn is_avc444_supported(&self) -> bool {
-        // TODO: Check explicit AVC444 capability when available
-        self.is_ready().await
+    /// AVC444 requires V10+ EGFX capabilities. The handler negotiates this
+    /// during the capability exchange and sets `is_avc444_enabled` in the
+    /// shared state. Platform quirks (force_avc420_only) may suppress AVC444
+    /// even when the client supports it.
+    pub fn is_avc444_supported(&self) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        self.handler_state.is_ready.load(Acquire)
+            && self.handler_state.is_avc444_enabled.load(Acquire)
     }
 
     /// Get number of frames sent
     pub fn frames_sent(&self) -> u64 {
         self.frame_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Send an uncompressed bitmap frame through EGFX for V8 clients
+    ///
+    /// Used when the client supports EGFX but not H.264 (AVC420/AVC444).
+    /// Sends raw pixel data via WireToSurface1 with Codec1Type::Uncompressed.
+    pub async fn send_uncompressed_frame(
+        &self,
+        bitmap_data: &[u8],
+        width: u16,
+        height: u16,
+        timestamp_ms: u32,
+    ) -> SendResult<u32> {
+        use std::sync::atomic::Ordering::Acquire;
+
+        if !self.handler_state.is_ready.load(Acquire) {
+            return Err(SendError::NotReady);
+        }
+
+        let surface_id = if self.handler_state.has_surface.load(Acquire) {
+            self.handler_state.primary_surface_id.load(Acquire)
+        } else {
+            return Err(SendError::NoSurface);
+        };
+
+        let (frame_id, dvc_messages, channel_id) = {
+            let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
+
+            let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
+
+            let frame_id = server
+                .send_uncompressed_frame(surface_id, bitmap_data, width, height, timestamp_ms)
+                .ok_or(SendError::Backpressure)?;
+
+            let messages = server.drain_output();
+
+            (frame_id, messages, channel_id)
+        };
+
+        if !dvc_messages.is_empty() {
+            let svc_messages =
+                encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                    .map_err(|e| SendError::EncodingFailed(e.to_string()))?;
+
+            let event = ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages: svc_messages,
+            });
+
+            self.event_tx
+                .send(event)
+                .map_err(|_| SendError::ChannelClosed)?;
+        }
+
+        let count = self
+            .frame_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count.is_multiple_of(30) {
+            trace!(
+                "EGFX Uncompressed: Sent frame {} (id={}, {}x{}, {}b)",
+                count,
+                frame_id,
+                width,
+                height,
+                bitmap_data.len()
+            );
+        }
+
+        Ok(frame_id)
     }
 
     /// Send an H.264 frame with specific damage regions
@@ -539,29 +631,46 @@ impl EgfxFrameSender {
         damage_regions: &[DamageRegion],
         timestamp_ms: u32,
     ) -> SendResult<u32> {
-        let state = self
-            .handler_state
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or(SendError::NotReady)?;
+        use std::sync::atomic::Ordering::Acquire;
 
-        if !state.is_ready {
+        if !self.handler_state.is_ready.load(Acquire) {
             return Err(SendError::NotReady);
         }
 
-        if !state.is_avc420_enabled {
+        if !self.handler_state.client_supports_avc420.load(Acquire) {
             return Err(SendError::Avc420NotSupported);
         }
 
-        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
-
-        let regions = if damage_regions.is_empty() {
-            vec![Avc420Region::full_frame(display_width, display_height, 22)]
+        let surface_id = if self.handler_state.has_surface.load(Acquire) {
+            self.handler_state.primary_surface_id.load(Acquire)
         } else {
-            damage_regions_to_avc420(damage_regions, display_width, display_height)
+            return Err(SendError::NoSurface);
         };
+
+        let mut regions = if damage_regions.is_empty() {
+            vec![Avc420Region::full_frame(
+                display_width,
+                display_height,
+                self.qp(),
+            )]
+        } else {
+            damage_regions_to_avc420(damage_regions, display_width, display_height, self.qp())
+        };
+
+        // Every damage region may have been dropped as degenerate above; a
+        // metablock with zero rects is itself invalid, so fall back to a single
+        // full-frame region rather than emit an empty region list.
+        if regions.is_empty() {
+            debug!(
+                "EGFX: all {} damage region(s) degenerate — sending full frame",
+                damage_regions.len()
+            );
+            regions = vec![Avc420Region::full_frame(
+                display_width,
+                display_height,
+                self.qp(),
+            )];
+        }
 
         if regions.len() > 1 {
             let total_area: u64 = damage_regions
@@ -635,29 +744,44 @@ impl EgfxFrameSender {
         damage_regions: &[DamageRegion],
         timestamp_ms: u32,
     ) -> SendResult<u32> {
-        let state = self
-            .handler_state
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or(SendError::NotReady)?;
+        use std::sync::atomic::Ordering::Acquire;
 
-        if !state.is_ready {
+        if !self.handler_state.is_ready.load(Acquire) {
             return Err(SendError::NotReady);
         }
 
-        if !state.is_avc420_enabled {
-            return Err(SendError::Avc420NotSupported);
+        if !self.handler_state.is_avc444_enabled.load(Acquire) {
+            return Err(SendError::Avc444NotSupported);
         }
 
-        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
-
-        let regions = if damage_regions.is_empty() {
-            vec![Avc420Region::full_frame(display_width, display_height, 22)]
+        let surface_id = if self.handler_state.has_surface.load(Acquire) {
+            self.handler_state.primary_surface_id.load(Acquire)
         } else {
-            damage_regions_to_avc420(damage_regions, display_width, display_height)
+            return Err(SendError::NoSurface);
         };
+
+        let mut regions = if damage_regions.is_empty() {
+            vec![Avc420Region::full_frame(
+                display_width,
+                display_height,
+                self.qp(),
+            )]
+        } else {
+            damage_regions_to_avc420(damage_regions, display_width, display_height, self.qp())
+        };
+
+        // See send_frame_with_regions: never emit an empty (zero-rect) metablock.
+        if regions.is_empty() {
+            debug!(
+                "EGFX AVC444: all {} damage region(s) degenerate — sending full frame",
+                damage_regions.len()
+            );
+            regions = vec![Avc420Region::full_frame(
+                display_width,
+                display_height,
+                self.qp(),
+            )];
+        }
 
         if regions.len() > 1 {
             debug!(
@@ -718,6 +842,7 @@ fn damage_regions_to_avc420(
     regions: &[DamageRegion],
     display_width: u16,
     display_height: u16,
+    qp: u8,
 ) -> Vec<Avc420Region> {
     regions
         .iter()
@@ -731,8 +856,18 @@ fn damage_regions_to_avc420(
                 .min(display_height as u32)
                 .saturating_sub(1) as u16;
 
-            // Skip invalid regions (where right < left or bottom < top)
-            if right < left || bottom < top {
+            // RFX_AVC420_METABLOCK rects MUST satisfy left < right and top <
+            // bottom (MS-RDPEGFX). FreeRDP and mstsc reject a degenerate
+            // (zero-width/zero-height) or inverted rect with ERROR_INVALID_DATA
+            // and tear down the GFX channel — the user sees a blank screen and
+            // the session disconnects. IronRDP's own decoder does not validate
+            // this, so such a rect rides through our own tools (rdpsee/rdpdo)
+            // undetected; only real clients expose it.
+            if right <= left || bottom <= top {
+                debug!(
+                    "EGFX: dropping degenerate damage region x{} y{} w{} h{} (LTRB {},{},{},{})",
+                    r.x, r.y, r.width, r.height, left, top, right, bottom
+                );
                 return None;
             }
 
@@ -744,8 +879,8 @@ fn damage_regions_to_avc420(
                 top,
                 right,
                 bottom,
-                quantization_parameter: 22, // Good quality/bitrate balance
-                quality: 100,               // Maximum quality for damage regions
+                quantization_parameter: qp,
+                quality: 100, // Maximum quality for damage regions
             })
         })
         .collect()
@@ -763,8 +898,41 @@ mod tests {
             "AVC420 not supported by client"
         );
         assert_eq!(
+            SendError::Avc444NotSupported.to_string(),
+            "AVC444 not supported by client"
+        );
+        assert_eq!(
             SendError::Backpressure.to_string(),
             "Frame dropped due to backpressure"
         );
+    }
+
+    #[test]
+    fn test_egfx_sender_readiness_from_shared_state() {
+        use std::sync::{Arc, atomic::Ordering};
+
+        use crate::server::gfx_factory::SharedHandlerState;
+
+        let state = Arc::new(SharedHandlerState::new());
+
+        // Not ready initially
+        assert!(!state.is_ready.load(Ordering::Acquire));
+
+        // Set ready + AVC420
+        state.is_ready.store(true, Ordering::Release);
+        state.client_supports_avc420.store(true, Ordering::Release);
+
+        assert!(state.is_ready.load(Ordering::Acquire));
+        assert!(state.client_supports_avc420.load(Ordering::Acquire));
+
+        // Set AVC444
+        state.is_avc444_enabled.store(true, Ordering::Release);
+        assert!(state.is_avc444_enabled.load(Ordering::Acquire));
+
+        // Surface
+        state.has_surface.store(true, Ordering::Release);
+        state.primary_surface_id.store(5, Ordering::Release);
+        assert!(state.has_surface.load(Ordering::Acquire));
+        assert_eq!(state.primary_surface_id.load(Ordering::Acquire), 5);
     }
 }
