@@ -60,7 +60,7 @@ The source tarball on the Releases page includes vendored dependencies for offli
 | **Sway / River** (wlroots) | AVC444 | wlr-direct | wl-clipboard | Native only |
 | **Hyprland** (official portal) | AVC444 | wlr-direct | wl-clipboard | Native only |
 | **Hyprland** (hypr-remote community portal) | AVC444 | Portal | Portal | Flatpak or native |
-| **COSMIC** (System76) | AVC420 | -- | -- | Video-only (native or Flatpak) |
+| **COSMIC** (System76) | AVC420 | /dev/uinput | wlr-direct | Flatpak or native |
 
 **Notes:**
 - GNOME 40-44 (RHEL 9) lacks Portal clipboard because RemoteDesktop v1 predates the clipboard API.
@@ -141,7 +141,7 @@ lamco-rdp-server is built on a set of published Rust crates available on [crates
 
 These crates are MIT/Apache-2.0 licensed. See [lamco.ai/open-source](https://www.lamco.ai/open-source/) for documentation and details.
 
-The server also depends on a [fork of IronRDP](https://github.com/lamco-admin/IronRDP) that adds MS-RDPEGFX Graphics Pipeline Extension and clipboard file transfer support. Contributions to upstream IronRDP are in progress.
+The server also depends on a [fork of IronRDP](https://github.com/lamco-admin/IronRDP) that adds my own innovations to IronRDP before they're published. Contributions to upstream IronRDP are in progress.
 
 ## Troubleshooting
 
