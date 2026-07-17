@@ -297,6 +297,12 @@ pub struct Avc420Encoder {
     current_level: Option<super::h264_level::H264Level>,
     /// Optional diagnostics — None when both diagnostics flags are off (zero cost).
     diagnostics: Option<std::sync::Arc<super::encode_diagnostics::EncodeDiagnostics>>,
+    /// Time of the last IDR frame, used for periodic artifact recovery.
+    last_idr_time: std::time::Instant,
+    /// Periodic IDR interval in seconds (0 disables periodic IDRs).
+    periodic_idr_interval_secs: u32,
+    /// Force the next encoded frame to be an IDR.
+    force_next_idr: bool,
 }
 
 /// Cached OpenH264 API handle, populated at probe time and reused by encoder creation.
@@ -439,6 +445,9 @@ impl Avc420Encoder {
             frame_count: 0,
             current_level: level,
             diagnostics: None,
+            last_idr_time: std::time::Instant::now(),
+            periodic_idr_interval_secs: 0,
+            force_next_idr: false,
         })
     }
 
@@ -450,6 +459,25 @@ impl Avc420Encoder {
         diagnostics: Option<std::sync::Arc<super::encode_diagnostics::EncodeDiagnostics>>,
     ) {
         self.diagnostics = diagnostics;
+    }
+
+    /// Configure periodic IDR insertion for recovery from accumulated artifacts.
+    pub fn configure_periodic_idr(&mut self, interval_secs: u32) {
+        self.periodic_idr_interval_secs = interval_secs;
+        self.last_idr_time = std::time::Instant::now();
+        if interval_secs > 0 {
+            info!("AVC420 periodic IDR enabled: interval={}s", interval_secs);
+        } else {
+            debug!("AVC420 periodic IDR disabled");
+        }
+    }
+
+    /// Non-consuming check used by the display path to force a full damage region.
+    pub fn is_periodic_idr_due(&self) -> bool {
+        self.force_next_idr
+            || (self.periodic_idr_interval_secs > 0
+                && self.last_idr_time.elapsed()
+                    >= std::time::Duration::from_secs(self.periodic_idr_interval_secs as u64))
     }
 
     pub fn encode_bgra(
@@ -471,6 +499,13 @@ impl Avc420Encoder {
                 bgra_data.len(),
                 expected_size
             )));
+        }
+
+        if self.is_periodic_idr_due() {
+            self.force_next_idr = false;
+            self.last_idr_time = std::time::Instant::now();
+            self.encoder.force_intra_frame();
+            info!("Forcing AVC420 IDR to clear accumulated display artifacts");
         }
 
         // Color conversion: BGRA → YUV420 (pure Rust, no FFI)
@@ -603,8 +638,8 @@ impl Avc420Encoder {
     }
 
     pub fn force_keyframe(&mut self) {
-        self.encoder.force_intra_frame();
-        debug!("Forced keyframe on next encode");
+        self.force_next_idr = true;
+        debug!("AVC420 IDR requested for next encode");
     }
 
     /// Get the detected ABI generation.
@@ -706,6 +741,28 @@ mod tests {
     fn test_encoder_creation() {
         let config = EncoderConfig::default();
         let _encoder = require_openh264!(Avc420Encoder::new(config));
+    }
+
+    #[cfg(feature = "h264")]
+    #[test]
+    fn test_avc420_periodic_idr_becomes_due_and_resets_after_encode() {
+        let config = EncoderConfig::default();
+        let mut encoder = require_openh264!(Avc420Encoder::new(config));
+        encoder.configure_periodic_idr(5);
+        encoder.last_idr_time = std::time::Instant::now() - std::time::Duration::from_secs(6);
+
+        assert!(encoder.is_periodic_idr_due());
+
+        let width = 64u32;
+        let height = 64u32;
+        let bgra_data = vec![0u8; (width * height * 4) as usize];
+        let frame = encoder
+            .encode_bgra(&bgra_data, width, height, 0)
+            .expect("periodic IDR encode should succeed")
+            .expect("periodic IDR encode should produce a frame");
+
+        assert!(frame.is_keyframe);
+        assert!(!encoder.is_periodic_idr_due());
     }
 
     #[cfg(feature = "h264")]

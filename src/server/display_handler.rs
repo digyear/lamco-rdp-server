@@ -194,7 +194,7 @@ impl VideoEncoder {
     /// Used to bypass damage detection and send full frame when IDR fires
     fn is_periodic_idr_due(&self) -> bool {
         match self {
-            VideoEncoder::Avc420(_) => false, // AVC420 doesn't have periodic IDR
+            VideoEncoder::Avc420(encoder) => encoder.is_periodic_idr_due(),
             VideoEncoder::Avc444(encoder) => encoder.is_periodic_idr_due(),
         }
     }
@@ -2459,50 +2459,58 @@ impl LamcoDisplayHandler {
                                             self.config.egfx.periodic_idr_interval,
                                         );
 
-                                        video_encoder = Some(VideoEncoder::Avc444(encoder));
-                                        info!(
-                                            "✅ AVC444 encoder initialized for {}×{} (4:4:4 chroma)",
-                                            encoded_width, encoded_height
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to create AVC444 encoder: {:?} - falling back to AVC420",
-                                            e
-                                        );
-                                        match Avc420Encoder::new(config) {
-                                            Ok(encoder) => {
-                                                video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                                info!(
-                                                    "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
-                                                    encoded_width, encoded_height
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
-                                                    e
-                                                );
-                                            }
+                                    video_encoder = Some(VideoEncoder::Avc444(encoder));
+                                    info!(
+                                        "✅ AVC444 encoder initialized for {}×{} (4:4:4 chroma)",
+                                        aligned_width, aligned_height
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to create AVC444 encoder: {:?} - falling back to AVC420",
+                                        e
+                                    );
+                                    // Fall through to AVC420
+                                    match Avc420Encoder::new(config) {
+                                        Ok(mut encoder) => {
+                                            encoder.configure_periodic_idr(
+                                                self.config.egfx.periodic_idr_interval,
+                                            );
+                                            encoder.set_diagnostics(encoder_diagnostics.clone());
+                                            video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                            info!(
+                                                "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
+                                                aligned_width, aligned_height
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
+                                                e
+                                            );
                                         }
                                     }
                                 }
-                            } else {
-                                // Use AVC420 (standard 4:2:0 chroma)
-                                match Avc420Encoder::new(config) {
-                                    Ok(encoder) => {
-                                        video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                        info!(
-                                            "✅ AVC420 encoder initialized for {}×{}",
-                                            encoded_width, encoded_height
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
-                                            e
-                                        );
-                                    }
+                            }
+                        } else {
+                            // Use AVC420 (standard 4:2:0 chroma)
+                            match Avc420Encoder::new(config) {
+                                Ok(mut encoder) => {
+                                    encoder.configure_periodic_idr(
+                                        self.config.egfx.periodic_idr_interval,
+                                    );
+                                    encoder.set_diagnostics(encoder_diagnostics.clone());
+                                    video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                    info!(
+                                        "✅ AVC420 encoder initialized for {}×{} (aligned)",
+                                        aligned_width, aligned_height
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -2650,13 +2658,70 @@ impl LamcoDisplayHandler {
 
                     // Try to send via EGFX H.264 if encoder is available
                     if let (Some(encoder), Some(sender)) = (&mut video_encoder, &egfx_sender) {
-                        // Use PipeWire PTS when available, fall back to synthetic timing
-                        let timestamp_ms = if frame.pts > 0 {
-                            frame.pts / 1_000_000 // nanoseconds → milliseconds
-                        } else {
-                            let frame_interval_ms =
-                                1000 / u64::from(self.config.video.target_fps.max(1));
-                            frames_sent * frame_interval_ms
+                        // Check transport backpressure before encoding. Advancing the H.264
+                        // reference state for a frame that cannot be queued can make the
+                        // client depend on an unsent frame and trigger an IDR retry storm.
+                        if sender.is_backpressured() {
+                            frames_dropped += 1;
+                            trace!("EGFX transport backpressure - skipping frame before encode");
+                            continue;
+                        }
+
+                        // CLOSED-LOOP FLOW CONTROL (Layer 4 / GrdRdpGfxFrameController equivalent)
+                        // — see src/egfx/flow_controller.rs.
+                        //
+                        // Before encoding the next frame, ask the flow controller whether
+                        // we should pause. The controller engages throttling when unacked
+                        // frame count exceeds an RTT-adaptive threshold (avoiding client
+                        // decoder saturation that causes mstsc to give up under load).
+                        //
+                        // Throttle path: drop the frame at the encoder boundary, log
+                        // periodically so operators can see flow control engaged.
+                        let throttle = handler.gfx_handler_state.as_ref().is_some_and(|s| {
+                            s.flow_controller
+                                .lock()
+                                .ok()
+                                .is_some_and(|fc| fc.should_throttle())
+                        });
+                        if throttle {
+                            frames_dropped += 1;
+                            if frames_dropped.is_multiple_of(60) {
+                                if let Some(ref s) = handler.gfx_handler_state
+                                    && let Ok(fc) = s.flow_controller.lock()
+                                {
+                                    info!(
+                                        unacked = fc.unacked_count(),
+                                        activate_th = fc.activate_th(),
+                                        avg_rtt_us = fc.avg_rtt().as_micros() as u64,
+                                        state = ?fc.state(),
+                                        "EGFX L4 flow controller: throttling encoder \
+                                         (waiting for client to drain unacked frames)"
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+
+                        use crate::egfx::align_to_16;
+
+                        let timestamp_ms = pipeline_decisions::compute_timestamp_ms(
+                            frame.pts,
+                            frames_sent,
+                            self.config.video.target_fps,
+                        );
+
+                        // Extract CPU-resident pixel data.
+                        // DMA-BUF passthrough frames (future) will take a different path
+                        // through the hardware encoder directly.
+                        let pixel_data = match &frame.buffer {
+                            lamco_pipewire::FrameBuffer::Memory(data) => {
+                                std::sync::Arc::clone(data)
+                            }
+                            lamco_pipewire::FrameBuffer::DmaBuf(_) => {
+                                trace!("Skipping DMA-BUF frame in software encode path");
+                                frames_dropped += 1;
+                                continue;
+                            }
                         };
 
                         // PipeWire sometimes sends zero-size buffers

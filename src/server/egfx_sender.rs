@@ -153,6 +153,14 @@ impl EgfxFrameSender {
         self.current_qp.load(std::sync::atomic::Ordering::Relaxed) as u8
     }
 
+    /// Check transport flow control before advancing the video encoder state.
+    pub fn is_backpressured(&self) -> bool {
+        self.gfx_server
+            .lock()
+            .map(|server| server.should_backpressure())
+            .unwrap_or(true)
+    }
+
     /// Check if EGFX is ready and AVC420 is supported
     pub fn is_ready(&self) -> bool {
         use std::sync::atomic::Ordering::Acquire;
@@ -840,10 +848,11 @@ impl EgfxFrameSender {
             return Err(SendError::NoSurface);
         };
 
-        let mut regions = if damage_regions.is_empty() {
+        let full_frame = is_full_frame_update(damage_regions, display_width, display_height);
+        let mut regions = if full_frame {
             vec![Avc420Region::full_frame(
-                display_width,
-                display_height,
+                encoded_width,
+                encoded_height,
                 self.qp(),
             )]
         } else {
@@ -958,10 +967,11 @@ impl EgfxFrameSender {
             return Err(SendError::NoSurface);
         };
 
-        let mut regions = if damage_regions.is_empty() {
+        let full_frame = is_full_frame_update(damage_regions, display_width, display_height);
+        let mut regions = if full_frame {
             vec![Avc420Region::full_frame(
-                display_width,
-                display_height,
+                encoded_width,
+                encoded_height,
                 self.qp(),
             )]
         } else {
@@ -1032,11 +1042,7 @@ impl EgfxFrameSender {
     }
 }
 
-fn is_full_frame_update(
-    regions: &[DamageRegion],
-    display_width: u16,
-    display_height: u16,
-) -> bool {
+fn is_full_frame_update(regions: &[DamageRegion], display_width: u16, display_height: u16) -> bool {
     if regions.is_empty() {
         return true;
     }
