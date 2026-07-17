@@ -193,8 +193,7 @@ impl StaticPasswordValidator {
         for (username, password_hash) in &password_hashes {
             validate_username(username)?;
             PasswordHash::new(password_hash)
-                .map_err(|e| anyhow::anyhow!("Invalid password_hash for user '{username}': {e}"))?
-                .to_string();
+                .map_err(|e| anyhow::anyhow!("Invalid password hash for user '{username}': {e}"))?;
         }
         info!(
             "Static password validator initialized ({} configured user(s))",

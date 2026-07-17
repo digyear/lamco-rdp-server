@@ -18,7 +18,7 @@ use std::sync::{
 
 use ironrdp_egfx::{
     pdu::{
-        CapabilitiesAdvertisePdu, CapabilitiesV10Flags, CapabilitiesV81Flags,
+        CapabilitiesAdvertisePdu, CapabilitiesV8Flags, CapabilitiesV10Flags, CapabilitiesV81Flags,
         CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitySet,
     },
     server::{GraphicsPipelineHandler, QoeMetrics, Surface},

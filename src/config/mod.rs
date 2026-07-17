@@ -814,7 +814,7 @@ mod tests {
         let config = Config::default_config().unwrap();
         let config = config.with_overrides(None, None);
 
-        assert_eq!(config.server.listen_addr, "0.0.0.0:3389");
+        assert_eq!(config.server.listen_addr, "[::]:3389");
     }
 
     #[test]
@@ -832,7 +832,7 @@ mod tests {
         let config = Config::default_config().unwrap();
         let config = config.with_overrides(None, Some(3390));
 
-        assert_eq!(config.server.listen_addr, "0.0.0.0:3390");
+        assert_eq!(config.server.listen_addr, "[::]:3390");
     }
 
     #[test]
