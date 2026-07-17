@@ -32,6 +32,8 @@ use crate::{
 pub struct SessionStrategySelector {
     service_registry: Arc<ServiceRegistry>,
     token_manager: Arc<Tokens>,
+    portal_app_id: Option<String>,
+    register_host_app: bool,
     /// Keyboard layout from config (e.g., "us", "de", "auto")
     #[cfg_attr(
         not(feature = "wayland"),
@@ -50,6 +52,8 @@ impl SessionStrategySelector {
         Self {
             service_registry,
             token_manager,
+            portal_app_id: None,
+            register_host_app: false,
             keyboard_layout: "auto".to_string(),
             prefers_libei: true,
         }
@@ -63,6 +67,8 @@ impl SessionStrategySelector {
         Self {
             service_registry,
             token_manager,
+            portal_app_id: None,
+            register_host_app: false,
             keyboard_layout,
             prefers_libei: true,
         }
@@ -71,6 +77,21 @@ impl SessionStrategySelector {
     pub fn with_input_protocol(mut self, prefers_libei: bool) -> Self {
         self.prefers_libei = prefers_libei;
         self
+    }
+
+    pub fn with_portal_identity(
+        mut self,
+        portal_app_id: Option<String>,
+        register_host_app: bool,
+    ) -> Self {
+        self.portal_app_id = portal_app_id;
+        self.register_host_app = register_host_app;
+        self
+    }
+
+    fn portal_token_strategy(&self) -> PortalTokenStrategy {
+        PortalTokenStrategy::new(self.service_registry.clone(), self.token_manager.clone())
+            .with_portal_identity(self.portal_app_id.clone(), self.register_host_app)
     }
 
     /// Select the best available session strategy
@@ -123,10 +144,7 @@ impl SessionStrategySelector {
                         warn!("Permission dialog will appear on every server start");
                     }
 
-                    return Ok(Box::new(PortalTokenStrategy::new(
-                        self.service_registry.clone(),
-                        self.token_manager.clone(),
-                    )));
+                    return Ok(Box::new(self.portal_token_strategy()));
                 }
 
                 // RemoteDesktop unavailable: try ScreenCast-only (view-only mode)
@@ -157,10 +175,7 @@ impl SessionStrategySelector {
                 info!("Systemd user deployment: using Portal + Token strategy");
                 info!("Avoiding libei input-only + standalone ScreenCast startup prompt");
 
-                return Ok(Box::new(PortalTokenStrategy::new(
-                    self.service_registry.clone(),
-                    self.token_manager.clone(),
-                )));
+                return Ok(Box::new(self.portal_token_strategy()));
             }
 
             DeploymentContext::SystemdSystem => {
@@ -168,10 +183,7 @@ impl SessionStrategySelector {
                 warn!("System service deployment: Limited to Portal strategy");
                 warn!("Recommend using systemd user service instead for better compatibility");
 
-                return Ok(Box::new(PortalTokenStrategy::new(
-                    self.service_registry.clone(),
-                    self.token_manager.clone(),
-                )));
+                return Ok(Box::new(self.portal_token_strategy()));
             }
 
             _ => {
@@ -327,10 +339,7 @@ impl SessionStrategySelector {
             info!("Selected: Portal + Token strategy");
             info!("   One-time permission dialog, then unattended operation");
 
-            return Ok(Box::new(PortalTokenStrategy::new(
-                self.service_registry.clone(),
-                self.token_manager.clone(),
-            )));
+            return Ok(Box::new(self.portal_token_strategy()));
         }
 
         // FALLBACK: Portal without tokens (portal v3 or below)
@@ -340,10 +349,7 @@ impl SessionStrategySelector {
             warn!("   Falling back to Portal + Token strategy");
             warn!("   Permission dialog will appear on every server start");
 
-            return Ok(Box::new(PortalTokenStrategy::new(
-                self.service_registry.clone(),
-                self.token_manager.clone(),
-            )));
+            return Ok(Box::new(self.portal_token_strategy()));
         }
 
         // LAST RESORT: ScreenCast-only (view-only) when no input strategy works
@@ -457,7 +463,14 @@ mod tests {
                 .expect("Failed to create Tokens"),
         );
 
-        let selector = SessionStrategySelector::new(registry, token_manager);
+        let selector = SessionStrategySelector::new(registry, token_manager)
+            .with_portal_identity(Some("org.kde.krdpserver".to_string()), true);
+
+        assert_eq!(
+            selector.portal_app_id.as_deref(),
+            Some("org.kde.krdpserver")
+        );
+        assert!(selector.register_host_app);
 
         // Should not panic
         let _strategy_name = selector.recommended_strategy_name();

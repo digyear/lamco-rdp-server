@@ -35,6 +35,12 @@ pub struct PortalSessionFactory {
     /// Token manager for persistence
     token_manager: Arc<Tokens>,
 
+    /// Stable native Portal identity, re-registered before every attempt.
+    portal_app_id: Option<String>,
+
+    /// Whether native host-app registration is enabled.
+    register_host_app: bool,
+
     /// Quirks that apply to this deployment/compositor combination
     quirks: Vec<InitQuirk>,
 
@@ -67,13 +73,55 @@ impl PortalSessionFactory {
         Self {
             registry,
             token_manager,
+            portal_app_id: None,
+            register_host_app: false,
             quirks,
             max_retries: 2,
         }
     }
 
+    pub fn with_portal_identity(
+        mut self,
+        portal_app_id: Option<String>,
+        register_host_app: bool,
+    ) -> Self {
+        self.portal_app_id = portal_app_id;
+        self.register_host_app = register_host_app;
+        self
+    }
+
+    async fn register_portal_identity(&self) {
+        if !self.register_host_app {
+            return;
+        }
+
+        let Some(app_id) = self.portal_app_id.as_deref() else {
+            return;
+        };
+
+        let parsed = match app_id.parse::<ashpd::AppID>() {
+            Ok(app_id) => app_id,
+            Err(e) => {
+                warn!(app_id, error = %e, "invalid portal app-id; skipping attempt registration");
+                return;
+            }
+        };
+
+        match ashpd::register_host_app(parsed).await {
+            Ok(()) => debug!(app_id, "registered portal app-id for session attempt"),
+            Err(e) => warn!(
+                app_id,
+                error = %e,
+                "failed to register portal app-id for session attempt"
+            ),
+        }
+    }
+
     fn expects_persistence_rejection(&self) -> bool {
-        false // Persistence rejection is handled gracefully in error recovery
+        matches!(
+            self.registry.compositor_capabilities().compositor,
+            crate::compositor::CompositorType::Kde { .. }
+        )
     }
 
     /// Attempt to create a session with the given configuration
@@ -101,6 +149,11 @@ impl PortalSessionFactory {
             deployment = ?self.registry.compositor_capabilities().deployment,
             "Starting session attempt"
         );
+
+        // xdg-desktop-portal keeps native host-app registration in process
+        // memory. Register for every attempt so a restarted Portal frontend
+        // does not turn a retry into an unknown application permission prompt.
+        self.register_portal_identity().await;
 
         let restore_token = if with_persistence {
             self.token_manager
@@ -254,10 +307,16 @@ impl SessionFactory for PortalSessionFactory {
                 .collect::<Vec<_>>()
         );
 
-        // Two-attempt flow: try with persistence first, retry without on rejection.
-        // Persistence rejection is handled gracefully in error recovery.
-        // Clipboard is created inside attempt_session, in the same D-Bus context
-        let first_result = self.attempt_session(true).await;
+        // KDE's RemoteDesktop backend rejects persist_mode even when the generic
+        // Portal version advertises restore-token support. Avoid the rejected
+        // request entirely: on some xdg-desktop-portal versions it also crashes
+        // the frontend and loses the registered host app identity.
+        let first_with_persistence = !self.expects_persistence_rejection();
+        if !first_with_persistence {
+            info!("Skipping persistence attempt (portal backend rejects it)");
+        }
+
+        let first_result = self.attempt_session(first_with_persistence).await;
 
         let (portal_handle, new_token, active_manager, clipboard_mgr) = match first_result {
             Ok(result) => result,
@@ -265,7 +324,7 @@ impl SessionFactory for PortalSessionFactory {
                 let failure = self.parse_failure(&e);
                 warn!("First session attempt failed: {}", failure.message());
 
-                if !failure.should_retry_without_persistence() {
+                if !first_with_persistence || !failure.should_retry_without_persistence() {
                     return Err(e).context("Session creation failed");
                 }
 
@@ -398,5 +457,60 @@ impl PortalSessionHandleImpl {
             stream_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             health_reporter: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        compositor::{CompositorCapabilities, CompositorType, PortalCapabilities},
+        session::CredentialStorageMethod,
+    };
+
+    #[tokio::test]
+    async fn kde_portal_skips_persistence_attempts() {
+        let mut portal = PortalCapabilities::default();
+        portal.version = 5;
+        portal.supports_restore_tokens = true;
+        let caps = CompositorCapabilities::new(
+            CompositorType::Kde {
+                version: Some("6.3.6".to_string()),
+            },
+            portal,
+            vec![],
+        );
+        let registry = Arc::new(ServiceRegistry::from_compositor(caps));
+        let token_manager = Arc::new(
+            Tokens::new(CredentialStorageMethod::EncryptedFile)
+                .await
+                .expect("token manager"),
+        );
+        let factory = PortalSessionFactory::new(registry, token_manager);
+
+        assert!(factory.expects_persistence_rejection());
+        assert!(!factory.capabilities().supports_persistence);
+    }
+
+    #[tokio::test]
+    async fn portal_identity_is_available_for_every_session_attempt() {
+        let caps = CompositorCapabilities::new(
+            CompositorType::Kde {
+                version: Some("6.3.6".to_string()),
+            },
+            PortalCapabilities::default(),
+            vec![],
+        );
+        let registry = Arc::new(ServiceRegistry::from_compositor(caps));
+        let token_manager = Arc::new(
+            Tokens::new(CredentialStorageMethod::EncryptedFile)
+                .await
+                .expect("token manager"),
+        );
+        let factory = PortalSessionFactory::new(registry, token_manager)
+            .with_portal_identity(Some("org.kde.krdpserver".to_string()), true);
+
+        assert_eq!(factory.portal_app_id.as_deref(), Some("org.kde.krdpserver"));
+        assert!(factory.register_host_app);
     }
 }

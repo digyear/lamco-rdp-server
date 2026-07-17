@@ -393,6 +393,17 @@ impl PortalTokenStrategy {
             service_registry,
         }
     }
+
+    pub fn with_portal_identity(
+        mut self,
+        portal_app_id: Option<String>,
+        register_host_app: bool,
+    ) -> Self {
+        self.factory = self
+            .factory
+            .with_portal_identity(portal_app_id, register_host_app);
+        self
+    }
 }
 
 #[async_trait]

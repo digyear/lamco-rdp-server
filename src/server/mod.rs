@@ -413,6 +413,10 @@ impl LamcoRdpServer {
                 Arc::new(token_manager),
                 config.input.keyboard_layout.clone(),
             )
+            .with_portal_identity(
+                config.portal.app_id.clone(),
+                config.portal.register_host_app,
+            )
             .with_input_protocol(prefers_libei);
 
             strategy_selector
