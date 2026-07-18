@@ -143,30 +143,24 @@ fn validate_security_config(
         }
     }
 
+    match config.security.security_mode.as_str() {
+        "tls" | "hybrid" | "auto" => {}
+        _ => {
+            errors.push(ValidationError {
+                field: "security.security_mode".to_string(),
+                message: format!(
+                    "Invalid security mode: '{}'. Valid options: tls, hybrid, auto",
+                    config.security.security_mode
+                ),
+            });
+        }
+    }
+
     if config.security.auth_method == "password" {
-        if !config.security.password.is_empty() {
-            errors.push(ValidationError {
-                field: "security.password".to_string(),
-                message: "Plaintext security.password is deprecated; use password_credentials"
-                    .to_string(),
-            });
-        }
-        if !config.security.password_username.is_empty()
-            || !config.security.password_hash.is_empty()
-        {
-            errors.push(ValidationError {
-                field: "security.password_credentials".to_string(),
-                message:
-                    "Use password_credentials instead of legacy password_username/password_hash"
-                        .to_string(),
-            });
-        }
         if config.security.password_credentials.is_empty() {
             errors.push(ValidationError {
                 field: "security.password_credentials".to_string(),
-                message:
-                    "Custom password authentication requires at least one username/password entry"
-                        .to_string(),
+                message: "Static password authentication requires at least one user".to_string(),
             });
         }
         for (username, password_hash) in &config.security.password_credentials {
@@ -186,9 +180,7 @@ fn validate_security_config(
         if config.security.security_mode == "hybrid" {
             errors.push(ValidationError {
                 field: "security.security_mode".to_string(),
-                message:
-                    "Custom password hash authentication supports TLS mode only; use tls or auto"
-                        .to_string(),
+                message: "Static password hash authentication supports TLS mode only".to_string(),
             });
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "lamco-rdp-server"
-version = "1.4.3"
+version = "1.4.4"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Greg Lamberson <greg@lamco.io>"]
@@ -73,6 +73,7 @@ tracing-appender = "0.2"
 # Error handling
 # -----------------------------------------------------------------------------
 anyhow = "1.0"
+argon2 = "0.5"
 subtle = "2"  # constant-time comparison for proxy_auth shared secret
 thiserror = "2"
 
@@ -223,7 +224,6 @@ dirs = "6.0"
 # Cryptography (for session token encryption)
 # -----------------------------------------------------------------------------
 aes-gcm = "0.10"
-argon2 = "0.5"
 
 # -----------------------------------------------------------------------------
 # Credential Storage Backends

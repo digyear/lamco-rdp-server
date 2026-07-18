@@ -73,9 +73,9 @@ mod graphics_drain;
 mod input_handler;
 #[expect(dead_code, reason = "WIP: not yet integrated into the server pipeline")]
 mod multiplexer_loop;
-pub mod planar;
+mod pipeline_decisions;
 
-use std::{net::SocketAddr, os::fd::FromRawFd, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result};
 pub use display_handler::LamcoDisplayHandler;
@@ -982,24 +982,6 @@ impl LamcoRdpServer {
                     };
 
                 let (input_tx, input_rx) = tokio::sync::mpsc::channel(256);
-                #[cfg(feature = "wl-clipboard")]
-                let cjk_clipboard: Option<
-                    Arc<dyn crate::clipboard::provider::ClipboardProvider>,
-                > = if config.input.cjk_paste_fallback {
-                    Some(Arc::new(
-                        crate::clipboard::providers::WlClipboardProvider::new(),
-                    ))
-                } else {
-                    None
-                };
-                #[cfg(not(feature = "wl-clipboard"))]
-                let cjk_clipboard: Option<
-                    Arc<dyn crate::clipboard::provider::ClipboardProvider>,
-                > = None;
-                let cjk_paste_paused_flag = match &wlr_clipboard_manager {
-                    Some(mgr) => Some(mgr.lock().await.cjk_paste_paused()),
-                    None => None,
-                };
                 let input_handler = LamcoInputHandler::new(
                     session_handle.clone(),
                     monitors,
@@ -1431,10 +1413,6 @@ impl LamcoRdpServer {
 
             clipboard_mgr.set_health_reporter(health_reporter.clone());
 
-            // Share the CJK paste pause flag with the input handler (created earlier).
-            // Must be set BEFORE initialize_strategy() which spawns the cooperation handler.
-            clipboard_mgr.set_cjk_paste_paused(cjk_paste_paused_flag);
-
             // Select clipboard strategy first — it drives provider choice
             let clipboard_strategy = crate::clipboard::ClipboardIntegrationMode::select(
                 &service_registry,
@@ -1450,97 +1428,8 @@ impl LamcoRdpServer {
                 crate::clipboard::ClipboardIntegrationMode::WaylandDataControlMode { .. }
             );
 
-            match session_handle_for_clipboard.clipboard_source() {
-                ClipboardSource::Portal(_) => {
-                    // Portal RemoteDesktop can provide the video/input session while KDE lacks
-                    // org.freedesktop.portal.Clipboard.  If strategy selection chose direct
-                    // data-control, wire that provider even when the Portal Clipboard proxy is
-                    // unavailable; otherwise every RDP FormatList is dropped with
-                    // "No clipboard provider available".
-                    if uses_data_control {
-                        #[cfg(feature = "wl-clipboard")]
-                        {
-                            let provider = crate::clipboard::providers::WlClipboardProvider::new();
-                            clipboard_mgr
-                                .set_clipboard_provider(Arc::new(provider))
-                                .await;
-                            info!(
-                                "Clipboard provider: wl-clipboard-rs (data-control override; Portal clipboard not required)"
-                            );
-                        }
-                        #[cfg(not(feature = "wl-clipboard"))]
-                        {
-                            if let (Some(clipboard_mgr_arc), Some(session)) =
-                                (&portal_clipboard_manager, &portal_clipboard_session)
-                            {
-                                let provider =
-                                    crate::clipboard::providers::PortalClipboardProvider::new(
-                                        Arc::clone(clipboard_mgr_arc),
-                                        Arc::clone(session),
-                                        Arc::clone(&portal_session_valid),
-                                        config.clipboard.rate_limit_ms,
-                                    )
-                                    .await;
-                                clipboard_mgr
-                                    .set_clipboard_provider(Arc::new(provider))
-                                    .await;
-                                info!("Clipboard provider: Portal (no wl-clipboard feature)");
-                            } else {
-                                warn!(
-                                    "Clipboard source is Portal and data-control selected, but neither wl-clipboard nor Portal Clipboard is available"
-                                );
-                            }
-                        }
-                    } else if let (Some(clipboard_mgr_arc), Some(session)) =
-                        (&portal_clipboard_manager, &portal_clipboard_session)
-                    {
-                        let provider = crate::clipboard::providers::PortalClipboardProvider::new(
-                            Arc::clone(clipboard_mgr_arc),
-                            Arc::clone(session),
-                            Arc::clone(&portal_session_valid),
-                            config.clipboard.rate_limit_ms,
-                        )
-                        .await;
-                        clipboard_mgr
-                            .set_clipboard_provider(Arc::new(provider))
-                            .await;
-                        info!("Clipboard provider: Portal");
-                    } else {
-                        warn!(
-                            "Clipboard source is Portal but Portal Clipboard proxy is unavailable"
-                        );
-                    }
-                }
-                ClipboardSource::Mutter(ref mutter_mgr) if !uses_data_control => {
-                    match crate::clipboard::providers::MutterClipboardProvider::new(Arc::clone(
-                        mutter_mgr,
-                    ))
-                    .await
-                    {
-                        Ok(provider) => {
-                            clipboard_mgr
-                                .set_clipboard_provider(Arc::new(provider))
-                                .await;
-                            info!("Clipboard provider: Mutter (D-Bus)");
-                        }
-                        Err(e) => {
-                            warn!("Failed to create Mutter clipboard provider: {e}");
-                        }
-                    }
-                }
-                #[cfg(feature = "portal-generic")]
-                ClipboardSource::DataControl(ref backend) => {
-                    let provider = crate::clipboard::providers::DataControlClipboardProvider::new(
-                        Arc::clone(backend),
-                    );
-                    clipboard_mgr
-                        .set_clipboard_provider(Arc::new(provider))
-                        .await;
-                    info!("Clipboard provider: data-control (portal-generic backend)");
-                }
-                ClipboardSource::None | ClipboardSource::Mutter(_) if uses_data_control => {
-                    // data-control mode selected but strategy doesn't provide a backend
-                    // (e.g., wlr-direct, libei, Mutter with data-control override)
+            let provider: Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> =
+                if uses_data_control {
                     #[cfg(feature = "wl-clipboard")]
                     {
                         info!("Clipboard provider: wl-clipboard-rs (data-control override)");
@@ -1807,28 +1696,24 @@ impl LamcoRdpServer {
         let use_hybrid =
             resolve_security_mode(&self.config.security.security_mode, effective_auth_method);
 
-        // auth_method=none: pass None so IronRDP skips credential comparison.
-        // auth_method=pam: PamValidator handles TLS-only validation via CredentialValidator.
-        // auth_method=password: StaticPasswordValidator handles TLS-only validation, while
-        // Hybrid/NLA also needs the same static credentials for CredSSP/NTLM.
-        self.rdp_server.set_credentials(None);
-
-        let static_password_validator = if effective_auth_method == "password" {
-            let validator =
-                std::sync::Arc::new(crate::security::StaticPasswordValidator::new_hashes(
-                    self.config.security.password_credentials.clone(),
-                )?);
-            self.rdp_server.set_credential_validator(validator.clone());
-            if use_hybrid {
-                anyhow::bail!(
-                    "auth_method=password uses password_credentials and cannot run in Hybrid/NLA mode; set security_mode=tls or auto"
-                );
+        // Credential resolution:
+        //   credssp_credentials present → use them (required for hybrid without PAM)
+        //   auth_method=pam → PamValidator (set below) handles validation post-CredSSP
+        //   otherwise → None (only valid for tls-only mode)
+        let initial_creds = self.config.security.credssp_credentials.as_ref().map(|c| {
+            ironrdp_server::Credentials {
+                username: c.username.clone(),
+                password: c.password.clone(),
+                domain: c.domain.clone(),
             }
-            info!("Static password credential validator attached to RDP server");
-            Some(validator)
-        } else {
-            None
-        };
+        });
+        if let Some(creds) = self.config.security.credssp_credentials.as_ref() {
+            info!(
+                "Pre-loaded CredSSP credentials from config (user: {})",
+                creds.username
+            );
+        }
+        self.rdp_server.set_credentials(initial_creds);
 
         // Set up PAM credential validator if auth_method=pam
         let pam_validator = if effective_auth_method == "pam" {
@@ -1841,17 +1726,31 @@ impl LamcoRdpServer {
             None
         };
 
+        let static_password_validator = if effective_auth_method == "password" {
+            let validator = std::sync::Arc::new(
+                crate::security::StaticPasswordValidator::new_hashes(
+                    self.config.security.password_credentials.clone(),
+                )
+                .context("Invalid static password credentials")?,
+            );
+            self.rdp_server
+                .set_credential_validator(Some(validator.clone()));
+            info!("Static password credential validator attached to RDP server");
+            Some(validator)
+        } else {
+            None
+        };
+
         if use_hybrid {
             info!("Security mode: Hybrid (NLA/CredSSP)");
-            match effective_auth_method {
-                "password" => {
-                    unreachable!("password_credentials auth is rejected before Hybrid mode starts")
-                }
-                "none" => {}
-                _ => {
-                    warn!("Hybrid mode active — credentials must be set before clients connect");
-                    warn!("Set credentials via D-Bus or GUI before clients connect");
-                }
+            if self.config.security.credssp_credentials.is_none() && effective_auth_method != "pam"
+            {
+                warn!(
+                    "Hybrid mode active but no credssp_credentials configured — \
+                     clients will fail with 'no credentials while doing credssp'. \
+                     Set [security].credssp_credentials in config, or use D-Bus/GUI \
+                     to set credentials before clients connect."
+                );
             }
         } else {
             info!("Security mode: TLS");
@@ -1866,15 +1765,23 @@ impl LamcoRdpServer {
             info!("Authentication: {}", effective_auth_method);
         }
 
-        // Bind the TCP listener with SO_REUSEADDR to avoid EADDRINUSE after
-        // restart. IronRDP's built-in run() uses bare TcpListener::bind() which
-        // doesn't set this, so a previous server's TIME_WAIT sockets block rebinding.
-        let listen_addr: std::net::SocketAddr = self
-            .config
-            .server
-            .listen_addr
-            .parse()
-            .context("Invalid listen address")?;
+        // Exposure guard (defense-in-depth, mirrors the qemu console's startup
+        // refusal): an unauthenticated listener on a routable address serves RDP
+        // to anyone who can reach the port. The desktop product still gates
+        // capture interactively via the Portal, so this warns loudly rather than
+        // refusing — but auth_method=none on a non-loopback bind is rarely
+        // intended outside a trusted network.
+        if effective_auth_method == "none"
+            && let Ok(addr) = self.config.server.listen_addr.parse::<SocketAddr>()
+            && !addr.ip().is_loopback()
+        {
+            warn!(
+                "⚠️  Unauthenticated RDP (auth_method=none) on routable address {} — anyone who \
+                 can reach this port can connect. Set auth_method=pam, configure \
+                 credssp_credentials, or bind to localhost unless this is a trusted network.",
+                addr
+            );
+        }
 
         // Phase 1 of the unified transport accept layer, retrofit 2026-05-16
         // to use the AcceptDeployment trait pattern.
@@ -1893,159 +1800,14 @@ impl LamcoRdpServer {
             self.health_subscriber.clone(),
             self.event_tx.clone(),
             pam_validator.clone(),
+            static_password_validator.clone(),
             self.shutdown_broadcast.clone(),
             Arc::clone(&self.session_handle),
             std::mem::take(&mut self.activated_fds),
         );
 
-                let socket = create_tcp_socket_for_addr(listen_addr)
-                    .context("Failed to create TCP socket")?;
-                socket
-                    .set_reuseaddr(true)
-                    .context("Failed to set SO_REUSEADDR")?;
-                if let Err(e) = socket.bind(listen_addr) {
-                    error!(
-                        "Failed to bind to {}: {}. Another process may be using this port.",
-                        listen_addr, e
-                    );
-                    // Run the check again after failure for detailed diagnostics
-                    check_port_available(&listen_addr);
-                    return Err(anyhow::anyhow!(
-                        "Failed to bind listen address {listen_addr}: {e}"
-                    ));
-                }
-                let listener = socket.listen(128).context("Failed to start TCP listener")?;
-                info!(
-                    "TCP listener bound to {} with SO_REUSEADDR",
-                    listener.local_addr().unwrap_or(listen_addr)
-                );
-                (listener, false)
-            };
-
-        // Accept loop: handle connections via IronRDP's run_connection(),
-        // with shutdown coordination via broadcast channel.
-        let mut shutdown_rx = self.shutdown_broadcast.subscribe();
-        let result: anyhow::Result<()> = loop {
-            tokio::select! {
-                accept_result = listener.accept() => {
-                    match accept_result {
-                        Ok((stream, peer)) => {
-                            debug!("Accepted connection from {peer}");
-                            let client_id = format!("rdp-{}", uuid::Uuid::new_v4());
-                            let conn_start = std::time::Instant::now();
-                            let conn_timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-
-                            let _ = self.event_tx.send(ServerEvent::ClientConnected {
-                                client_id: client_id.clone(),
-                                peer_address: peer.to_string(),
-                                timestamp: conn_timestamp,
-                            });
-
-                            // Set peer IP for auth rate limiting before handshake
-                            if let Some(ref validator) = pam_validator {
-                                validator.set_peer_ip(peer.ip());
-                            }
-                            if let Some(ref validator) = static_password_validator {
-                                validator.set_peer_ip(peer.ip());
-                            }
-
-                            let mut skip_disconnect_cleanup = false;
-
-                            if let Err(e) = self.rdp_server.run_connection(stream).await {
-                                let duration = conn_start.elapsed();
-                                let msg = format!("{e:#}");
-                                let is_reset = msg.contains("Connection reset by peer")
-                                    || msg.contains("os error 104");
-                                let is_short_handshake_failure = duration < std::time::Duration::from_secs(1)
-                                    && (is_reset
-                                        || msg.contains("no credentials received")
-                                        || msg.contains("not enough bytes")
-                                        || msg.contains("accept_begin failed"));
-
-                                if is_short_handshake_failure && self.display_handler.is_client_active() {
-                                    // mstsc can open extra short-lived probe/retry TCP connections
-                                    // after the real connection has already authenticated. Treating
-                                    // those failed side connections as a client disconnect clears the
-                                    // active session pipeline and surfaces as mstsc error 2308.
-                                    warn!("Ignoring short failed side connection from {peer} while an authenticated client is active (lasted {:.0}ms): {msg}", duration.as_secs_f64() * 1000.0);
-                                    skip_disconnect_cleanup = true;
-                                } else if is_reset && duration < std::time::Duration::from_secs(1) {
-                                    // mstsc.exe commonly probes with a short-lived
-                                    // connection before the real one; not an error.
-                                    warn!("Connection from {peer} reset during handshake (likely client probe, lasted {:.0}ms)", duration.as_secs_f64() * 1000.0);
-                                } else if is_reset {
-                                    // Connection was established and running, then reset.
-                                    // This is a real connection failure, not a probe.
-                                    error!("Connection from {peer} reset after {:.1}s (active session lost)", duration.as_secs_f64());
-                                } else {
-                                    error!("Connection error from {peer} after {:.1}s: {msg}", duration.as_secs_f64());
-                                }
-                            }
-
-                            // Prune stale rate limit entries between connections
-                            if let Some(ref validator) = pam_validator {
-                                validator.prune_stale_entries();
-                            }
-                            if let Some(ref validator) = static_password_validator {
-                                validator.prune_stale_entries();
-                            }
-
-                            if skip_disconnect_cleanup {
-                                continue;
-                            }
-
-                            // Emit disconnect event
-                            let duration = conn_start.elapsed().as_secs();
-                            let _ = self.event_tx.send(ServerEvent::ClientDisconnected {
-                                client_id,
-                                reason: "Connection ended".into(),
-                                duration_seconds: duration,
-                            });
-
-                            // Client disconnected (or failed): clean up transient state
-                            // while keeping Portal/PipeWire alive for the next client when
-                            // healthy. If the session/video/input health is invalid, fail
-                            // the daemon so systemd restarts with fresh Portal/PipeWire state.
-                            if !self.on_disconnect().await {
-                                let _ = self.event_tx.send(ServerEvent::StatusChanged {
-                                    old: "running".into(),
-                                    new: "stopped".into(),
-                                    message: "Session health invalidated".into(),
-                                });
-                                break Err(anyhow::anyhow!("session health invalidated"));
-                            }
-
-                            if socket_activated {
-                                info!(
-                                    "Socket-activated connection from {peer} ended; exiting so Portal/RemoteDesktop is not kept active while idle"
-                                );
-                                let _ = self.event_tx.send(ServerEvent::StatusChanged {
-                                    old: "running".into(),
-                                    new: "stopped".into(),
-                                    message: "Socket-activated connection ended".into(),
-                                });
-                                break Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Accept failed: {e}");
-                        }
-                    }
-                }
-                _ = shutdown_rx.recv() => {
-                    info!("Shutdown broadcast received: stopping server");
-                    let _ = self.event_tx.send(ServerEvent::StatusChanged {
-                        old: "running".into(),
-                        new: "stopped".into(),
-                        message: "Shutdown requested".into(),
-                    });
-                    break Ok(());
-                }
-            }
-        };
+        let result =
+            crate::transport::AcceptDispatcher::run(deployment, &mut self.rdp_server).await;
 
         if let Err(ref e) = result {
             error!("Server stopped with error: {:#}", e);
@@ -2174,13 +1936,13 @@ impl LamcoRdpServer {
         Ok(())
     }
 
-    /// Clears transient per-client state, and returns whether this process can
-    /// safely accept another client.
+    /// Clears transient state without closing Portal session (reusable for reconnect).
+    /// The Portal session, PipeWire stream, and input handler survive for the next client.
     ///
-    /// Normal disconnects keep the Portal session, PipeWire stream, and input
-    /// handler alive for the next client. If health is invalid, the current
-    /// Portal/PipeWire handles are not trustworthy after KDE display sleep/wake,
-    /// so the caller should fail the daemon and let systemd restart it.
+    /// Returns `true` if the server can accept another client. Video/input failures
+    /// return `true` because the display pipeline reinitializes per-connection.
+    /// Returns `false` only when the Portal session itself was destroyed by the
+    /// compositor — the D-Bus session object is gone and can't be recreated.
     async fn on_disconnect(&self) -> bool {
         perform_disconnect_cleanup(&self.display_handler, self.health_subscriber.as_ref(), true)
             .await
@@ -2206,44 +1968,35 @@ pub(crate) async fn perform_disconnect_cleanup(
         // but no CPU is wasted on encoding or queue pressure.
         display_handler.on_client_disconnect();
 
-        // Check health state to decide whether this server instance can accept
-        // another client. Invalid health after KDE display sleep/wake often means
-        // the D-Bus objects still exist while PipeWire/input handles are unusable;
-        // fail the daemon so systemd restarts with a fresh session.
-        if let Some(ref subscriber) = self.health_subscriber {
-            let health = subscriber.current();
+        // Drive the clipboard connection-lifecycle teardown: clear the Ready
+        // latch, drop per-connection state, and release any local clipboard
+        // ownership held on the now-gone remote's behalf.
+        display_handler.notify_clipboard_disconnect().await;
+    } else {
+        // A connection that never served (a fast handshake-failure client probe)
+        // must NOT pause the pipeline or tear down clipboard. The real client can
+        // be actively served on an overlapping connection, and pausing it here is
+        // exactly what left frame processing stuck (frames captured, none sent)
+        // after a reconnect.
+        debug!("Unserved/probe disconnect — skipping pipeline pause and clipboard teardown");
+    }
 
-            if health.session.is_failed() {
-                error!("Portal session destroyed — cannot accept new clients");
-                error!("  session: {}", health.session);
-                error!("  video: {}", health.video);
-                error!("  input: {}", health.input);
-                error!("  clipboard: {}", health.clipboard);
-                return false;
-            }
+    // Check health state to decide whether this server instance can accept
+    // another client. Only session destruction (compositor closed the Portal
+    // session) is truly fatal — the D-Bus session object is gone and can't be
+    // recreated without user interaction. Video/input failures are recoverable:
+    // a new client connection restarts the display pipeline.
+    if let Some(subscriber) = health_subscriber {
+        let health = subscriber.current();
 
-            match health.overall {
-                crate::health::OverallHealth::Invalid => {
-                    error!(
-                        "Session health is invalid — restarting daemon to rebuild Portal/PipeWire state"
-                    );
-                    error!("  session: {}", health.session);
-                    error!("  video: {}", health.video);
-                    error!("  input: {}", health.input);
-                    error!("  clipboard: {}", health.clipboard);
-                    return false;
-                }
-                crate::health::OverallHealth::Degraded => {
-                    warn!("Session health is degraded — will accept new clients cautiously");
-                    warn!("  video: {}", health.video);
-                    warn!("  input: {}", health.input);
-                }
-                _ => {
-                    info!("Disconnect cleanup complete - ready for next connection");
-                }
-            }
-        } else {
-            info!("Disconnect cleanup complete - ready for next connection");
+        if health.session.is_failed() {
+            // Session destroyed by compositor — irrecoverable without restart
+            error!("Portal session destroyed — cannot accept new clients");
+            error!("  session: {}", health.session);
+            error!("  video: {}", health.video);
+            error!("  input: {}", health.input);
+            error!("  clipboard: {}", health.clipboard);
+            return false;
         }
 
         match health.overall {
@@ -2304,135 +2057,14 @@ impl Drop for LamcoRdpServer {
 
 /// Resolve the effective security mode from config.
 ///
-/// "auto" resolves to "hybrid" only for authentication backends that can
-/// provide plaintext/equivalent credentials to CredSSP. Hashed static password
-/// auth deliberately stays TLS-only because Argon2id hashes cannot be reversed
-/// into NTLM/CredSSP credentials.
+/// "auto" resolves to "hybrid" when credentials are available (auth != "none"),
+/// "tls" otherwise. Explicit "hybrid" or "tls" pass through.
 fn resolve_security_mode(security_mode: &str, effective_auth_method: &str) -> bool {
     match security_mode {
         "hybrid" => true,
-        "auto" => effective_auth_method != "none" && effective_auth_method != "password",
+        "auto" => effective_auth_method != "none",
         _ => false, // "tls" or unknown
     }
-}
-
-fn create_tcp_socket_for_addr(addr: SocketAddr) -> std::io::Result<tokio::net::TcpSocket> {
-    if addr.is_ipv4() {
-        tokio::net::TcpSocket::new_v4()
-    } else {
-        tokio::net::TcpSocket::new_v6()
-    }
-}
-
-/// Return a listener handed to us by systemd socket activation, if present.
-///
-/// This lets the user enable `lamco-rdp-server.socket` instead of the always-on
-/// service. systemd owns and listens on port 3389 while lamco is stopped; the
-/// first incoming TCP connection starts lamco, and only then do we create the
-/// KDE Portal RemoteDesktop/ScreenCast session. That avoids showing the KDE
-/// desktop as "remote desktop is active" just because the user service started.
-fn systemd_activated_listener(
-    expected_addr: SocketAddr,
-) -> Result<Option<tokio::net::TcpListener>> {
-    const SD_LISTEN_FDS_START: i32 = 3;
-
-    let listen_fds = match std::env::var("LISTEN_FDS") {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-
-    let listen_fds: i32 = listen_fds
-        .parse()
-        .context("Invalid LISTEN_FDS from systemd socket activation")?;
-    if listen_fds <= 0 {
-        return Ok(None);
-    }
-
-    if let Ok(listen_pid) = std::env::var("LISTEN_PID") {
-        let listen_pid: u32 = listen_pid
-            .parse()
-            .context("Invalid LISTEN_PID from systemd socket activation")?;
-        if listen_pid != std::process::id() {
-            debug!(
-                "Ignoring systemd socket activation for LISTEN_PID={} (current pid={})",
-                listen_pid,
-                std::process::id()
-            );
-            return Ok(None);
-        }
-    }
-
-    if listen_fds > 1 {
-        warn!(
-            "systemd passed {} socket activation FDs; using fd {} and ignoring the rest",
-            listen_fds, SD_LISTEN_FDS_START
-        );
-    }
-
-    let fd = SD_LISTEN_FDS_START;
-    // SAFETY: fd 3 is the well-known first socket-activation file descriptor
-    // documented by sd_listen_fds(3). From here on this TcpListener owns it.
-    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-    std_listener
-        .set_nonblocking(true)
-        .context("Failed to set systemd-activated listener nonblocking")?;
-
-    let actual_addr = std_listener
-        .local_addr()
-        .context("Systemd-activated fd is not a TCP listener")?;
-    if actual_addr.port() != expected_addr.port() {
-        warn!(
-            "systemd-activated listener is bound to {}, but config listen_addr is {}; using activated listener",
-            actual_addr, expected_addr
-        );
-    } else {
-        info!(
-            "Using systemd-activated TCP listener on {} (config listen_addr={})",
-            actual_addr, expected_addr
-        );
-    }
-
-    tokio::net::TcpListener::from_std(std_listener)
-        .map(Some)
-        .context("Failed to adopt systemd-activated listener")
-}
-
-/// Return true when systemd passed a listening socket but there is no queued
-/// connection to accept yet.
-///
-/// User units can be globally enabled by a package while a user-level socket is
-/// also active. systemd passes socket FDs to any start of the service, even a
-/// graphical-session start that was not caused by an incoming RDP connection.
-/// Polling fd 3 before Portal initialization lets those non-connection starts
-/// exit quietly without making KDE show an active remote-desktop session.
-pub fn systemd_socket_activation_without_pending_connection() -> bool {
-    const SD_LISTEN_FDS_START: i32 = 3;
-
-    let listen_fds = match std::env::var("LISTEN_FDS") {
-        Ok(value) => value.parse::<i32>().unwrap_or(0),
-        Err(_) => return false,
-    };
-    if listen_fds <= 0 {
-        return false;
-    }
-
-    if let Ok(listen_pid) = std::env::var("LISTEN_PID")
-        && let Ok(listen_pid) = listen_pid.parse::<u32>()
-        && listen_pid != std::process::id()
-    {
-        return false;
-    }
-
-    let mut pollfd = libc::pollfd {
-        fd: SD_LISTEN_FDS_START,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-
-    // SAFETY: poll(2) is called with a valid pointer to one pollfd, a count of
-    // one, and a zero timeout. It does not take ownership of the fd.
-    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
-    ready == 0
 }
 
 /// Check if a port is available before attempting to bind.
@@ -2575,25 +2207,6 @@ async fn send_portal_notification(id: &str, title: &str, body: &str, high_priori
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-
-    use super::create_tcp_socket_for_addr;
-
-    #[test]
-    fn create_tcp_socket_for_addr_binds_ipv4() {
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let socket = create_tcp_socket_for_addr(addr).expect("create IPv4 socket");
-
-        socket.bind(addr).expect("bind IPv4 socket");
-    }
-
-    #[test]
-    fn create_tcp_socket_for_addr_binds_ipv6() {
-        let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, 0));
-        let socket = create_tcp_socket_for_addr(addr).expect("create IPv6 socket");
-
-        socket.bind(addr).expect("bind IPv6 socket");
-    }
 
     #[tokio::test]
     #[ignore = "Requires D-Bus and portal access"]

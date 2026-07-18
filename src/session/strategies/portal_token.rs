@@ -25,7 +25,6 @@ use std::sync::{
 };
 
 use anyhow::{Result, anyhow};
-use ashpd::desktop::remote_desktop::{KeyState, RemoteDesktop};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use tracing::{debug, error, info, warn};
@@ -276,24 +275,17 @@ impl SessionHandle for PortalSessionHandleImpl {
             .map_err(|e| self.handle_input_error(e, "keyboard keycode"))
     }
 
-    async fn notify_keyboard_keysym(&self, keysym: i32, pressed: bool) -> Result<()> {
+    async fn notify_keyboard_keysym(&self, keysym: u32, pressed: bool) -> Result<()> {
         if !self.session_valid.load(Ordering::Acquire) {
-            return Err(anyhow!(
-                "Portal session invalid — cannot send keyboard keysym"
-            ));
+            return Err(anyhow!("Portal session invalid — cannot send keysym event"));
+        }
+        if !self.stream_active.load(Ordering::Acquire) {
+            return Err(anyhow!("Portal stream paused — input suspended"));
         }
 
-        let state = if pressed {
-            KeyState::Pressed
-        } else {
-            KeyState::Released
-        };
         let session = self.session.read().await;
-        let remote_desktop = RemoteDesktop::new()
-            .await
-            .map_err(|e| self.handle_input_error(e, "keyboard keysym proxy"))?;
-        remote_desktop
-            .notify_keyboard_keysym(&session, keysym, state)
+        self.remote_desktop
+            .notify_keyboard_keysym(&session, keysym as i32, pressed)
             .await
             .map_err(|e| self.handle_input_error(e, "keyboard keysym"))
     }

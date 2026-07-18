@@ -23,9 +23,7 @@ use crate::{
         message::{DamageTrackingPreset, EgfxPreset, Message, PerformancePreset},
         server_connection::{ConnectionMode, ServerConnection},
         server_process::ServerLogLine,
-        state::{
-            AppState, CertGenState, EditStrings, LogLevel, LogLine, MessageLevel, Tab, TabCategory,
-        },
+        state::{AppState, CertGenState, LogLevel, LogLine, MessageLevel, Tab, TabCategory},
         tabs, theme as app_theme,
     },
 };
@@ -144,19 +142,21 @@ impl ConfigGuiApp {
 
             Message::ServerListenAddrChanged(addr) => {
                 self.state.edit_strings.server_ip = addr;
-                self.state.config.server.listen_addr = EditStrings::compose_listen_addr(
+                let composed = crate::gui::state::compose_listen_addr(
                     &self.state.edit_strings.server_ip,
                     &self.state.edit_strings.server_port,
                 );
+                self.state.config.server.listen_addr = composed;
                 self.state.mark_dirty();
                 Task::none()
             }
             Message::ServerPortChanged(port) => {
                 self.state.edit_strings.server_port = port;
-                self.state.config.server.listen_addr = EditStrings::compose_listen_addr(
+                let composed = crate::gui::state::compose_listen_addr(
                     &self.state.edit_strings.server_ip,
                     &self.state.edit_strings.server_port,
                 );
+                self.state.config.server.listen_addr = composed;
                 self.state.mark_dirty();
                 Task::none()
             }
@@ -347,14 +347,12 @@ impl ConfigGuiApp {
                 Task::none()
             }
             Message::SecurityPasswordUsernameChanged(username) => {
-                self.state.edit_strings.password_username = username.clone();
-                // The username field selects which entry in password_credentials
-                // will be added/updated when a new password is entered.
+                self.state.edit_strings.password_username = username;
                 self.state.mark_dirty();
                 Task::none()
             }
             Message::SecurityPasswordChanged(password) => {
-                self.state.edit_strings.password = password.clone();
+                self.state.edit_strings.password.clone_from(&password);
                 let username = self.state.edit_strings.password_username.trim().to_string();
                 if password.is_empty() {
                     if !username.is_empty() {
@@ -368,7 +366,7 @@ impl ConfigGuiApp {
                 } else if username.is_empty() {
                     self.state.add_message(
                         MessageLevel::Error,
-                        "Enter a username before setting a password".to_string(),
+                        "Enter a username before setting a static password".to_string(),
                     );
                 } else {
                     match crate::security::hash_static_password(&password) {
@@ -380,12 +378,7 @@ impl ConfigGuiApp {
                                 .insert(username, hash);
                             self.state.mark_dirty();
                         }
-                        Err(e) => {
-                            self.state.add_message(
-                                MessageLevel::Error,
-                                format!("Failed to hash password: {e}"),
-                            );
-                        }
+                        Err(e) => self.state.add_message(MessageLevel::Error, e.to_string()),
                     }
                 }
                 Task::none()

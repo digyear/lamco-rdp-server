@@ -283,6 +283,7 @@ mod tests {
             LamcoConnectionHandler::new(
                 self.event_tx.clone(),
                 None,
+                None,
                 cb,
                 Arc::new(tokio::sync::broadcast::channel::<()>(1).0),
             )

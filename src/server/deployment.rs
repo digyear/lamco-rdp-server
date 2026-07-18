@@ -17,7 +17,7 @@ use crate::{
     config::Config,
     dbus::ServerEvent,
     health::HealthSubscriber,
-    security::auth::PamValidator,
+    security::auth::{PamValidator, StaticPasswordValidator},
     session::strategy::{PipeWireAccess, SessionHandle, SessionLifecyclePolicy},
     transport::{
         AcceptDeployment, ActivatedFds, LamcoConnectionHandler, Listener,
@@ -31,6 +31,7 @@ pub(crate) struct WlrDirectDeployment {
     health_subscriber: Option<HealthSubscriber>,
     event_tx: mpsc::UnboundedSender<ServerEvent>,
     pam_validator: Option<Arc<PamValidator>>,
+    static_password_validator: Option<Arc<StaticPasswordValidator>>,
     shutdown_broadcast: Arc<broadcast::Sender<()>>,
     /// Session handle whose lifecycle policy drives per-connect establishment
     /// and per-disconnect release (see `build_handler`).
@@ -45,6 +46,7 @@ impl WlrDirectDeployment {
         health_subscriber: Option<HealthSubscriber>,
         event_tx: mpsc::UnboundedSender<ServerEvent>,
         pam_validator: Option<Arc<PamValidator>>,
+        static_password_validator: Option<Arc<StaticPasswordValidator>>,
         shutdown_broadcast: Arc<broadcast::Sender<()>>,
         session_handle: Arc<dyn SessionHandle>,
         activated_fds: ActivatedFds,
@@ -55,6 +57,7 @@ impl WlrDirectDeployment {
             health_subscriber,
             event_tx,
             pam_validator,
+            static_password_validator,
             shutdown_broadcast,
             session_handle,
             activated_fds,
@@ -253,6 +256,7 @@ impl AcceptDeployment for WlrDirectDeployment {
         LamcoConnectionHandler::new(
             self.event_tx.clone(),
             self.pam_validator.clone(),
+            self.static_password_validator.clone(),
             on_disconnect,
             Arc::clone(&self.shutdown_broadcast),
         )

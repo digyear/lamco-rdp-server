@@ -8,14 +8,13 @@ Connect to your Linux desktop from any RDP client (Windows, macOS, Linux, iOS, A
 
 ---
 
-## Fork Improvements (v1.4.3)
+## Fork Improvements (rebased on v1.4.4)
 
 This fork adds several features and fixes for practical KDE Plasma / Wayland deployments where upstream lacks support:
 
 ### New Features
 - **Static password authentication** -- configurable multi-user static passwords without PAM dependency. Ideal for headless or containerized deployments where PAM is undesirable or difficult to configure. Supports multiple username/password pairs via `config.toml` or GUI.
-- **IPv6 listen address** -- bind to `[::1]:3389` or any IPv6 address, in addition to IPv4.
-- **CJK (Chinese/Japanese/Korean) input** -- RDP Unicode keyboard events are routed through clipboard-paste fallback with synthetic Ctrl+V, enabling Chinese input from Windows/macOS RDP clients that send committed IME text as Unicode events.
+- **Upstreamed capabilities** -- IPv6 listening and Unicode keyboard mapping are now provided directly by upstream v1.4.4.
 
 ### KDE Plasma Fixes
 - **Clipboard sync restoration** -- fixes the issue where KDE Plasma sessions using data-control strategy had no working clipboard. Wires the `wl-data-control` / `wl-clipboard` provider independently of Portal Clipboard.
@@ -25,7 +24,7 @@ This fork adds several features and fixes for practical KDE Plasma / Wayland dep
 - **Session preservation** -- keeps active RDP sessions alive when mstsc opens short side-connections after initial authentication.
 
 ### Android / Microsoft RD Client Fixes
-- **Android black-screen recovery** -- fixes Microsoft RD Client on Android showing a black screen while mouse/input still worked after EGFX reconnect cleanup. Android can advertise EGFX with `AVC_DISABLED`; the server now preserves the connection-owned EGFX handler state and `GfxServerHandle` after channel attach so the Planar/RemoteFX fallback path can initialize instead of falling through to FastPath bitmap fallback. Windows Remote Desktop clients continue to use the normal AVC/EGFX path.
+- **Android AVC-disabled handling** -- honors `AVC_DISABLED` in V10.x EGFX capability sets so Microsoft RD Client can use the upstream v1.4.4 uncompressed EGFX fallback rather than being incorrectly treated as H.264-capable.
 
 ### Build
 - Debian package (`lamco-rdp-server_1.4.3-1_amd64.deb`) built and tested on Parrot Security 7.2 / Debian 13 with KDE Plasma on Wayland.

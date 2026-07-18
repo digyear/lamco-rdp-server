@@ -536,188 +536,6 @@ impl EgfxFrameSender {
         Ok(frame_id)
     }
 
-    /// Send a Planar-encoded frame through EGFX.
-    ///
-    /// Planar codec (0xa) is supported by the MS Android RD Client.
-    /// Used when AVC is disabled and RemoteFX is not supported by the client.
-    ///
-    /// The `planar_encoder` should be created once and reused across frames.
-    pub async fn send_planar_frame(
-        &self,
-        planar_encoder: &mut ironrdp_graphics::rdp6::BitmapStreamEncoder,
-        bitmap: &ironrdp_server::BitmapUpdate,
-        display_width: u16,
-        display_height: u16,
-        timestamp_ms: u32,
-    ) -> SendResult<u32> {
-        let state = self
-            .handler_state
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or(SendError::NotReady)?;
-
-        if !state.is_ready {
-            return Err(SendError::NotReady);
-        }
-
-        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
-
-        // Encode to RDP6_BITMAP_STREAM (Planar codec, codec_id=0xa).
-        // PipeWire delivers BGRx32 (B=byte0, G=byte1, R=byte2, X=byte3),
-        // so BgrAChannels must be used for correct RGB channel mapping.
-        //
-        // BitmapStreamEncoder stores width/height and uses them to split the pixel
-        // iterator into per-scanline RLE segments. If the stored dimensions differ
-        // from the actual frame, the delta encoding uses the wrong row boundary and
-        // produces striped corruption. Rebuild from actual frame dimensions on every
-        // call — encoder construction is O(1) with no allocation.
-        let w = bitmap.width.get() as usize;
-        let h = bitmap.height.get() as usize;
-        *planar_encoder = ironrdp_graphics::rdp6::BitmapStreamEncoder::new(w, h);
-        let mut planar_buf = vec![0u8; w * h * 4 + 1024];
-        let encoded_len = planar_encoder
-            .encode_bitmap::<ironrdp_graphics::rdp6::BgrAChannels>(
-                &bitmap.data,
-                &mut planar_buf,
-                true,
-            )
-            .map_err(|e| SendError::EncodingFailed(format!("Planar encode: {e}")))?;
-        let planar_data = &planar_buf[..encoded_len];
-
-        let count_before = self.frame_count.load(std::sync::atomic::Ordering::Relaxed);
-        if count_before == 0 {
-            tracing::info!(
-                "EGFX Planar first frame: surface={} {}x{} raw={}B encoded={}B (ratio={:.1}x)",
-                surface_id,
-                display_width,
-                display_height,
-                bitmap.data.len(),
-                encoded_len,
-                bitmap.data.len() as f32 / encoded_len.max(1) as f32,
-            );
-        }
-
-        let (frame_id, dvc_messages, channel_id) = {
-            let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
-            let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
-
-            let frame_id = server
-                .send_planar_frame(
-                    surface_id,
-                    planar_data,
-                    display_width,
-                    display_height,
-                    timestamp_ms,
-                )
-                .ok_or(SendError::Backpressure)?;
-
-            let messages = server.drain_output();
-            (frame_id, messages, channel_id)
-        };
-
-        if !dvc_messages.is_empty() {
-            let svc_messages =
-                encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
-                    .map_err(|e| SendError::EncodingFailed(e.to_string()))?;
-
-            let event = ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                messages: svc_messages,
-            });
-
-            self.event_tx
-                .send(event)
-                .map_err(|_| SendError::ChannelClosed)?;
-        }
-
-        let count = self
-            .frame_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count.is_multiple_of(30) {
-            debug!(
-                "EGFX Planar: Sent frame {} (id={}, {}x{}, {}B encoded)",
-                count, frame_id, display_width, display_height, encoded_len,
-            );
-        }
-
-        Ok(frame_id)
-    }
-
-    /// Send an uncompressed frame via EGFX channel
-    ///
-    /// Uses Codec1Type::Uncompressed (0x0) - sends raw RGB data.
-    /// This is a diagnostic tool to test if the EGFX channel works without Planar encoding.
-    pub async fn send_uncompressed_frame(
-        &self,
-        bitmap: &ironrdp_server::BitmapUpdate,
-        display_width: u16,
-        display_height: u16,
-        timestamp_ms: u32,
-    ) -> SendResult<u32> {
-        let state = self
-            .handler_state
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .ok_or(SendError::NotReady)?;
-
-        if !state.is_ready {
-            return Err(SendError::NotReady);
-        }
-
-        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
-
-        // Send raw bitmap data via EGFX with Codec1Type::Uncompressed
-        let (frame_id, dvc_messages, channel_id) = {
-            let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
-            let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
-
-            let frame_id = server
-                .send_uncompressed_frame(
-                    surface_id,
-                    &bitmap.data,
-                    display_width,
-                    display_height,
-                    timestamp_ms,
-                )
-                .ok_or(SendError::Backpressure)?;
-
-            let messages = server.drain_output();
-            (frame_id, messages, channel_id)
-        };
-
-        if !dvc_messages.is_empty() {
-            let svc_messages =
-                encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
-                    .map_err(|e| SendError::EncodingFailed(e.to_string()))?;
-
-            let event = ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                messages: svc_messages,
-            });
-
-            self.event_tx
-                .send(event)
-                .map_err(|_| SendError::ChannelClosed)?;
-        }
-
-        let count = self
-            .frame_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        tracing::info!(
-            "📹 EGFX Uncompressed: frame {} (id={}, {}x{}, {} bytes raw)",
-            count,
-            frame_id,
-            display_width,
-            display_height,
-            bitmap.data.len(),
-        );
-
-        Ok(frame_id)
-    }
-
     /// Check if AVC444 is supported by the client
     ///
     /// AVC444 requires V10+ EGFX capabilities. The handler negotiates this
@@ -927,19 +745,8 @@ impl EgfxFrameSender {
             return Err(SendError::Avc420NotSupported);
         }
 
-        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
-
-        // CRITICAL: Full-frame AVC updates must use the encoded dimensions.
-        // Windows mstsc expects the AVC420 region to cover the entire H.264
-        // bitstream/surface. For non-16-aligned desktop sizes the bitstream is
-        // padded (e.g. 1584×756 -> 1584×768); sending a visible-size region for
-        // an IDR/full-frame update leaves the bottom macroblocks outside the
-        // region and mstsc black-screens/rejects the frame.
-        //
-        // The caller represents forced full frames as a single full-display
-        // DamageRegion, not as an empty slice, so check both forms here.
-        let regions = if is_full_frame_update(damage_regions, display_width, display_height) {
-            vec![Avc420Region::full_frame(encoded_width, encoded_height, 22)]
+        let surface_id = if self.handler_state.has_surface.load(Acquire) {
+            self.handler_state.primary_surface_id.load(Acquire)
         } else {
             return Err(SendError::NoSurface);
         };
@@ -1052,13 +859,8 @@ impl EgfxFrameSender {
             return Err(SendError::Avc444NotSupported);
         }
 
-        let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
-
-        // Same full-frame rule as send_frame_with_regions: a forced full-display
-        // update must cover the 16-aligned encoded bitstream, not just the
-        // visible desktop rectangle.
-        let regions = if is_full_frame_update(damage_regions, display_width, display_height) {
-            vec![Avc420Region::full_frame(encoded_width, encoded_height, 22)]
+        let surface_id = if self.handler_state.has_surface.load(Acquire) {
+            self.handler_state.primary_surface_id.load(Acquire)
         } else {
             return Err(SendError::NoSurface);
         };
@@ -1224,35 +1026,31 @@ mod tests {
     }
 
     #[test]
-    fn full_display_damage_region_is_full_frame_update() {
-        assert!(is_full_frame_update(&[], 1584, 756));
-        assert!(is_full_frame_update(
-            &[DamageRegion::full_frame(1584, 756)],
-            1584,
-            756
-        ));
-        assert!(is_full_frame_update(
-            &[DamageRegion::new(0, 0, 1584, 768)],
-            1584,
-            756
-        ));
-        assert!(!is_full_frame_update(
-            &[DamageRegion::new(0, 0, 1584, 755)],
-            1584,
-            756
-        ));
-        assert!(!is_full_frame_update(
-            &[DamageRegion::new(10, 0, 1574, 756)],
-            1584,
-            756
-        ));
-        assert!(!is_full_frame_update(
-            &[
-                DamageRegion::new(0, 0, 792, 756),
-                DamageRegion::new(792, 0, 792, 756),
-            ],
-            1584,
-            756
-        ));
+    fn test_egfx_sender_readiness_from_shared_state() {
+        use std::sync::{Arc, atomic::Ordering};
+
+        use crate::server::gfx_factory::SharedHandlerState;
+
+        let state = Arc::new(SharedHandlerState::new());
+
+        // Not ready initially
+        assert!(!state.is_ready.load(Ordering::Acquire));
+
+        // Set ready + AVC420
+        state.is_ready.store(true, Ordering::Release);
+        state.client_supports_avc420.store(true, Ordering::Release);
+
+        assert!(state.is_ready.load(Ordering::Acquire));
+        assert!(state.client_supports_avc420.load(Ordering::Acquire));
+
+        // Set AVC444
+        state.is_avc444_enabled.store(true, Ordering::Release);
+        assert!(state.is_avc444_enabled.load(Ordering::Acquire));
+
+        // Surface
+        state.has_surface.store(true, Ordering::Release);
+        state.primary_surface_id.store(5, Ordering::Release);
+        assert!(state.has_surface.load(Ordering::Acquire));
+        assert_eq!(state.primary_surface_id.load(Ordering::Acquire), 5);
     }
 }

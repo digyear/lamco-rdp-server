@@ -67,10 +67,7 @@
 use std::{
     num::{NonZeroU16, NonZeroUsize},
     os::fd::{IntoRawFd, OwnedFd},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Instant,
 };
 
@@ -78,8 +75,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate as IronBitmapUpdate, DesktopSize, DisplayUpdate, GfxServerHandle,
-    PixelFormat as IronPixelFormat, RGBAPointer, RdpServerDisplay, RdpServerDisplayUpdates,
-    ServerEvent,
+    PixelFormat as IronPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates, ServerEvent,
 };
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -87,7 +83,7 @@ use tracing::{debug, error, info, trace, warn};
 use super::pipeline_decisions;
 use crate::{
     damage::{DamageConfig, DamageDetector, DamageRegion},
-    egfx::{Avc420Encoder, Avc444Encoder, ColorSpaceConfig, EncoderConfig, align_to_16},
+    egfx::{Avc420Encoder, Avc444Encoder, ColorSpaceConfig, EncoderConfig},
     performance::{AdaptiveFpsController, EncodingDecision, LatencyGovernor, LatencyMode},
     pipewire::{PipeWireThreadCommand, PipeWireThreadManager, VideoFrame},
     portal::StreamInfo,
@@ -96,10 +92,8 @@ use crate::{
         gfx_factory::SharedHandlerState, input_handler::LamcoInputHandler,
     },
     services::{ServiceId, ServiceRegistry},
-    video::{BitmapConverter, BitmapData, BitmapUpdate, RdpPixelFormat, Rectangle},
+    video::{BitmapConverter, BitmapUpdate, RdpPixelFormat},
 };
-
-static LOGGED_FIRST_BITMAP_UPDATE: AtomicBool = AtomicBool::new(false);
 
 /// Client-initiated resize request
 ///
@@ -382,80 +376,6 @@ pub struct LamcoDisplayHandler {
 }
 
 impl LamcoDisplayHandler {
-    fn pad_frame_to_aligned(
-        data: &[u8],
-        width: u32,
-        height: u32,
-        aligned_width: u32,
-        aligned_height: u32,
-    ) -> Vec<u8> {
-        let bytes_per_pixel = 4;
-        let src_stride = width * bytes_per_pixel;
-        let dst_stride = aligned_width * bytes_per_pixel;
-        let mut padded = vec![0u8; (aligned_width * aligned_height * bytes_per_pixel) as usize];
-
-        for y in 0..height {
-            let src_offset = (y * src_stride) as usize;
-            let dst_offset = (y * dst_stride) as usize;
-            padded[dst_offset..dst_offset + src_stride as usize]
-                .copy_from_slice(&data[src_offset..src_offset + src_stride as usize]);
-
-            if aligned_width > width {
-                let last_pixel_src = src_offset + (src_stride - bytes_per_pixel) as usize;
-                for x in width..aligned_width {
-                    let dst_offset = (y * dst_stride + x * bytes_per_pixel) as usize;
-                    padded[dst_offset..dst_offset + bytes_per_pixel as usize].copy_from_slice(
-                        &data[last_pixel_src..last_pixel_src + bytes_per_pixel as usize],
-                    );
-                }
-            }
-        }
-
-        if aligned_height > height {
-            let last_row_offset = ((height - 1) * dst_stride) as usize;
-            let last_row = padded[last_row_offset..last_row_offset + dst_stride as usize].to_vec();
-            for y in height..aligned_height {
-                let dst_offset = (y * dst_stride) as usize;
-                padded[dst_offset..dst_offset + dst_stride as usize].copy_from_slice(&last_row);
-            }
-        }
-
-        padded
-    }
-
-    fn crop_frame_to_size(frame: &VideoFrame, width: u16, height: u16) -> VideoFrame {
-        let target_width = u32::from(width).min(frame.width);
-        let target_height = u32::from(height).min(frame.height);
-
-        if target_width == frame.width && target_height == frame.height {
-            return frame.clone();
-        }
-
-        let bytes_per_pixel = frame.format.bytes_per_pixel() as u32;
-        let row_bytes = target_width * bytes_per_pixel;
-        // Keep cropped video frames compact. EGFX AVC/Planar encoders validate
-        // data_len == width * height * bytes_per_pixel; leaking stride padding
-        // here causes Android-sized frames such as 1596×768 to become 1600×768
-        // worth of bytes while still being advertised as 1596×768.
-        let target_stride = row_bytes;
-        let mut cropped = vec![0u8; (row_bytes * target_height) as usize];
-
-        for y in 0..target_height {
-            let src_offset = (y * frame.stride) as usize;
-            let dst_offset = (y * row_bytes) as usize;
-            cropped[dst_offset..dst_offset + row_bytes as usize]
-                .copy_from_slice(&frame.data[src_offset..src_offset + row_bytes as usize]);
-        }
-
-        let mut out = frame.clone();
-        out.width = target_width;
-        out.height = target_height;
-        out.stride = target_stride;
-        out.data = Arc::new(cropped);
-        out.damage_regions.clear();
-        out
-    }
-
     #[expect(
         clippy::too_many_arguments,
         reason = "display handler needs pipeline components at construction"
@@ -737,13 +657,91 @@ impl LamcoDisplayHandler {
         info!("Client disconnect signaled to pipeline - frame processing paused");
     }
 
-    /// Whether a client is currently marked active by the display pipeline.
+    /// Rebind the capture pipeline to a new PipeWire node after a session
+    /// re-establishment (the `PerConnection` lifecycle re-creates the compositor
+    /// session, which yields a fresh node). Destroys the stream on the old node
+    /// and creates one on the new node; a no-op if the node is unchanged (the
+    /// common first-connection case, where the startup session is reused).
     ///
-    /// mstsc can open extra short-lived probe/retry TCP connections while the
-    /// authenticated session is active. Those failed probe connections must not
-    /// clear the active session's pipeline state.
-    pub fn is_client_active(&self) -> bool {
-        self.client_active.load(std::sync::atomic::Ordering::SeqCst)
+    /// NOTE: this does not rewrite `stream_info`, so a client resize *after* a
+    /// rebind still references the startup node. Revisit if per-connection
+    /// resize on the Mutter-direct path becomes a requirement.
+    pub async fn rebind_capture_node(
+        &self,
+        old_node: u32,
+        new_node: u32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if old_node == new_node {
+            // Not a no-op: the re-established session's stream can land on the
+            // same node id as the stopped one. The old PipeWire stream is dead,
+            // so we still Destroy + Create to reconnect to the new source.
+            debug!(
+                "[capture-rebind] Node id {new_node} reused by re-established session — recreating stream"
+            );
+        }
+        info!(
+            old_node,
+            new_node, width, height, "[capture-rebind] Rebinding capture pipeline to new node"
+        );
+
+        // Destroy the stream on the old (now-defunct) node.
+        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let mgr = self.pipewire_thread.lock().await;
+            if let Err(e) = mgr.send_command(PipeWireThreadCommand::DestroyStream {
+                stream_id: old_node,
+                response_tx: resp_tx,
+            }) {
+                warn!("[capture-rebind] Failed to send DestroyStream for old node {old_node}: {e}");
+            } else {
+                match resp_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(Ok(())) => info!("[capture-rebind] Old stream {old_node} destroyed"),
+                    Ok(Err(e)) => warn!("[capture-rebind] DestroyStream({old_node}) failed: {e}"),
+                    Err(_) => warn!("[capture-rebind] DestroyStream({old_node}) timeout"),
+                }
+            }
+        }
+
+        // Create a stream on the re-established node.
+        let config = lamco_pipewire::StreamConfig {
+            name: "monitor-0".to_string(),
+            width,
+            height,
+            framerate: 60,
+            use_dmabuf: self.use_dmabuf,
+            buffer_count: 3,
+            preferred_format: Some(lamco_pipewire::PixelFormat::BGRx),
+            dmabuf_passthrough: false,
+        };
+        let (resp_tx2, resp_rx2) = std::sync::mpsc::sync_channel(1);
+        let mgr = self.pipewire_thread.lock().await;
+        if let Err(e) = mgr.send_command(PipeWireThreadCommand::CreateStream {
+            stream_id: new_node,
+            node_id: new_node,
+            config,
+            response_tx: resp_tx2,
+        }) {
+            warn!("[capture-rebind] Failed to send CreateStream for new node {new_node}: {e}");
+            return false;
+        }
+        match resp_rx2.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => {
+                self.capture_node
+                    .store(new_node, std::sync::atomic::Ordering::Relaxed);
+                info!("[capture-rebind] New stream {new_node} created at {width}x{height}");
+                true
+            }
+            Ok(Err(e)) => {
+                warn!("[capture-rebind] CreateStream({new_node}) failed: {e}");
+                false
+            }
+            Err(_) => {
+                warn!("[capture-rebind] CreateStream({new_node}) timeout");
+                false
+            }
+        }
     }
 
     /// Set graphics queue sender for priority multiplexing
@@ -797,6 +795,52 @@ impl LamcoDisplayHandler {
         *self.update_sender.lock().await = new_sender;
         *self.update_receiver.lock().await = Some(new_receiver);
         debug!("Display update channel reset for new client");
+    }
+
+    /// Pad frame to aligned dimensions (16-pixel boundary)
+    ///
+    /// MS-RDPEGFX requires surface dimensions to be multiples of 16.
+    /// This function pads the frame by replicating edge pixels.
+    fn pad_frame_to_aligned(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        aligned_width: u32,
+        aligned_height: u32,
+    ) -> Vec<u8> {
+        let bytes_per_pixel = 4; // BGRA
+        let src_stride = width * bytes_per_pixel;
+        let dst_stride = aligned_width * bytes_per_pixel;
+        let mut padded = vec![0u8; (aligned_width * aligned_height * bytes_per_pixel) as usize];
+
+        for y in 0..height {
+            let src_offset = (y * src_stride) as usize;
+            let dst_offset = (y * dst_stride) as usize;
+            padded[dst_offset..dst_offset + src_stride as usize]
+                .copy_from_slice(&data[src_offset..src_offset + src_stride as usize]);
+
+            if aligned_width > width {
+                let last_pixel_src = src_offset + (src_stride - bytes_per_pixel) as usize;
+                for x in width..aligned_width {
+                    let dst_offset = (y * dst_stride + x * bytes_per_pixel) as usize;
+                    padded[dst_offset..dst_offset + bytes_per_pixel as usize].copy_from_slice(
+                        &data[last_pixel_src..last_pixel_src + bytes_per_pixel as usize],
+                    );
+                }
+            }
+        }
+
+        if aligned_height > height {
+            let last_row_offset = ((height - 1) * dst_stride) as usize;
+            // Create a copy of the last row to avoid borrow checker issues
+            let last_row = padded[last_row_offset..last_row_offset + dst_stride as usize].to_vec();
+            for y in height..aligned_height {
+                let dst_offset = (y * dst_stride) as usize;
+                padded[dst_offset..dst_offset + dst_stride as usize].copy_from_slice(&last_row);
+            }
+        }
+
+        padded
     }
 
     /// Check if EGFX is ready for frame sending
@@ -1329,11 +1373,9 @@ impl LamcoDisplayHandler {
             let mut egfx_gate_bypassed = false;
             let mut was_client_active = false;
             // Set after PipeWire CreateStream during resize — cleared when the
-            // first frame from the new stream arrives. Keep the RDP desktop at
-            // the client-requested size; PipeWire may still return the compositor
-            // source size, which must be cropped before encoding instead of being
-            // advertised back to the RDP client.
-            let mut pending_resize: Option<DesktopSize> = None;
+            // first frame from the new stream arrives and we finalize the resize
+            // using the actual negotiated resolution
+            let mut pending_resize = false;
             let zero_frame_threshold = std::time::Duration::from_secs(10);
 
             // === PTS INTERVAL TRACKING ===
@@ -1526,14 +1568,12 @@ impl LamcoDisplayHandler {
                                 };
 
                                 if create_ok {
-                                    // Defer EGFX reinitialization until the first frame arrives
-                                    // from the new stream. Keep the RDP desktop at the
-                                    // client-requested resolution; if the compositor returns
-                                    // a larger source frame, the pipeline crops it before encoding.
-                                    pending_resize = Some(DesktopSize {
-                                        width: req.width,
-                                        height: req.height,
-                                    });
+                                    // Defer display update until the first frame arrives
+                                    // from the new stream. The compositor controls the
+                                    // actual output resolution — it may differ from what
+                                    // we requested. We use the frame's negotiated
+                                    // width/height to tell the RDP client the truth.
+                                    pending_resize = true;
 
                                     // Reset pipeline encoder state so the first frame
                                     // from the new stream triggers full re-init
@@ -1654,22 +1694,25 @@ impl LamcoDisplayHandler {
                         // Mark that we've received at least one frame
                         first_frame_received = true;
 
-                        // Finalize deferred resize. The RDP desktop stays at the
-                        // client-requested size; the PipeWire frame may be larger
-                        // and will be cropped before encoding.
-                        if let Some(target) = pending_resize.take() {
+                        // Finalize deferred resize using the frame's actual
+                        // dimensions (set by PipeWire param_changed negotiation)
+                        if pending_resize {
+                            pending_resize = false;
+                            let actual_w = f.width as u16;
+                            let actual_h = f.height as u16;
+
                             {
                                 let mut converter = handler.bitmap_converter.lock().await;
-                                *converter = BitmapConverter::new(target.width, target.height);
+                                *converter = BitmapConverter::new(actual_w, actual_h);
                             }
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            handler.update_size(target.width, target.height).await;
+                            handler.update_size(actual_w, actual_h).await;
 
                             info!(
-                                "Resize finalized: client desktop {}x{}, source frame {}x{} (crop if needed)",
-                                target.width, target.height, f.width, f.height
+                                "Resize finalized from first frame: {}x{} (compositor negotiated)",
+                                actual_w, actual_h
                             );
                         }
 
@@ -1714,12 +1757,7 @@ impl LamcoDisplayHandler {
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            // Reset only per-pipeline EGFX objects here. The shared
-                            // handler state/server handle are connection-owned by
-                            // LamcoGfxFactory::build_server_with_handle(); clearing them
-                            // here races with fast EGFX capability negotiation (Android
-                            // AVC_DISABLED) and prevents Planar init.
-                            info!("Pipeline state reset for new client connection (cache cleared)");
+                            info!("Pipeline state reset for new client connection");
                         }
                         debug!("Received frame from PipeWire");
                         f
@@ -1813,22 +1851,32 @@ impl LamcoDisplayHandler {
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            // Reset only per-pipeline EGFX objects here. The shared
-                            // handler state/server handle are connection-owned by
-                            // LamcoGfxFactory::build_server_with_handle(); clearing them
-                            // here races with fast EGFX capability negotiation (Android
-                            // AVC_DISABLED) and prevents Planar init.
-                            info!(
-                                "Pipeline state reset for new client connection (no-frame path, cache cleared)"
-                            );
+                            info!("Pipeline state reset for new client connection (no-frame path)");
                         }
 
                         let needs_init = handler
                             .egfx_needs_init
                             .load(std::sync::atomic::Ordering::Relaxed);
 
-                        let should_replay_for_egfx =
-                            client_waiting && needs_init && handler.is_egfx_ready().await;
+                        // Log EGFX readiness check periodically during reconnection wait
+                        if client_waiting && needs_init && !handler.is_egfx_ready().await {
+                            static EGFX_WAIT_COUNTER: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let count = EGFX_WAIT_COUNTER
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if count.is_multiple_of(200) {
+                                // Log every ~1 second (200 * 5ms)
+                                let has_tx = handler.server_event_tx.read().await.is_some();
+                                let has_handle = handler.gfx_server_handle.read().await.is_some();
+                                let state_ready =
+                                    handler.gfx_handler_state.as_ref().is_some_and(|s| {
+                                        s.is_ready.load(std::sync::atomic::Ordering::Acquire)
+                                    });
+                                debug!(
+                                    "⏳ EGFX not ready (wait #{count}): tx={has_tx}, handle={has_handle}, state_ready={state_ready}"
+                                );
+                            }
+                        }
 
                         // Replay the cached frame once EGFX is ready. AVC clients use
                         // H.264; Android clients advertising AVC_DISABLED must still
@@ -1850,37 +1898,6 @@ impl LamcoDisplayHandler {
                             tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                             continue;
                         }
-                    }
-                };
-
-                // Use the client-negotiated desktop size for display encoding.
-                // PipeWire may keep producing the compositor/source size after a
-                // mobile client rotates or requests a smaller portrait/landscape
-                // desktop. If we encode/send the raw source dimensions while EGFX
-                // ResetGraphics/CreateSurface use the client size, Android RD
-                // Client renders corrupted pixels or a blank surface. Crop to the
-                // negotiated size before damage detection, encoder setup, surface
-                // creation, regions, and frame transmission.
-                let frame = {
-                    let size = handler.size.read().await;
-                    let target_w = size.width;
-                    let target_h = size.height;
-                    drop(size);
-
-                    if target_w > 0
-                        && target_h > 0
-                        && (u32::from(target_w) < frame.width || u32::from(target_h) < frame.height)
-                    {
-                        let cropped = Self::crop_frame_to_size(&frame, target_w, target_h);
-                        if cropped.width != frame.width || cropped.height != frame.height {
-                            info!(
-                                "📐 Cropped source frame {}×{} → client desktop {}×{} before encoding",
-                                frame.width, frame.height, cropped.width, cropped.height
-                            );
-                        }
-                        cropped
-                    } else {
-                        frame
                     }
                 };
 
@@ -1994,19 +2011,6 @@ impl LamcoDisplayHandler {
                         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                         continue;
                     }
-                }
-
-                // === EGFX LATE ARRIVAL ===
-                // If EGFX was bypassed due to timeout but later becomes ready
-                // (capability exchange completed after the 5s window), clear the
-                // bypass so the Planar/AVC init path can run. Without this, the
-                // replay loop spins forever: is_egfx_ready()=true + needs_init=true
-                // but egfx_gate_bypassed=true prevents Planar init from executing.
-                if egfx_gate_bypassed && handler.is_egfx_ready().await {
-                    egfx_gate_bypassed = false;
-                    info!(
-                        "🔄 EGFX became ready after bypass — re-enabling EGFX path for Planar/AVC init"
-                    );
                 }
 
                 // === EGFX/H.264 PATH ===
@@ -2200,164 +2204,12 @@ impl LamcoDisplayHandler {
                 }
 
                 let is_avc = !egfx_gate_bypassed && handler.is_avc_supported().await;
-                // Android RD Client advertises EGFX with AVC_DISABLED. Use the
-                // EGFX Planar codec path for these clients; FastPath Bitmap/RLE
-                // is not accepted reliably by this Android client once the EGFX
-                // dynamic channel is present.
-                let is_egfx_rfx = !egfx_gate_bypassed && !is_avc && handler.is_egfx_ready().await;
-                if needs_init && !is_avc && !is_egfx_rfx {
-                    // Distinguish between:
-                    // 1. V8 client (no EGFX channel at all) → clear flag now
-                    // 2. EGFX negotiation still pending (e.g. Android V10 with AVC_DISABLED) → wait
-                    //
-                    // If gfx_handler_state exists but is_ready is false, the capability
-                    // exchange hasn't completed yet. We must NOT clear egfx_needs_init
-                    // because Planar setup runs after negotiation finishes.
-                    let caps_pending = handler
-                        .gfx_handler_state
-                        .read()
-                        .await
-                        .as_ref()
-                        .map(|s| !s.is_ready)
-                        .unwrap_or(false);
-
-                    if !caps_pending {
-                        // V8 client: no EGFX capability state, no setup needed
-                        handler
-                            .egfx_needs_init
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                    } else {
-                        debug!("V8 check: skipping egfx_needs_init clear (caps still pending)");
-                    }
-                }
-
-                // === EGFX Planar PATH (AVC disabled) ===
-                // When EGFX is ready but AVC is disabled, use Planar codec (0xa)
-                // via EGFX channel. This provides ~5:1 to 25:1 compression without H.264.
-                // Planar is supported by the MS Android RD Client; RemoteFX (0x3) is NOT.
-                if is_egfx_rfx && needs_init {
-                    egfx_sender = None;
-
-                    if let Some(ref mut detector) = damage_detector_opt {
-                        detector.invalidate();
-                        info!("🔄 Damage detector invalidated for Planar reconnection");
-                    }
-
-                    info!(
-                        "🎬 EGFX channel ready - initializing Planar encoder (AVC disabled, codec_id=0xa)"
-                    );
-
-                    // Planar codec does NOT require 16-pixel alignment (only AVC/H.264 does).
-                    // Using actual dimensions prevents surface/bitmap height mismatch crashes.
-                    let surface_width = frame.width as u16;
-                    let surface_height = frame.height as u16;
-
-                    // Create IronRDP BitmapStreamEncoder (reference Planar implementation)
-                    planar_encoder = Some(ironrdp_graphics::rdp6::BitmapStreamEncoder::new(
-                        frame.width as usize,
-                        frame.height as usize,
-                    ));
-
-                    // Create EGFX surface with actual dimensions (no alignment)
-                    if let (Some(gfx_handle), Some(event_tx)) = (
-                        handler.gfx_server_handle.read().await.clone(),
-                        handler.server_event_tx.read().await.clone(),
-                    ) {
-                        {
-                            let mut server =
-                                gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
-                            server.set_output_dimensions(surface_width, surface_height);
-
-                            // MS-RDPEGFX §2.2.2.15: ResetGraphics MUST include at least
-                            // 1 RDPGFX_MONITOR_DEF entry. nMonitors=0 causes Android
-                            // client rendering corruption (horizontal scan-line artifacts).
-                            // Call resize_with_monitors before create_surface so the
-                            // auto-ResetGraphics inside create_surface is skipped.
-                            // RDPGFX_MONITOR_DEF.right/bottom are INCLUSIVE (last pixel),
-                            // so right = width - 1, bottom = height - 1.
-                            {
-                                use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
-                                server.resize_with_monitors(
-                                    surface_width,
-                                    surface_height,
-                                    vec![Monitor {
-                                        left: 0,
-                                        top: 0,
-                                        right: surface_width as i32 - 1,
-                                        bottom: surface_height as i32 - 1,
-                                        flags: MonitorFlags::PRIMARY,
-                                    }],
-                                );
-                            }
-
-                            match server.create_surface(surface_width, surface_height) {
-                                Some(surface_id) => {
-                                    info!(
-                                        "✅ EGFX Planar surface {} created: {}×{}",
-                                        surface_id, surface_width, surface_height
-                                    );
-
-                                    // Map surface to output (REQUIRED - client crashes without it)
-                                    if server.map_surface_to_output(surface_id, 0, 0) {
-                                        info!(
-                                            "✅ EGFX Planar surface {} mapped to output",
-                                            surface_id
-                                        );
-                                    }
-
-                                    let messages = server.drain_output();
-                                    if !messages.is_empty() {
-                                        use ironrdp_dvc::encode_dvc_messages;
-                                        use ironrdp_server::EgfxServerMessage;
-                                        use ironrdp_svc::ChannelFlags;
-
-                                        if let Some(ch_id) = server.channel_id() {
-                                            match encode_dvc_messages(
-                                                ch_id,
-                                                messages,
-                                                ChannelFlags::SHOW_PROTOCOL,
-                                            ) {
-                                                Ok(svc_messages) => {
-                                                    let msg = EgfxServerMessage::SendMessages {
-                                                        messages: svc_messages,
-                                                    };
-                                                    let _ = event_tx.send(ServerEvent::Egfx(msg));
-                                                    info!(
-                                                        "✅ EGFX Planar surface PDUs sent to client"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        "EGFX Planar: Failed to encode DVC messages: {:?}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                None => {
-                                    warn!(
-                                        "Failed to create EGFX Planar surface - server may not be ready"
-                                    );
-                                }
-                            }
-                        }
-
-                        let sender = EgfxFrameSender::new(
-                            gfx_handle,
-                            handler.gfx_handler_state.clone(),
-                            event_tx,
-                        );
-                        egfx_sender = Some(sender);
-                        info!("✅ EGFX Planar frame sender initialized");
-
-                        handler
-                            .egfx_needs_init
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                        force_first_frame = true;
-                        info!("📺 First Planar frame after init will be forced");
-                    }
+                let is_egfx = !egfx_gate_bypassed && handler.is_egfx_ready().await;
+                if needs_init && !is_avc && !is_egfx {
+                    // Non-EGFX client: clear flag, no EGFX setup needed
+                    handler
+                        .egfx_needs_init
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
 
                 if is_avc {
@@ -2379,28 +2231,25 @@ impl LamcoDisplayHandler {
                             "🎬 EGFX channel ready - initializing H.264 encoder (needs_init=true)"
                         );
 
-                        // AVC/H.264 path keeps encoder/surface dimensions 16-pixel
-                        // aligned for Windows mstsc compatibility. Planar clients keep
-                        // using actual-size surfaces in the separate Planar path above.
-                        let display_width = frame.width as u16;
-                        let display_height = frame.height as u16;
-                        let encoded_width = align_to_16(frame.width) as u16;
-                        let encoded_height = align_to_16(frame.height) as u16;
+                        // Calculate aligned dimensions first (needed for encoder and surface)
+                        use crate::egfx::align_to_16;
+                        let aligned_width = align_to_16(frame.width as u32) as u16;
+                        let aligned_height = align_to_16(frame.height as u32) as u16;
 
                         // Create H.264 encoder with resolution-appropriate level
                         // Use config values for quality settings and color space
                         let color_space = ColorSpaceConfig::from_config(
                             &self.config.egfx.color_matrix,
                             &self.config.egfx.color_range,
-                            encoded_width as u32,
-                            encoded_height as u32,
+                            aligned_width as u32,
+                            aligned_height as u32,
                         );
                         let config = EncoderConfig {
                             bitrate_kbps: self.config.egfx.h264_bitrate,
                             max_fps: self.config.video.target_fps as f32,
                             enable_skip_frame: true,
-                            width: Some(encoded_width),
-                            height: Some(encoded_height),
+                            width: Some(aligned_width),
+                            height: Some(aligned_height),
                             color_space: Some(color_space),
                             qp_min: self.config.egfx.qp_min,
                             qp_max: self.config.egfx.qp_max,
@@ -2472,23 +2321,22 @@ impl LamcoDisplayHandler {
                             }
                         };
 
-                        // ── Software encoder (OpenH264) ──────────────────────────
-                        if video_encoder.is_none() {
-                            if avc444_enabled {
-                                // Try AVC444 first (premium 4:4:4 chroma)
-                                match Avc444Encoder::new(config.clone()) {
-                                    Ok(mut encoder) => {
-                                        // Wire aux omission config from EgfxConfig
-                                        encoder.configure_aux_omission(
-                                            self.config.egfx.avc444_enable_aux_omission,
-                                            self.config.egfx.avc444_max_aux_interval,
-                                            self.config.egfx.avc444_aux_change_threshold,
-                                            self.config.egfx.avc444_force_aux_idr_on_return,
-                                        );
-                                        // Wire periodic IDR config for artifact recovery
-                                        encoder.configure_periodic_idr(
-                                            self.config.egfx.periodic_idr_interval,
-                                        );
+                        if avc444_enabled {
+                            // Try AVC444 first (premium 4:4:4 chroma)
+                            match Avc444Encoder::new(config.clone()) {
+                                Ok(mut encoder) => {
+                                    // Wire aux omission config from EgfxConfig
+                                    encoder.configure_aux_omission(
+                                        self.config.egfx.avc444_enable_aux_omission,
+                                        self.config.egfx.avc444_max_aux_interval,
+                                        self.config.egfx.avc444_aux_change_threshold,
+                                        self.config.egfx.avc444_force_aux_idr_on_return,
+                                    );
+                                    // Wire periodic IDR config for artifact recovery
+                                    encoder.configure_periodic_idr(
+                                        self.config.egfx.periodic_idr_interval,
+                                    );
+                                    encoder.set_diagnostics(encoder_diagnostics.clone());
 
                                     video_encoder = Some(VideoEncoder::Avc444(encoder));
                                     info!(
@@ -2830,24 +2678,31 @@ impl LamcoDisplayHandler {
                             }
                         }
 
-                        // AVC/H.264 uses 16-aligned encoded dimensions for Windows
-                        // compatibility. Keep display_width/display_height as the visible
-                        // region, and pad only the encoder input so Planar/Android remains
-                        // actual-size in its separate path.
-                        let encoded_width = align_to_16(frame.width);
-                        let encoded_height = align_to_16(frame.height);
+                        // MS-RDPEGFX REQUIRES 16-pixel alignment
+                        // Frame from PipeWire may not be aligned (e.g., 800×600)
+                        // Must align dimensions AND pad frame data
+                        // (Transform already applied above, before the EGFX/bitmap fork)
+                        let aligned_width = align_to_16(frame.width);
+                        let aligned_height = align_to_16(frame.height);
+
                         let frame_data =
-                            if encoded_width != frame.width || encoded_height != frame.height {
+                            if aligned_width != frame.width || aligned_height != frame.height {
                                 Self::pad_frame_to_aligned(
-                                    &frame.data,
+                                    &pixel_data,
                                     frame.width,
                                     frame.height,
-                                    encoded_width,
-                                    encoded_height,
+                                    aligned_width,
+                                    aligned_height,
                                 )
                             } else {
-                                (*frame.data).clone()
+                                (*pixel_data).clone()
                             };
+
+                        // Update adaptive QP from client feedback before encoding
+                        if let Some(ref mut adapt) = encoding_adaptation {
+                            let qp = adapt.adapted_qp();
+                            sender.set_qp(qp);
+                        }
 
                         // OpenH264's encode() is synchronous and CPU-bound.
                         // On slow hardware (e.g., QEMU VMs) it can block for seconds.
@@ -2862,8 +2717,8 @@ impl LamcoDisplayHandler {
                         let encode_result = tokio::task::block_in_place(|| {
                             encoder.encode_bgra(
                                 &frame_data,
-                                encoded_width,
-                                encoded_height,
+                                aligned_width,
+                                aligned_height,
                                 timestamp_ms,
                             )
                         });
@@ -2897,8 +2752,8 @@ impl LamcoDisplayHandler {
                                         sender
                                             .send_frame_with_regions(
                                                 &data,
-                                                encoded_width as u16,
-                                                encoded_height as u16,
+                                                aligned_width as u16,
+                                                aligned_height as u16,
                                                 frame.width as u16,
                                                 frame.height as u16,
                                                 &damage_regions,
@@ -2911,8 +2766,8 @@ impl LamcoDisplayHandler {
                                             .send_avc444_frame_with_regions(
                                                 &main,
                                                 aux.as_deref(), // Option<Vec<u8>> → Option<&[u8]>
-                                                encoded_width as u16,
-                                                encoded_height as u16,
+                                                aligned_width as u16,
+                                                aligned_height as u16,
                                                 frame.width as u16,
                                                 frame.height as u16,
                                                 &damage_regions,
@@ -3232,189 +3087,12 @@ impl LamcoDisplayHandler {
                     }
                 }
 
-                // === EGFX Planar FRAME PATH (AVC disabled) ===
-                // Send frames via EGFX channel using Planar codec (0xa) when H.264 is unavailable
-                if let (Some(planar_enc), Some(sender)) = (&mut planar_encoder, &egfx_sender) {
-                    let timestamp_ms = if frame.pts > 0 {
-                        frame.pts / 1_000_000
-                    } else {
-                        let frame_interval_ms =
-                            1000 / u64::from(self.config.video.target_fps.max(1));
-                        frames_sent * frame_interval_ms
-                    };
-
-                    let expected_size = (frame.width * frame.height * 4) as usize;
-                    if frame.data.len() < expected_size {
-                        frames_dropped += 1;
-                        continue;
-                    }
-
-                    // Damage detection
-                    let force_full = force_first_frame;
-                    if force_first_frame {
-                        info!("📺 Forcing first Planar frame after init");
-                        force_first_frame = false;
-                    }
-
-                    let damage_regions = if force_full {
-                        vec![DamageRegion::full_frame(frame.width, frame.height)]
-                    } else if let Some(ref mut detector) = damage_detector_opt {
-                        detector.detect(&frame.data, frame.width, frame.height)
-                    } else {
-                        vec![DamageRegion::full_frame(frame.width, frame.height)]
-                    };
-
-                    let damage_ratio = if !damage_regions.is_empty() {
-                        let frame_area = (frame.width * frame.height) as u64;
-                        let damage_area: u64 = damage_regions
-                            .iter()
-                            .map(super::super::damage::DamageRegion::area)
-                            .sum();
-                        damage_area as f32 / frame_area as f32
-                    } else {
-                        0.0
-                    };
-
-                    if adaptive_fps_enabled {
-                        adaptive_fps.update(damage_ratio);
-                    }
-
-                    if damage_regions.is_empty() {
-                        frames_skipped_damage += 1;
-                        continue;
-                    }
-
-                    // Build a *full-frame* IronRDP bitmap directly for EGFX Planar.
-                    // The frame has already been cropped to the client desktop and
-                    // is compact BGRx32. Do not route this through BitmapConverter:
-                    // for Android-sized compact BGRx frames it may hit the generic
-                    // BGRx -> BGRx conversion path, which is intentionally unsupported
-                    // and results in a blank screen because no Planar frames are sent.
-                    let bytes_per_pixel = frame.format.bytes_per_pixel() as usize;
-                    let expected_len =
-                        frame.width as usize * frame.height as usize * bytes_per_pixel;
-                    if frame.data.len() < expected_len {
-                        error!(
-                            "Planar: compact frame too small: len={} expected={} for {}×{}",
-                            frame.data.len(),
-                            expected_len,
-                            frame.width,
-                            frame.height
-                        );
-                        frames_dropped += 1;
-                        continue;
-                    }
-
-                    let planar_bitmap = IronBitmapUpdate {
-                        x: 0,
-                        y: 0,
-                        width: match NonZeroU16::new(frame.width as u16) {
-                            Some(width) => width,
-                            None => {
-                                frames_dropped += 1;
-                                continue;
-                            }
-                        },
-                        height: match NonZeroU16::new(frame.height as u16) {
-                            Some(height) => height,
-                            None => {
-                                frames_dropped += 1;
-                                continue;
-                            }
-                        },
-                        format: IronPixelFormat::BgrX32,
-                        data: Bytes::copy_from_slice(&frame.data[..expected_len]),
-                        stride: match NonZeroUsize::new(frame.width as usize * bytes_per_pixel) {
-                            Some(stride) => stride,
-                            None => {
-                                frames_dropped += 1;
-                                continue;
-                            }
-                        },
-                    };
-
-                    // Send via EGFX Planar (codec_id=0xa)
-                    {
-                        let send_result = sender
-                            .send_planar_frame(
-                                planar_enc,
-                                &planar_bitmap,
-                                planar_bitmap.width.get(),
-                                planar_bitmap.height.get(),
-                                timestamp_ms as u32,
-                            )
-                            .await;
-
-                        match send_result {
-                            Ok(_frame_id) => {
-                                egfx_frames_sent += 1;
-                                if egfx_frames_sent.is_multiple_of(30) {
-                                    debug!(
-                                        "📹 EGFX Uncompressed (diag): Sent {} frames via EGFX",
-                                        egfx_frames_sent
-                                    );
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                trace!("EGFX Uncompressed send failed: {} - dropping frame", e);
-                                frames_dropped += 1;
-                                continue;
-                            }
-                        }
-                    }
-                }
-
                 let convert_start = std::time::Instant::now();
-                let target_size = *handler.size.read().await;
-                let bitmap_frame =
-                    Self::crop_frame_to_size(&frame, target_size.width, target_size.height);
-                if bitmap_frame.width != frame.width || bitmap_frame.height != frame.height {
-                    debug!(
-                        "Cropping bitmap fallback frame: {}x{} -> {}x{}",
-                        frame.width, frame.height, bitmap_frame.width, bitmap_frame.height
-                    );
-                }
-                // BGRx passthrough: PipeWire always produces BGRx, and when the
-                // client desktop also uses BGRx the BitmapConverter's generic path
-                // rejects BGRx→BGRx as unsupported. Build the BitmapUpdate directly
-                // from the compact frame data to bypass the converter.
-                use lamco_pipewire::PixelFormat as PwPixelFormat;
-                let bitmap_update = if bitmap_frame.format == PwPixelFormat::BGRx {
-                    let bpp = 4usize;
-                    let expected_len =
-                        bitmap_frame.width as usize * bitmap_frame.height as usize * bpp;
-                    if bitmap_frame.data.len() < expected_len {
-                        error!(
-                            "BGRx passthrough: frame too small: len={} expected={} for {}×{}",
-                            bitmap_frame.data.len(),
-                            expected_len,
-                            bitmap_frame.width,
-                            bitmap_frame.height
-                        );
-                        frames_dropped += 1;
+                let bitmap_update = match handler.convert_to_bitmap(frame).await {
+                    Ok(bitmap) => bitmap,
+                    Err(e) => {
+                        error!("Failed to convert frame to bitmap: {}", e);
                         continue;
-                    }
-                    BitmapUpdate {
-                        rectangles: vec![BitmapData {
-                            rectangle: Rectangle::new(
-                                0,
-                                0,
-                                bitmap_frame.width as u16,
-                                bitmap_frame.height as u16,
-                            ),
-                            format: RdpPixelFormat::BgrX32,
-                            data: bitmap_frame.data[..expected_len].to_vec(),
-                            compressed: false,
-                        }],
-                    }
-                } else {
-                    match handler.convert_to_bitmap(bitmap_frame).await {
-                        Ok(bitmap) => bitmap,
-                        Err(e) => {
-                            error!("Failed to convert frame to bitmap: {}", e);
-                            continue;
-                        }
                     }
                 };
                 let convert_elapsed = convert_start.elapsed();
@@ -3542,202 +3220,10 @@ impl LamcoDisplayHandler {
                 stride,
             };
 
-            if !LOGGED_FIRST_BITMAP_UPDATE.swap(true, Ordering::Relaxed) {
-                info!(
-                    "First IronRDP bitmap update: x={} y={} width={} height={} format={:?} stride={} data_len={} expected_compact_len={}",
-                    iron_bitmap.x,
-                    iron_bitmap.y,
-                    iron_bitmap.width.get(),
-                    iron_bitmap.height.get(),
-                    iron_bitmap.format,
-                    iron_bitmap.stride.get(),
-                    iron_bitmap.data.len(),
-                    width as usize * height as usize * bytes_per_pixel,
-                );
-            }
-
             iron_updates.push(iron_bitmap);
         }
 
         Ok(iron_updates)
-    }
-
-    /// Create a standard Breeze left-pointer cursor as RGBA pixel data.
-    ///
-    /// The source asset is /usr/share/icons/Breeze_Light/cursors/left_ptr
-    /// 32x32 XCursor image, converted from ARGB to RGBA. Android Microsoft RD
-    /// Client displays this pointer bitmap vertically flipped in our RDP path,
-    /// so the embedded rows are stored vertically flipped. The hotspot stays
-    /// in normal top-left cursor coordinates so PointerPosition tracks the
-    /// actual click/injection point instead of the flipped bitmap row.
-    pub(crate) fn create_arrow_cursor() -> RGBAPointer {
-        const W: u16 = 32;
-        const H: u16 = 32;
-        const DATA: [u8; 4096] = [
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 6, 0, 0, 0, 19, 0, 0, 0, 32, 0, 0, 0, 31,
-            0, 0, 0, 17, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 1, 0, 0, 0, 6, 0, 0, 0, 7, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 19,
-            0, 0, 0, 81, 0, 0, 0, 149, 0, 0, 0, 144, 0, 0, 0, 67, 0, 0, 0, 10, 0, 0, 0, 1, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 26, 0, 0, 0, 32, 0,
-            0, 0, 23, 0, 0, 0, 14, 0, 0, 0, 17, 0, 0, 0, 69, 0, 0, 0, 171, 36, 36, 36, 185, 6, 6,
-            6, 175, 0, 0, 0, 163, 0, 0, 0, 21, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 132, 0, 0, 0, 149, 0, 0, 0, 98, 0, 0, 0, 47, 0, 0,
-            0, 51, 1, 1, 1, 159, 159, 159, 159, 224, 255, 255, 255, 255, 184, 184, 184, 232, 0, 0,
-            0, 169, 0, 0, 0, 36, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 10, 1, 1, 1, 169, 149, 149, 149, 221, 25, 25, 25, 181, 0, 0, 0, 167, 0, 0, 0,
-            155, 121, 121, 121, 212, 255, 255, 255, 255, 255, 255, 255, 255, 248, 248, 248, 253, 0,
-            0, 0, 169, 0, 0, 0, 21, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 245, 245, 245, 252, 136, 136, 136,
-            217, 95, 95, 95, 204, 253, 253, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255, 226,
-            226, 226, 246, 0, 0, 0, 158, 0, 0, 0, 19, 0, 0, 0, 8, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 203, 203, 203, 238, 0, 0, 0, 157, 0, 0, 0, 56, 0, 0, 0, 31, 0, 0, 0, 18,
-            0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 199, 199, 199, 237, 14, 14, 14, 177, 0, 0, 0,
-            171, 0, 0, 0, 133, 0, 0, 0, 73, 0, 0, 0, 14, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10,
-            1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 249, 249, 249, 253, 185, 185, 185, 232, 106, 106, 106, 206, 13, 13, 13, 171, 0, 0,
-            0, 47, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 167, 167, 167, 225, 3, 3, 3, 145, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 167, 167, 167, 225, 3, 3, 3, 148, 0, 0, 0, 29, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 167, 167, 167, 225, 3, 3, 3, 148, 0,
-            0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1,
-            169, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 167, 167, 167, 225, 3, 3,
-            3, 148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 159, 159, 159, 222, 2, 2,
-            2, 148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 159, 159, 159, 222, 2, 2, 2,
-            148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 159, 159, 159, 222, 2, 2, 2, 148, 0, 0, 0, 29,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 159, 159, 159, 222, 2, 2, 2, 148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 159, 159, 159,
-            222, 2, 2, 2, 148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1,
-            1, 1, 169, 255, 255, 255, 255, 159, 159, 159, 222, 2, 2, 2, 148, 0, 0, 0, 29, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 1, 1, 1, 166, 159, 159, 159, 222,
-            2, 2, 2, 147, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 3, 0, 0, 0, 147, 2, 2, 2, 143, 0, 0, 0, 25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 0, 0, 0, 12, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-
-        RGBAPointer {
-            cache_index: 0,
-            width: W,
-            height: H,
-            hot_x: 4u16,
-            hot_y: 4u16,
-            data: DATA.to_vec(),
-        }
     }
 }
 
@@ -3745,22 +3231,6 @@ impl LamcoDisplayHandler {
 impl RdpServerDisplay for LamcoDisplayHandler {
     async fn size(&mut self) -> DesktopSize {
         let size = self.size.read().await;
-        *size
-    }
-
-    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
-        let size = self.size.read().await;
-
-        // Windows mstsc commonly proposes the local window/client size here
-        // (for example 1366×768). Accepting that before EGFX setup makes the
-        // remote desktop visibly shrink immediately after connection and also
-        // exercises non-16-aligned AVC surface/desktop geometry. Keep the
-        // compositor/portal-selected size for the initial session; true dynamic
-        // resize requests still go through DisplayControl::request_layout().
-        info!(
-            "Keeping server initial desktop size: {}x{} (client requested {}x{})",
-            size.width, size.height, client_size.width, client_size.height
-        );
         *size
     }
 
@@ -3791,13 +3261,23 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             self.egfx_needs_init
                 .store(true, std::sync::atomic::Ordering::SeqCst);
 
-            // Do not clear gfx_handler_state/gfx_server_handle here. IronRDP calls
-            // LamcoGfxFactory::build_server_with_handle() while attaching channels
-            // for the new connection; that factory installs the fresh handle and
-            // clears readiness before capability negotiation. Clearing after that
-            // point races with Android EGFX AVC_DISABLED negotiation and leaves the
-            // display pipeline stuck in FastPath bitmap fallback (mouse works,
-            // video black).
+            // Reset handler state atomics to force waiting for NEW EGFX channel negotiation.
+            // The new connection's GfxServerFactory.build_server_with_handle() will
+            // update these atomics when the client's EGFX DVC channel is established.
+            if let Some(ref state) = self.gfx_handler_state {
+                state.reset();
+                info!("Reset gfx_handler_state atomics for new EGFX negotiation");
+            }
+
+            // NOTE: Do NOT clear gfx_server_handle here. The GfxServerFactory's
+            // build_server_with_handle() already replaced it with the new client's
+            // handle BEFORE updates() is called. Clearing it here would destroy
+            // the new handle, causing is_egfx_ready() to return false indefinitely.
+            {
+                let handle = self.gfx_server_handle.read().await;
+                let has_handle = handle.is_some();
+                info!("gfx_server_handle after factory: {has_handle} (preserved for new client)");
+            }
 
             // Reset bitmap converter so the new client gets a full initial frame.
             // The converter caches the last frame hash for dirty-region optimization;
@@ -3850,18 +3330,6 @@ impl RdpServerDisplay for LamcoDisplayHandler {
         self.client_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
         info!("Client active - pipeline frame processing resumed");
-
-        // Android Microsoft RD Client does not draw a visible remote pointer
-        // when only DefaultPointer (empty PDU) is sent. We must send a real
-        // cursor bitmap via RGBAPointer with actual RGBA pixel data.
-        // Windows clients also benefit from receiving an explicit cursor shape.
-        {
-            let sender = self.update_sender.lock().await;
-            let arrow = Self::create_arrow_cursor();
-            if let Err(err) = sender.try_send(DisplayUpdate::RGBAPointer(arrow)) {
-                trace!("Dropping initial RGBA pointer update: {err}");
-            }
-        }
 
         let receiver = receiver_option
             .take()
@@ -4282,16 +3750,5 @@ mod tests {
         assert_eq!(data.rectangle.right, 100);
         assert_eq!(data.rectangle.bottom, 100);
         assert_eq!(data.data.len(), 100 * 100 * 4);
-    }
-
-    #[test]
-    fn arrow_cursor_keeps_hotspot_in_visual_coordinates() {
-        let cursor = LamcoDisplayHandler::create_arrow_cursor();
-
-        assert_eq!(cursor.width, 32);
-        assert_eq!(cursor.height, 32);
-        assert_eq!(cursor.hot_x, 4);
-        assert_eq!(cursor.hot_y, 4);
-        assert_eq!(cursor.data.len(), 32 * 32 * 4);
     }
 }

@@ -1,26 +1,18 @@
-lamco-rdp-server (1.4.3-2) unstable; urgency=medium
+lamco-rdp-server (1.4.4-1) unstable; urgency=medium
 
-  * fix: Defer KDE Portal RemoteDesktop startup until an RDP client connects
-  * feat: Add systemd user socket activation unit for idle listening on 3389
-  * fix: Make Debian installs default to socket activation, not a direct service
+  * New upstream release 1.4.4
+  * Unified multi-transport accept layer: AF_VSOCK for Hyper-V Enhanced Session
+    Mode, plus experimental WebSocket and RDCleanPath
+  * Vulkan Video H.264 encoder and an HTTP metrics and health server
+  * Per-connection session lifecycle on GNOME, so the server handles many
+    sequential sessions without a restart
+  * KDE, sway, and COSMIC capture and clipboard fixes; Linux-to-Windows file
+    copy on native installs; many GUI fixes
+  * systemd unit hardening fix so PAM authentication works under the unit
+  * MSRV 1.89, Rust edition 2024
+  * License revision: Licensor Lamco Development LLC, Change Date 2029-06-01
 
- -- Greg Lamberson <greg@lamco.io>  Thu, 18 Jun 2026 16:45:00 +0800
-
-lamco-rdp-server (1.4.3-1) unstable; urgency=medium
-
-  * feat: Add static password authentication with multi-user support
-  * feat: Add IPv6 listen address support
-  * feat: Add Portal host app identity registration for KDE compatibility
-  * fix: Restore KDE clipboard sync via data-control/wl-clipboard provider
-  * fix: Cache RDP clipboard text for data-control backends
-  * fix: Route CJK input via Portal keysym injection for BMP characters
-  * fix: Pause Klipper cooperation sync during CJK clipboard-paste fallback
-    - Prevents "已复制" toast spam during Chinese/Japanese/Korean typing
-    - Preserves original clipboard content after CJK paste operations
-    - Shares cjk_paste_paused flag between input handler and ClipboardOrchestrator
-  * fix: Handle Portal + Token strategy for systemd user deployments
-
- -- Greg Lamberson <greg@lamco.io>  Tue, 17 Jun 2026 10:00:00 +0000
+ -- Greg Lamberson <greg@lamco.io>  Fri, 03 Jul 2026 00:00:00 -0500
 
 lamco-rdp-server (1.4.2-1) unstable; urgency=medium
 

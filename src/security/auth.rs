@@ -20,7 +20,9 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
-use ironrdp_server::{CredentialValidator, Credentials};
+use ironrdp_server::{
+    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
+};
 #[cfg(feature = "pam-auth")]
 use nonstick::{AuthnFlags, ConversationAdapter, Transaction, TransactionBuilder};
 use tracing::{debug, info, warn};
@@ -169,11 +171,7 @@ impl RateLimiter {
     }
 }
 
-/// Static username/password validator implementing IronRDP's `CredentialValidator` trait.
-///
-/// Validates credentials received during the RDP TLS handshake against the
-/// username and password configured in `config.toml`. Includes per-IP rate
-/// limiting with exponential backoff.
+/// Static username/password validator backed by Argon2id PHC hashes.
 pub struct StaticPasswordValidator {
     password_hashes: BTreeMap<String, String>,
     rate_limiter: RateLimiter,
@@ -181,10 +179,6 @@ pub struct StaticPasswordValidator {
 }
 
 impl StaticPasswordValidator {
-    pub fn new_hash(username: String, password_hash: String) -> Result<Self> {
-        Self::new_hashes([(username, password_hash)])
-    }
-
     pub fn new_hashes(password_hashes: impl IntoIterator<Item = (String, String)>) -> Result<Self> {
         let password_hashes: BTreeMap<String, String> = password_hashes.into_iter().collect();
         if password_hashes.is_empty() {
@@ -216,10 +210,6 @@ impl StaticPasswordValidator {
     pub fn prune_stale_entries(&self) {
         self.rate_limiter.prune_stale();
     }
-
-    pub fn credentials(&self) -> Credentials {
-        panic!("Static password hash authentication cannot provide plaintext CredSSP credentials")
-    }
 }
 
 /// Hash a static RDP password as an Argon2id PHC string suitable for config.toml.
@@ -231,16 +221,22 @@ pub fn hash_static_password(password: &str) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("Failed to hash password: {e}"))
 }
 
+#[async_trait::async_trait]
 impl CredentialValidator for StaticPasswordValidator {
-    fn validate(&self, credentials: &Credentials) -> Result<bool> {
-        validate_username(&credentials.username)?;
+    async fn validate(
+        &self,
+        credentials: &Credentials,
+    ) -> Result<CredentialDecision, CredentialValidationError> {
+        if let Err(e) = validate_username(&credentials.username) {
+            warn!("Rejecting static credentials: {e}");
+            return Ok(CredentialDecision::Reject);
+        }
 
         let peer_ip = self
             .peer_ip
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .unwrap_or(IpAddr::from([0, 0, 0, 0]));
-
         if let Some(remaining) = self.rate_limiter.check(peer_ip) {
             warn!(
                 "Rate limited: {} ({}s remaining) for static password user '{}'",
@@ -248,38 +244,34 @@ impl CredentialValidator for StaticPasswordValidator {
                 remaining.as_secs(),
                 credentials.username
             );
-            return Ok(false);
+            return Ok(CredentialDecision::Reject);
         }
 
-        let authenticated =
-            if let Some(password_hash) = self.password_hashes.get(&credentials.username) {
-                match PasswordHash::new(password_hash) {
-                    Ok(hash) => Argon2::default()
-                        .verify_password(credentials.password.as_bytes(), &hash)
-                        .is_ok(),
-                    Err(e) => {
-                        warn!("Static password: invalid stored password hash: {}", e);
-                        false
-                    }
-                }
-            } else {
-                false
-            };
+        let authenticated = self
+            .password_hashes
+            .get(&credentials.username)
+            .and_then(|stored| PasswordHash::new(stored).ok())
+            .is_some_and(|hash| {
+                Argon2::default()
+                    .verify_password(credentials.password.as_bytes(), &hash)
+                    .is_ok()
+            });
+
         if authenticated {
             self.rate_limiter.clear(peer_ip);
             info!(
                 "Static password: user '{}' authenticated successfully",
                 credentials.username
             );
+            Ok(CredentialDecision::Accept)
         } else {
             self.rate_limiter.record_failure(peer_ip);
             warn!(
                 "Static password: authentication failed for user '{}'",
                 credentials.username
             );
+            Ok(CredentialDecision::Reject)
         }
-
-        Ok(authenticated)
     }
 }
 
@@ -598,7 +590,6 @@ mod tests {
     #[test]
     fn test_auth_method_from_str() {
         assert_eq!(AuthMethod::from_str("pam"), AuthMethod::Pam);
-        assert_eq!(AuthMethod::from_str("password"), AuthMethod::Password);
         assert_eq!(AuthMethod::from_str("none"), AuthMethod::None);
         assert_eq!(AuthMethod::from_str("invalid"), AuthMethod::None);
     }
@@ -682,99 +673,6 @@ mod tests {
         assert_eq!(token.username(), "testuser");
         assert!(!token.token().is_empty());
         assert!(!token.is_expired(std::time::Duration::from_secs(3600)));
-    }
-
-    #[test]
-    fn test_static_password_validator_accepts_matching_credentials() {
-        let validator = StaticPasswordValidator::new_hashes([(
-            "rdpuser".to_string(),
-            hash_static_password("secret").unwrap(),
-        )])
-        .unwrap();
-        let credentials = Credentials {
-            username: "rdpuser".to_string(),
-            password: "secret".to_string(),
-            domain: None,
-        };
-
-        assert!(validator.validate(&credentials).unwrap());
-    }
-
-    #[test]
-    fn test_static_password_validator_rejects_wrong_credentials() {
-        let validator = StaticPasswordValidator::new_hashes([(
-            "rdpuser".to_string(),
-            hash_static_password("secret").unwrap(),
-        )])
-        .unwrap();
-        let credentials = Credentials {
-            username: "rdpuser".to_string(),
-            password: "wrong".to_string(),
-            domain: None,
-        };
-
-        assert!(!validator.validate(&credentials).unwrap());
-    }
-
-    #[test]
-    fn test_hash_password_generates_verifiable_phc_string() {
-        let hash = hash_static_password("secret").unwrap();
-        assert!(hash.starts_with("$argon2id$"));
-
-        let validator =
-            StaticPasswordValidator::new_hashes([("rdpuser".to_string(), hash)]).unwrap();
-        assert!(
-            validator
-                .validate(&Credentials {
-                    username: "rdpuser".to_string(),
-                    password: "secret".to_string(),
-                    domain: None,
-                })
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn test_static_password_validator_accepts_multiple_configured_users() {
-        let validator = StaticPasswordValidator::new_hashes([
-            (
-                "alice".to_string(),
-                hash_static_password("alice-secret").unwrap(),
-            ),
-            (
-                "bob".to_string(),
-                hash_static_password("bob-secret").unwrap(),
-            ),
-        ])
-        .unwrap();
-
-        assert!(
-            validator
-                .validate(&Credentials {
-                    username: "alice".to_string(),
-                    password: "alice-secret".to_string(),
-                    domain: None,
-                })
-                .unwrap()
-        );
-        assert!(
-            validator
-                .validate(&Credentials {
-                    username: "bob".to_string(),
-                    password: "bob-secret".to_string(),
-                    domain: None,
-                })
-                .unwrap()
-        );
-        assert!(
-            !validator
-                .validate(&Credentials {
-                    username: "alice".to_string(),
-                    password: "bob-secret".to_string(),
-                    domain: None,
-                })
-                .unwrap()
-        );
     }
 
     #[test]

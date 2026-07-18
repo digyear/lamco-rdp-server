@@ -481,9 +481,9 @@ pub fn address_input<'a>(
     on_port_change: impl Fn(String) -> Message + 'a,
 ) -> Element<'a, Message> {
     row![
-        text_input("0.0.0.0 or ::", ip)
+        text_input("[::]", ip)
             .on_input(on_ip_change)
-            .width(Length::Fixed(220.0))
+            .width(Length::Fixed(150.0))
             .style(theme::text_input_style),
         text(":").size(20).style(|_theme| text::Style {
             color: Some(theme::colors::TEXT_PRIMARY),

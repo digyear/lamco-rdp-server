@@ -68,9 +68,6 @@ pub struct LamcoGraphicsHandler {
     /// Whether AVC444 was negotiated (V10+ with AVC420)
     avc444_enabled: AtomicBool,
 
-    /// Whether negotiated capabilities indicate the Android RD Client pointer quirk.
-    needs_android_pointer_updates: AtomicBool,
-
     /// Whether the channel is ready for frames (local fast access)
     ready: AtomicBool,
 
@@ -130,7 +127,6 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
-            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             advertised_avc_disabled: AtomicBool::new(false),
@@ -151,7 +147,6 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
-            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             advertised_avc_disabled: AtomicBool::new(false),
@@ -172,7 +167,6 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
-            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             advertised_avc_disabled: AtomicBool::new(false),
@@ -215,7 +209,6 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
-            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             advertised_avc_disabled: AtomicBool::new(false),
@@ -230,14 +223,28 @@ impl LamcoGraphicsHandler {
         }
     }
 
-    /// Synchronize current state to the shared HandlerState.
+    /// Attach a MetricsCollector for recording EGFX pipeline data.
+    pub fn set_metrics(&mut self, metrics: Arc<MetricsCollector>) {
+        self.metrics = Some(metrics);
+    }
+
+    /// Attach an EGFX snapshot handle for the SnapshotCollector.
+    pub fn set_egfx_snapshot(&mut self, snapshot: Arc<RwLock<EgfxSnapshot>>) {
+        self.egfx_snapshot = Some(snapshot);
+    }
+
+    /// Attach a health reporter for EGFX channel state events.
+    pub fn set_health_reporter(&mut self, reporter: crate::health::HealthReporter) {
+        self.health_reporter = Some(reporter);
+    }
+
+    /// Synchronize current state to the shared HandlerState
     ///
-    /// GraphicsPipelineHandler callbacks are synchronous but the shared state is
-    /// a tokio RwLock read frequently by the display pipeline. A one-shot
-    /// try_write() can lose the readiness transition under read contention,
-    /// leaving EGFX negotiated but permanently "not ready" until bitmap fallback
-    /// crashes Android clients. Retry briefly; readers hold the lock only for
-    /// short readiness checks.
+    /// Propagate local atomic state to the shared state.
+    ///
+    /// Uses atomic stores (no locks) so it never fails, even when called
+    /// from synchronous DVC callbacks while the async pipeline loop is
+    /// reading the same fields.
     fn sync_shared_state(&self) {
         if let Some(ref shared) = self.shared_state {
             shared
@@ -383,48 +390,27 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
                 let has_avc420 = flags.contains(CapabilitiesV81Flags::AVC420_ENABLED);
                 (has_avc420, false)
             }
-            // V10+: check AVC_DISABLED flag — client may explicitly disable AVC
-            CapabilitySet::V10 { flags } => {
-                if flags.contains(CapabilitiesV10Flags::AVC_DISABLED) {
-                    (false, false)
-                } else {
-                    (true, true)
-                }
-            }
-            CapabilitySet::V10_2 { flags } => {
-                if flags.contains(CapabilitiesV10Flags::AVC_DISABLED) {
-                    (false, false)
-                } else {
-                    (true, true)
-                }
+            CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
+                let enabled = !flags.contains(CapabilitiesV10Flags::AVC_DISABLED);
+                (enabled, enabled)
             }
             CapabilitySet::V10_3 { flags } => {
-                if flags.contains(CapabilitiesV103Flags::AVC_DISABLED) {
-                    (false, false)
-                } else {
-                    (true, true)
-                }
+                let enabled = !flags.contains(CapabilitiesV103Flags::AVC_DISABLED);
+                (enabled, enabled)
             }
             CapabilitySet::V10_4 { flags }
             | CapabilitySet::V10_5 { flags }
-            | CapabilitySet::V10_6 { flags }
-            | CapabilitySet::V10_6Err { flags } => {
-                if flags.contains(CapabilitiesV104Flags::AVC_DISABLED) {
-                    (false, false)
-                } else {
-                    (true, true)
-                }
+            | CapabilitySet::V10_6 { flags } => {
+                let enabled = !flags.contains(CapabilitiesV104Flags::AVC_DISABLED);
+                (enabled, enabled)
             }
             CapabilitySet::V10_7 { flags } => {
-                if flags.contains(CapabilitiesV107Flags::AVC_DISABLED) {
-                    (false, false)
-                } else {
-                    (true, true)
-                }
+                let enabled = !flags.contains(CapabilitiesV107Flags::AVC_DISABLED);
+                (enabled, enabled)
             }
-            // V10_1 has no flags field
+            // V10.1 carries no flags field, so AVC cannot be explicitly disabled.
             CapabilitySet::V10_1 => (true, true),
-            // V8 and earlier / Unknown don't support AVC
+            // V8 and earlier don't support AVC
             _ => (false, false),
         };
 
@@ -453,8 +439,6 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         self.avc420_enabled.store(avc420, Ordering::Release);
         self.avc444_enabled
             .store(effective_avc444, Ordering::Release);
-        self.needs_android_pointer_updates
-            .store(needs_android_pointer_updates, Ordering::Release);
         self.ready.store(true, Ordering::Release);
 
         // Sync to shared state for EgfxFrameSender visibility
@@ -603,8 +587,6 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         );
         self.ready.store(false, Ordering::Release);
         self.avc420_enabled.store(false, Ordering::Release);
-        self.needs_android_pointer_updates
-            .store(false, Ordering::Release);
         self.has_surface.store(false, Ordering::Release);
         // Sync to shared state - channel closed
         self.sync_shared_state();

@@ -21,7 +21,10 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use super::listener::PeerAddr;
-use crate::{dbus::ServerEvent, security::auth::PamValidator};
+use crate::{
+    dbus::ServerEvent,
+    security::auth::{PamValidator, StaticPasswordValidator},
+};
 
 /// Callback type for the "is the Portal session still alive?" check that the
 /// wlr-direct path runs after each disconnect. Lives in `LamcoRdpServer` as
@@ -52,6 +55,7 @@ struct ClientState {
 pub struct LamcoConnectionHandler {
     event_tx: mpsc::UnboundedSender<ServerEvent>,
     pam_validator: Option<Arc<PamValidator>>,
+    static_password_validator: Option<Arc<StaticPasswordValidator>>,
     on_disconnect: OnDisconnectFn,
     /// Establishes the compositor session for an incoming client (per lifecycle
     /// policy). Defaults to a no-op that accepts; the deployment installs the
@@ -67,12 +71,14 @@ impl LamcoConnectionHandler {
     pub fn new(
         event_tx: mpsc::UnboundedSender<ServerEvent>,
         pam_validator: Option<Arc<PamValidator>>,
+        static_password_validator: Option<Arc<StaticPasswordValidator>>,
         on_disconnect: OnDisconnectFn,
         shutdown_tx: Arc<tokio::sync::broadcast::Sender<()>>,
     ) -> Self {
         Self {
             event_tx,
             pam_validator,
+            static_password_validator,
             on_disconnect,
             on_connect: Arc::new(|| Box::pin(async { true })),
             shutdown_tx,
@@ -102,6 +108,9 @@ impl LamcoConnectionHandler {
         // Capability #6: PAM peer-IP setup for rate limiting. Only meaningful
         // for transports with an IP-shaped peer (TCP, WebSocket).
         if let (Some(validator), Some(ip)) = (self.pam_validator.as_ref(), peer.ip()) {
+            validator.set_peer_ip(ip);
+        }
+        if let (Some(validator), Some(ip)) = (self.static_password_validator.as_ref(), peer.ip()) {
             validator.set_peer_ip(ip);
         }
 
@@ -183,6 +192,9 @@ impl LamcoConnectionHandler {
 
         // Capability #9: prune PAM rate-limit entries between connections.
         if let Some(ref validator) = self.pam_validator {
+            validator.prune_stale_entries();
+        }
+        if let Some(ref validator) = self.static_password_validator {
             validator.prune_stale_entries();
         }
 
@@ -270,6 +282,7 @@ mod tests {
         let mut handler = LamcoConnectionHandler::new(
             tx,
             None,
+            None,
             always_alive_callback(),
             Arc::new(tokio::sync::broadcast::channel::<()>(1).0),
         );
@@ -298,6 +311,7 @@ mod tests {
         let mut handler = LamcoConnectionHandler::new(
             tx,
             None,
+            None,
             always_alive_callback(),
             Arc::new(tokio::sync::broadcast::channel::<()>(1).0),
         );
@@ -320,6 +334,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut handler = LamcoConnectionHandler::new(
             tx,
+            None,
             None,
             always_dead_callback(),
             Arc::new(tokio::sync::broadcast::channel::<()>(1).0),
@@ -358,6 +373,7 @@ mod tests {
         let mut handler = LamcoConnectionHandler::new(
             tx,
             None,
+            None,
             always_alive_callback(),
             Arc::new(tokio::sync::broadcast::channel::<()>(1).0),
         );
@@ -387,6 +403,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut handler = LamcoConnectionHandler::new(
             tx,
+            None,
             None,
             cb,
             Arc::new(tokio::sync::broadcast::channel::<()>(1).0),

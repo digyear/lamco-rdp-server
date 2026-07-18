@@ -84,7 +84,7 @@ use ironrdp_server::{
     DisplayUpdate, KeyboardEvent as IronKeyboardEvent, MouseEvent as IronMouseEvent, RGBAPointer,
     RdpServerInputHandler,
 };
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::clipboard::provider::ClipboardProvider;
@@ -305,23 +305,8 @@ fn unicode_to_evdev(cp: u16) -> Option<(u32, bool)> {
     }
 }
 
-/// Convert an RDP Unicode input code unit into an XKB keysym.
-///
-/// X11/XKB represents Unicode characters outside Latin-1 as `0x01000000 | codepoint`.
-/// RDP Unicode input delivers UTF-16 code units; the current IronRDP server API exposes
-/// each unit as `u16`, so supplementary-plane characters that require surrogate pairs
-/// cannot be represented as a single keysym here.
-fn unicode_to_keysym(cp: u16) -> Option<i32> {
-    match cp {
-        0xD800..=0xDFFF => None,
-        0x0000..=0x001F | 0x007F..=0x009F => None,
-        0x0020..=0x00FF => Some(i32::from(cp)),
-        _ => Some((0x0100_0000u32 | u32::from(cp)) as i32),
-    }
-}
-
-fn portal_err(e: impl std::fmt::Display) -> InputError {
-    InputError::PortalError(e.to_string())
+fn input_injection_err(e: impl std::fmt::Display) -> InputError {
+    InputError::PortalError(format!("Input injection error: {e}"))
 }
 
 /// Lamco RDP Input Handler
@@ -803,47 +788,31 @@ impl LamcoInputHandler {
                     session_handle
                         .notify_keyboard_keysym(keysym, true)
                         .await
-                        .map_err(portal_err)?;
-                } else {
-                    debug!(
-                        "Unicode press 0x{:04X}: no evdev or keysym mapping",
-                        unicode
-                    );
+                        .map_err(input_injection_err)?;
                 }
             }
 
             IronKeyboardEvent::UnicodeReleased(unicode) => {
-                // Skip release events for chars that were buffered into the CJK buffer
-                // (they have no corresponding keycode to release)
-                if unicode_to_evdev(unicode).is_some() {
-                    debug!("Unicode release 0x{:04X} -> evdev", unicode);
-                    if let Some((keycode, needs_shift)) = unicode_to_evdev(unicode) {
+                if let Some((keycode, needs_shift)) = unicode_to_evdev(unicode) {
+                    debug!(
+                        "Unicode release 0x{:04X} -> evdev {} (shift={})",
+                        unicode, keycode, needs_shift
+                    );
+                    session_handle
+                        .notify_keyboard_keycode(keycode as i32, false)
+                        .await
+                        .map_err(input_injection_err)?;
+                    if needs_shift {
                         session_handle
-                            .notify_keyboard_keycode(keycode as i32, false)
+                            .notify_keyboard_keycode(42, false)
                             .await
-                            .map_err(portal_err)?;
-                        if needs_shift {
-                            session_handle
-                                .notify_keyboard_keycode(42, false)
-                                .await
-                                .map_err(portal_err)?;
-                        }
+                            .map_err(input_injection_err)?;
                     }
                 } else if !cjk_paste_enabled || clipboard_provider.is_none() {
                     let keysym = 0x0100_0000_u32 + u32::from(unicode);
                     debug!(
-                        "Unicode release 0x{:04X} -> XKB keysym 0x{:08X}",
+                        "Unicode release 0x{:04X} -> keysym 0x{:08X}",
                         unicode, keysym
-                    );
-                    session_handle
-                        .notify_keyboard_keysym(keysym, false)
-                        .await
-                        .map_err(portal_err)?;
-                } else {
-                    // Buffered CJK character — no release event needed
-                    debug!(
-                        "Unicode release 0x{:04X}: skipping (buffered or unmapped)",
-                        unicode
                     );
                     session_handle
                         .notify_keyboard_keysym(keysym, false)
@@ -1416,30 +1385,79 @@ mod tests {
     }
 
     #[test]
-    fn test_cjk_buffer_basic() {
-        let mut buf = CjkPasteBuffer::new();
-        buf.push_char('中');
-        buf.push_char('文');
-        buf.push_char('字');
-        assert!(!buf.is_empty());
-        assert_eq!(buf.take_text(), Some("中文字".to_string()));
-        assert!(buf.is_empty());
-        assert_eq!(buf.take_text(), None);
+    fn test_unicode_to_evdev_ascii() {
+        use super::unicode_to_evdev;
+
+        // Space
+        assert_eq!(unicode_to_evdev(0x20), Some((57, false)));
+        // Lowercase 'a'
+        assert_eq!(unicode_to_evdev(0x61), Some((30, false)));
+        // Uppercase 'A' (shift)
+        assert_eq!(unicode_to_evdev(0x41), Some((30, true)));
+        // Digit '0'
+        assert_eq!(unicode_to_evdev(0x30), Some((11, false)));
+        // Exclamation '!' (shift+1)
+        assert_eq!(unicode_to_evdev(0x21), Some((2, true)));
+        // Tab
+        assert_eq!(unicode_to_evdev(0x09), Some((15, false)));
+        // Enter
+        assert_eq!(unicode_to_evdev(0x0D), Some((28, false)));
     }
 
     #[test]
-    fn test_surrogate_pair() {
-        let mut buf = CjkPasteBuffer::new();
-        // U+1F600 GRINNING FACE: high=0xD83D, low=0xDE00
-        let result = buf.push_surrogate_pair(0xD83D, 0xDE00);
-        assert_eq!(result, Some('😀'));
-        assert_eq!(buf.take_text(), Some("😀".to_string()));
+    fn test_unicode_to_evdev_symbols() {
+        use super::unicode_to_evdev;
+
+        assert_eq!(unicode_to_evdev(0x2D), Some((12, false))); // '-'
+        assert_eq!(unicode_to_evdev(0x5F), Some((12, true))); // '_'
+        assert_eq!(unicode_to_evdev(0x3D), Some((13, false))); // '='
+        assert_eq!(unicode_to_evdev(0x2B), Some((13, true))); // '+'
+        assert_eq!(unicode_to_evdev(0x5B), Some((26, false))); // '['
+        assert_eq!(unicode_to_evdev(0x7B), Some((26, true))); // '{'
     }
 
     #[test]
-    fn test_buffer_empty_returns_none() {
-        let mut buf = CjkPasteBuffer::new();
-        assert!(buf.is_empty());
-        assert_eq!(buf.take_text(), None);
+    fn test_unicode_to_evdev_non_ascii_returns_none() {
+        use super::unicode_to_evdev;
+
+        // CJK characters should return None (handled by keysym path)
+        assert_eq!(unicode_to_evdev(0x754C), None); // unicode codepoint beyond ASCII
+        assert_eq!(unicode_to_evdev(0x4E16), None); // unicode codepoint beyond ASCII
+        // Accented characters
+        assert_eq!(unicode_to_evdev(0x00E9), None); // 'e' with acute
+        // High values
+        assert_eq!(unicode_to_evdev(0xD83D), None); // high surrogate
+    }
+
+    #[test]
+    fn test_unicode_keysym_encoding() {
+        // Verify the XKB Unicode keysym formula: 0x01000000 + code_point
+        let unicode: u16 = 0x754C;
+        let keysym = 0x0100_0000_u32 + u32::from(unicode);
+        assert_eq!(keysym, 0x0100_754C);
+
+        let unicode: u16 = 0x4E16;
+        let keysym = 0x0100_0000_u32 + u32::from(unicode);
+        assert_eq!(keysym, 0x0100_4E16);
+
+        // ASCII 'A' would be 0x01000041, but we use evdev for ASCII
+        let unicode: u16 = 0x0041;
+        let keysym = 0x0100_0000_u32 + u32::from(unicode);
+        assert_eq!(keysym, 0x0100_0041);
+    }
+
+    #[test]
+    fn test_unicode_full_ascii_coverage() {
+        use super::unicode_to_evdev;
+
+        // Every printable ASCII character (0x20-0x7E) should map to something
+        for cp in 0x20u16..=0x7E {
+            assert!(
+                unicode_to_evdev(cp).is_some(),
+                "ASCII 0x{:02X} ('{}') should have a mapping",
+                cp,
+                char::from(cp as u8)
+            );
+        }
     }
 }
