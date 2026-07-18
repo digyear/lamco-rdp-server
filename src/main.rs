@@ -2,7 +2,7 @@
 //!
 //! Entry point for the server binary.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use lamco_rdp_server::{config::Config, server::LamcoRdpServer};
 use tracing::{error, info, warn};
@@ -135,6 +135,11 @@ async fn main() -> Result<()> {
         print!("{}", lamco_rdp_server::third_party::notices());
         return Ok(());
     }
+
+    // Consume systemd LISTEN_FDS before the first await so inherited sockets
+    // can be transferred into the desktop accept deployment.
+    let activated_fds = lamco_rdp_server::transport::ActivatedFds::from_env()
+        .context("Failed to consume systemd socket activation environment")?;
 
     // Resolve config path: CLI flag, then Flatpak-aware default, then /etc fallback
     let config_path = args.config.clone().unwrap_or_else(|| {
@@ -280,7 +285,7 @@ async fn main() -> Result<()> {
 
     info!("Initializing server");
     let mut server = match LamcoRdpServer::new(config).await {
-        Ok(s) => s,
+        Ok(s) => s.with_activated_fds(activated_fds),
         Err(e) => {
             error!("Server initialization failed: {e:#}");
             eprintln!("{}", lamco_rdp_server::runtime::format_user_error(&e));

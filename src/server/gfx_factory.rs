@@ -119,6 +119,9 @@ pub struct SharedHandlerState {
     pub is_ready: std::sync::atomic::AtomicBool,
     /// Whether AVC420 (H.264 YUV420) codec is supported
     pub client_supports_avc420: std::sync::atomic::AtomicBool,
+    /// Whether the client explicitly advertised AVC_DISABLED and requires
+    /// the Android-compatible RDP6 Planar fallback instead of EGFX Uncompressed.
+    pub client_requires_planar: std::sync::atomic::AtomicBool,
     /// Whether AVC444 (H.264 YUV444) codec is supported
     pub is_avc444_enabled: bool,
     /// Whether this client needs Android RD Client pointer workaround updates.
@@ -140,6 +143,7 @@ impl SharedHandlerState {
         Self {
             is_ready: std::sync::atomic::AtomicBool::new(false),
             client_supports_avc420: std::sync::atomic::AtomicBool::new(false),
+            client_requires_planar: std::sync::atomic::AtomicBool::new(false),
             is_avc444_enabled: std::sync::atomic::AtomicBool::new(false),
             has_surface: std::sync::atomic::AtomicBool::new(false),
             primary_surface_id: std::sync::atomic::AtomicU16::new(0),
@@ -159,6 +163,8 @@ impl SharedHandlerState {
         self.is_ready
             .store(false, std::sync::atomic::Ordering::Release);
         self.client_supports_avc420
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.client_requires_planar
             .store(false, std::sync::atomic::Ordering::Release);
         self.is_avc444_enabled
             .store(false, std::sync::atomic::Ordering::Release);

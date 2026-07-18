@@ -87,64 +87,53 @@ use ironrdp_server::{
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
-/// Accumulates non-ASCII Unicode input units for clipboard-paste fallback.
-///
-/// RDP sends CJK input as a stream of UnicodePressed events. Since keysym
-/// injection fails for many CJK characters on KDE, we buffer them and flush
-/// via write_text + Ctrl+V when a non-Unicode event (keycode) arrives.
+use crate::clipboard::provider::ClipboardProvider;
+use crate::input::{
+    CoordinateTransformer, InputError, KeyboardHandler, MonitorInfo, MouseButton, MouseHandler,
+};
+use crate::server::gfx_factory::SharedHandlerState;
+
+/// Accumulates non-ASCII UTF-16 input for clipboard-paste fallback.
+#[derive(Default)]
 struct CjkPasteBuffer {
     buf: String,
     pending_high_surrogate: Option<u16>,
 }
 
 impl CjkPasteBuffer {
-    fn new() -> Self {
-        Self {
-            buf: String::new(),
-            pending_high_surrogate: None,
+    fn push_utf16_unit(&mut self, unit: u16) -> bool {
+        if (0xD800..=0xDBFF).contains(&unit) {
+            self.pending_high_surrogate = Some(unit);
+            return false;
         }
-    }
-
-    fn push_char(&mut self, c: char) {
-        self.buf.push(c);
-    }
-
-    /// Decode a UTF-16 surrogate pair and push the resulting char.
-    /// Returns the decoded char if the pair is complete, None if `high` was stored
-    /// waiting for a low surrogate, or None if the pair is invalid.
-    fn push_surrogate_pair(&mut self, high: u16, low: u16) -> Option<char> {
-        if !(0xD800..=0xDBFF).contains(&high) || !(0xDC00..=0xDFFF).contains(&low) {
-            self.pending_high_surrogate = None;
-            return None;
+        if (0xDC00..=0xDFFF).contains(&unit) {
+            let Some(high) = self.pending_high_surrogate.take() else {
+                return false;
+            };
+            let code_point = 0x10000 + (u32::from(high - 0xD800) << 10) + u32::from(unit - 0xDC00);
+            if let Some(c) = char::from_u32(code_point) {
+                self.buf.push(c);
+                return true;
+            }
+            return false;
         }
-        let code_point = 0x10000 + (u32::from(high - 0xD800) << 10) + u32::from(low - 0xDC00);
-        let c = char::from_u32(code_point)?;
-        self.buf.push(c);
         self.pending_high_surrogate = None;
-        Some(c)
+        if let Some(c) = char::from_u32(u32::from(unit)) {
+            self.buf.push(c);
+            return true;
+        }
+        false
     }
 
     fn is_empty(&self) -> bool {
         self.buf.is_empty() && self.pending_high_surrogate.is_none()
     }
 
-    /// Drain buffered text. Returns None if nothing was accumulated.
     fn take_text(&mut self) -> Option<String> {
         self.pending_high_surrogate = None;
-        if self.buf.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.buf))
-        }
+        (!self.buf.is_empty()).then(|| std::mem::take(&mut self.buf))
     }
 }
-
-use crate::clipboard::provider::ClipboardProvider;
-use crate::input::{
-    CoordinateTransformer, InputError, KeyboardHandler, MonitorInfo, MouseButton, MouseHandler,
-};
-use crate::server::display_handler::LamcoDisplayHandler;
-use crate::server::gfx_factory::HandlerState;
 
 /// Map a Unicode code point to an evdev keycode and whether Shift is needed.
 /// Covers printable ASCII (0x20-0x7E) on US QWERTY layout.
@@ -442,24 +431,14 @@ pub struct LamcoInputHandler {
     /// Input event queue sender (for multiplexer - bounded with drop policy)
     input_tx: mpsc::Sender<InputEvent>,
 
-    /// Display update channel used only for Android RD Client pointer workaround PDUs.
+    /// Display update channel used for Android RD Client pointer workaround PDUs.
     pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
 
-    /// Shared EGFX capability state used to gate Android-only pointer workaround PDUs.
-    gfx_handler_state: Option<Arc<RwLock<Option<HandlerState>>>>,
+    /// EGFX state used to restrict workaround PDUs to AVC-disabled Android clients.
+    gfx_handler_state: Option<Arc<SharedHandlerState>>,
 
-    /// Whether the Android workaround cursor bitmap was already sent this connection.
+    /// Whether the workaround cursor shape was sent for this connection.
     pointer_shape_sent: Arc<AtomicBool>,
-
-    /// Whether CJK clipboard-paste fallback is enabled (from config)
-    cjk_paste_enabled: bool,
-
-    /// Clipboard provider for writing text during CJK paste fallback
-    clipboard_provider: Option<Arc<dyn ClipboardProvider>>,
-
-    /// Flag to pause cooperation sync during CJK paste operations.
-    /// When set to true, the cooperation event handler skips Klipper sync events.
-    cjk_paste_paused: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl LamcoInputHandler {
@@ -469,12 +448,12 @@ impl LamcoInputHandler {
         primary_stream_id: u32,
         input_tx: mpsc::Sender<InputEvent>,
         pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
-        gfx_handler_state: Option<Arc<RwLock<Option<HandlerState>>>>,
+        gfx_handler_state: Option<Arc<SharedHandlerState>>,
         mut input_rx: mpsc::Receiver<InputEvent>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         cjk_paste_enabled: bool,
         clipboard_provider: Option<Arc<dyn ClipboardProvider>>,
-        cjk_paste_paused: Option<Arc<std::sync::atomic::AtomicBool>>,
+        cjk_paste_paused: Option<Arc<AtomicBool>>,
     ) -> Result<Self, InputError> {
         let keyboard_handler = Arc::new(Mutex::new(KeyboardHandler::new()));
         let mouse_handler = Arc::new(Mutex::new(MouseHandler::new()));
@@ -492,20 +471,19 @@ impl LamcoInputHandler {
         let keyboard_clone = Arc::clone(&keyboard_handler);
         let mouse_clone = Arc::clone(&mouse_handler);
         let coord_clone = Arc::clone(&coordinate_transformer);
-        let cjk_enabled_task = cjk_paste_enabled;
-        let clipboard_provider_task = clipboard_provider.clone();
-        let cjk_paste_paused_task = cjk_paste_paused.clone();
         let pointer_update_tx_task = pointer_update_tx.clone();
         let gfx_handler_state_task = gfx_handler_state.clone();
         let pointer_shape_sent = Arc::new(AtomicBool::new(false));
         let pointer_shape_sent_task = Arc::clone(&pointer_shape_sent);
+        let clipboard_provider_task = clipboard_provider.clone();
+        let cjk_paste_paused_task = cjk_paste_paused.clone();
 
         tokio::spawn(async move {
             let mut keyboard_batch = Vec::with_capacity(16);
             let mut mouse_batch = Vec::with_capacity(16);
             let mut last_flush = Instant::now();
             let batch_interval = tokio::time::Duration::from_millis(10);
-            let mut cjk_buffer = CjkPasteBuffer::new();
+            let mut cjk_buffer = CjkPasteBuffer::default();
 
             // Rate-limit input injection errors to avoid log spam when the
             // portal session becomes unresponsive (e.g. PipeWire stream pauses)
@@ -538,7 +516,7 @@ impl LamcoInputHandler {
                                 &keyboard_clone,
                                 kbd_event,
                                 &mut cjk_buffer,
-                                cjk_enabled_task,
+                                cjk_paste_enabled,
                                 &clipboard_provider_task,
                                 &cjk_paste_paused_task,
                             ).await {
@@ -625,9 +603,6 @@ impl LamcoInputHandler {
             pointer_update_tx,
             gfx_handler_state,
             pointer_shape_sent,
-            cjk_paste_enabled,
-            clipboard_provider,
-            cjk_paste_paused,
         })
     }
 
@@ -684,13 +659,12 @@ impl LamcoInputHandler {
         cjk_buffer: &mut CjkPasteBuffer,
         cjk_paste_enabled: bool,
         clipboard_provider: &Option<Arc<dyn ClipboardProvider>>,
-        cjk_paste_paused: &Option<Arc<std::sync::atomic::AtomicBool>>,
+        cjk_paste_paused: &Option<Arc<AtomicBool>>,
     ) -> Result<(), InputError> {
         let mut keyboard = keyboard_handler.lock().await;
 
         match event {
             IronKeyboardEvent::Pressed { code, extended } => {
-                // Flush any buffered CJK text before a regular keycode event
                 if !cjk_buffer.is_empty() {
                     drop(keyboard);
                     Self::flush_cjk_buffer(
@@ -792,12 +766,10 @@ impl LamcoInputHandler {
 
             IronKeyboardEvent::UnicodePressed(unicode) => {
                 if let Some((keycode, needs_shift)) = unicode_to_evdev(unicode) {
-                    // Fast path: ASCII characters mapped to evdev keycodes
                     debug!(
                         "Unicode press 0x{:04X} -> evdev {} (shift={})",
                         unicode, keycode, needs_shift
                     );
-                    // KEY_LEFTSHIFT = 42
                     if needs_shift {
                         session_handle
                             .notify_keyboard_keycode(42, true)
@@ -807,47 +779,13 @@ impl LamcoInputHandler {
                     session_handle
                         .notify_keyboard_keycode(keycode as i32, true)
                         .await
-                        .map_err(portal_err)?;
-                } else if cjk_paste_enabled {
-                    // KDE/xdg-desktop-portal-kde cannot turn CJK Unicode keysyms into
-                    // physical keycodes, so do not try keysym injection for non-ASCII
-                    // Unicode here. Buffer the committed text and paste it immediately.
-                    if (0xD800..=0xDBFF).contains(&unicode) {
-                        cjk_buffer.pending_high_surrogate = Some(unicode);
-                        debug!(
-                            "Unicode press 0x{:04X}: stored high surrogate for CJK paste",
+                        .map_err(input_injection_err)?;
+                } else if cjk_paste_enabled && clipboard_provider.is_some() {
+                    if cjk_buffer.push_utf16_unit(unicode) {
+                        info!(
+                            "Unicode press 0x{:04X}: committing via CJK paste fallback",
                             unicode
                         );
-                    } else if (0xDC00..=0xDFFF).contains(&unicode) {
-                        if let Some(high) = cjk_buffer.pending_high_surrogate.take() {
-                            if cjk_buffer.push_surrogate_pair(high, unicode).is_some() {
-                                info!(
-                                    "Unicode press surrogate pair 0x{:04X}+0x{:04X}: buffered for CJK paste",
-                                    high, unicode
-                                );
-                                drop(keyboard);
-                                Self::flush_cjk_buffer(
-                                    session_handle,
-                                    cjk_buffer,
-                                    clipboard_provider,
-                                    cjk_paste_paused,
-                                )
-                                .await;
-                            } else {
-                                debug!(
-                                    "Unicode press 0x{:04X}: invalid surrogate pair, discarding",
-                                    unicode
-                                );
-                            }
-                        } else {
-                            debug!(
-                                "Unicode press 0x{:04X}: lone low surrogate, discarding",
-                                unicode
-                            );
-                        }
-                    } else if let Some(c) = char::from_u32(u32::from(unicode)) {
-                        cjk_buffer.push_char(c);
-                        info!("Unicode press 0x{:04X}: buffered for CJK paste", unicode);
                         drop(keyboard);
                         Self::flush_cjk_buffer(
                             session_handle,
@@ -857,13 +795,11 @@ impl LamcoInputHandler {
                         )
                         .await;
                     } else {
-                        debug!("Unicode press 0x{:04X}: no mapping, discarding", unicode);
+                        debug!("Unicode press 0x{:04X}: waiting for UTF-16 pair", unicode);
                     }
-                } else if let Some(keysym) = unicode_to_keysym(unicode) {
-                    debug!(
-                        "Unicode press 0x{:04X} -> XKB keysym 0x{:08X}",
-                        unicode, keysym
-                    );
+                } else {
+                    let keysym = 0x0100_0000_u32 + u32::from(unicode);
+                    debug!("Unicode press 0x{:04X} -> keysym 0x{:08X}", unicode, keysym);
                     session_handle
                         .notify_keyboard_keysym(keysym, true)
                         .await
@@ -893,7 +829,8 @@ impl LamcoInputHandler {
                                 .map_err(portal_err)?;
                         }
                     }
-                } else if let Some(keysym) = unicode_to_keysym(unicode) {
+                } else if !cjk_paste_enabled || clipboard_provider.is_none() {
+                    let keysym = 0x0100_0000_u32 + u32::from(unicode);
                     debug!(
                         "Unicode release 0x{:04X} -> XKB keysym 0x{:08X}",
                         unicode, keysym
@@ -912,6 +849,11 @@ impl LamcoInputHandler {
                         .notify_keyboard_keysym(keysym, false)
                         .await
                         .map_err(input_injection_err)?;
+                } else {
+                    trace!(
+                        "Unicode release 0x{:04X}: handled by CJK paste fallback",
+                        unicode
+                    );
                 }
             }
 
@@ -927,124 +869,255 @@ impl LamcoInputHandler {
         Ok(())
     }
 
-    /// Flush buffered CJK text via clipboard write + synthetic Ctrl+V.
-    ///
-    /// Pauses cooperation sync before writing to clipboard so Klipper's
-    /// clipboardHistoryUpdated doesn't trigger "已复制" toasts on the client.
-    /// Saves and restores the original clipboard content around the paste.
+    /// Commit buffered Unicode through the local clipboard and synthetic Ctrl+V.
     async fn flush_cjk_buffer(
         session_handle: &Arc<dyn crate::session::SessionHandle>,
         cjk_buffer: &mut CjkPasteBuffer,
         clipboard_provider: &Option<Arc<dyn ClipboardProvider>>,
-        cjk_paste_paused: &Option<Arc<std::sync::atomic::AtomicBool>>,
+        cjk_paste_paused: &Option<Arc<AtomicBool>>,
     ) {
-        use std::sync::atomic::Ordering;
-
         let Some(text) = cjk_buffer.take_text() else {
             return;
         };
+        let Some(provider) = clipboard_provider else {
+            return;
+        };
         let char_count = text.chars().count();
+        let saved_clipboard = provider.read_data("text/plain").await.ok();
 
-        if let Some(provider) = clipboard_provider {
-            // Save current clipboard content so we can restore it after the paste.
-            let saved_clipboard = provider.read_data("text/plain").await.ok();
+        if let Some(flag) = cjk_paste_paused {
+            flag.store(true, Ordering::Release);
+        }
 
-            // Pause cooperation sync BEFORE writing to clipboard.
-            // This prevents Klipper's clipboardHistoryUpdated from triggering
-            // SendInitiateCopy back to the client (which shows "已复制" toast).
-            if let Some(flag) = cjk_paste_paused {
-                flag.store(true, Ordering::Release);
-                debug!("CJK paste: cooperation sync paused");
-            }
-
-            if let Err(e) = provider.write_text(&text).await {
-                warn!("CJK paste fallback: clipboard write failed: {e}");
-            }
-
-            // Allow clipboard to propagate before sending Ctrl+V
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-            // Ctrl+V: KEY_LEFTCTRL=29, KEY_V=47
-            let send_key = |keycode: i32, pressed: bool| {
-                let sh = Arc::clone(session_handle);
-                async move {
-                    if let Err(e) = sh.notify_keyboard_keycode(keycode, pressed).await {
-                        warn!("CJK paste fallback: keycode inject failed: {e}");
-                    }
-                }
-            };
-            send_key(29, true).await;
-            send_key(47, true).await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            send_key(47, false).await;
-            send_key(29, false).await;
-
-            // Wait for Ctrl+V to be processed before restoring clipboard
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-            // Restore original clipboard content
-            if let Some(saved) = saved_clipboard {
-                if let Ok(saved_text) = String::from_utf8(saved) {
-                    if let Err(e) = provider.write_text(&saved_text).await {
-                        warn!("CJK paste: clipboard restore failed: {e}");
-                    } else {
-                        debug!("CJK paste: clipboard content restored");
-                    }
-                }
-            }
-
-            // Wait for Klipper to process the restore write before resuming sync.
-            // Without this, the Klipper event from the restore could arrive at the
-            // cooperation handler AFTER we set paused=false, causing a spurious "已复制".
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-            // Resume cooperation sync after clipboard is restored and Klipper has settled
+        if let Err(err) = provider.write_text(&text).await {
+            warn!("CJK paste fallback: clipboard write failed: {err}");
             if let Some(flag) = cjk_paste_paused {
                 flag.store(false, Ordering::Release);
-                debug!("CJK paste: cooperation sync resumed");
+            }
+            return;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        for (keycode, pressed) in [(29, true), (47, true), (47, false), (29, false)] {
+            if let Err(err) = session_handle
+                .notify_keyboard_keycode(keycode, pressed)
+                .await
+            {
+                warn!("CJK paste fallback: key injection failed: {err}");
+            }
+            if keycode == 47 && pressed {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
         }
 
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        if let Some(saved) = saved_clipboard.and_then(|bytes| String::from_utf8(bytes).ok())
+            && let Err(err) = provider.write_text(&saved).await
+        {
+            warn!("CJK paste fallback: clipboard restore failed: {err}");
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        if let Some(flag) = cjk_paste_paused {
+            flag.store(false, Ordering::Release);
+        }
         info!("CJK paste fallback: flushed {char_count} chars via clipboard");
     }
 
     fn create_android_arrow_cursor() -> RGBAPointer {
-        LamcoDisplayHandler::create_arrow_cursor()
+        const W: u16 = 32;
+        const H: u16 = 32;
+        const DATA: [u8; 4096] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 6, 0, 0, 0, 19, 0, 0, 0, 32, 0, 0, 0, 31,
+            0, 0, 0, 17, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 1, 0, 0, 0, 6, 0, 0, 0, 7, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 19,
+            0, 0, 0, 81, 0, 0, 0, 149, 0, 0, 0, 144, 0, 0, 0, 67, 0, 0, 0, 10, 0, 0, 0, 1, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 26, 0, 0, 0, 32, 0,
+            0, 0, 23, 0, 0, 0, 14, 0, 0, 0, 17, 0, 0, 0, 69, 0, 0, 0, 171, 36, 36, 36, 185, 6, 6,
+            6, 175, 0, 0, 0, 163, 0, 0, 0, 21, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 132, 0, 0, 0, 149, 0, 0, 0, 98, 0, 0, 0, 47, 0, 0,
+            0, 51, 1, 1, 1, 159, 159, 159, 159, 224, 255, 255, 255, 255, 184, 184, 184, 232, 0, 0,
+            0, 169, 0, 0, 0, 36, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 10, 1, 1, 1, 169, 149, 149, 149, 221, 25, 25, 25, 181, 0, 0, 0, 167, 0, 0, 0,
+            155, 121, 121, 121, 212, 255, 255, 255, 255, 255, 255, 255, 255, 248, 248, 248, 253, 0,
+            0, 0, 169, 0, 0, 0, 21, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 245, 245, 245, 252, 136, 136, 136,
+            217, 95, 95, 95, 204, 253, 253, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255, 226,
+            226, 226, 246, 0, 0, 0, 158, 0, 0, 0, 19, 0, 0, 0, 8, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 203, 203, 203, 238, 0, 0, 0, 157, 0, 0, 0, 56, 0, 0, 0, 31, 0, 0, 0, 18,
+            0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 199, 199, 199, 237, 14, 14, 14, 177, 0, 0, 0,
+            171, 0, 0, 0, 133, 0, 0, 0, 73, 0, 0, 0, 14, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10,
+            1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 249, 249, 249, 253, 185, 185, 185, 232, 106, 106, 106, 206, 13, 13, 13, 171, 0, 0,
+            0, 47, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 167, 167, 167, 225, 3, 3, 3, 145, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 167, 167, 167, 225, 3, 3, 3, 148, 0, 0, 0, 29, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 167, 167, 167, 225, 3, 3, 3, 148, 0,
+            0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1,
+            169, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 167, 167, 167, 225, 3, 3,
+            3, 148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 159, 159, 159, 222, 2, 2,
+            2, 148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 159, 159, 159, 222, 2, 2, 2,
+            148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 159, 159, 159, 222, 2, 2, 2, 148, 0, 0, 0, 29,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 159, 159, 159, 222, 2, 2, 2, 148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 10, 1, 1, 1, 169, 255, 255, 255, 255, 255, 255, 255, 255, 159, 159, 159,
+            222, 2, 2, 2, 148, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1,
+            1, 1, 169, 255, 255, 255, 255, 159, 159, 159, 222, 2, 2, 2, 148, 0, 0, 0, 29, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 1, 1, 1, 166, 159, 159, 159, 222,
+            2, 2, 2, 147, 0, 0, 0, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 3, 0, 0, 0, 147, 2, 2, 2, 143, 0, 0, 0, 25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 0, 0, 0, 12, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+
+        RGBAPointer {
+            cache_index: 0,
+            width: W,
+            height: H,
+            hot_x: 4u16,
+            hot_y: 4u16,
+            data: DATA.to_vec(),
+        }
     }
 
-    async fn needs_android_pointer_updates(
-        gfx_handler_state: &Option<Arc<RwLock<Option<HandlerState>>>>,
-    ) -> bool {
-        let Some(state) = gfx_handler_state else {
-            return false;
-        };
-        state
-            .read()
-            .await
+    fn needs_android_pointer_updates(gfx_handler_state: &Option<Arc<SharedHandlerState>>) -> bool {
+        gfx_handler_state
             .as_ref()
-            .is_some_and(|s| s.needs_android_pointer_updates)
+            .is_some_and(|state| state.client_requires_planar.load(Ordering::Acquire))
     }
 
     async fn send_android_pointer_shape_once(
         pointer_update_tx: &Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
-        gfx_handler_state: &Option<Arc<RwLock<Option<HandlerState>>>>,
+        gfx_handler_state: &Option<Arc<SharedHandlerState>>,
         pointer_shape_sent: &Arc<AtomicBool>,
     ) {
-        if !Self::needs_android_pointer_updates(gfx_handler_state).await {
-            return;
-        }
-        if pointer_shape_sent
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+        if !Self::needs_android_pointer_updates(gfx_handler_state)
+            || pointer_shape_sent
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
         {
             return;
         }
 
         let Some(update_tx) = pointer_update_tx else {
+            pointer_shape_sent.store(false, Ordering::Release);
             return;
         };
-        let sender = update_tx.lock().await;
-        if let Err(err) = sender.try_send(DisplayUpdate::RGBAPointer(
+        if let Err(err) = update_tx.lock().await.try_send(DisplayUpdate::RGBAPointer(
             Self::create_android_arrow_cursor(),
         )) {
             trace!("Dropping Android pointer shape update: {err}");
@@ -1056,20 +1129,18 @@ impl LamcoInputHandler {
 
     async fn send_android_pointer_position_update(
         pointer_update_tx: &Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
-        gfx_handler_state: &Option<Arc<RwLock<Option<HandlerState>>>>,
+        gfx_handler_state: &Option<Arc<SharedHandlerState>>,
         x: u16,
         y: u16,
     ) {
-        if !Self::needs_android_pointer_updates(gfx_handler_state).await {
+        if !Self::needs_android_pointer_updates(gfx_handler_state) {
             return;
         }
         let Some(update_tx) = pointer_update_tx else {
             return;
         };
-
         let update = DisplayUpdate::PointerPosition(PointerPositionAttribute { x, y });
-        let sender = update_tx.lock().await;
-        if let Err(err) = sender.try_send(update) {
+        if let Err(err) = update_tx.lock().await.try_send(update) {
             trace!("Dropping Android pointer position update: {err}");
         }
     }
@@ -1083,7 +1154,7 @@ impl LamcoInputHandler {
         event: IronMouseEvent,
         stream_id: u32,
         pointer_update_tx: &Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
-        gfx_handler_state: &Option<Arc<RwLock<Option<HandlerState>>>>,
+        gfx_handler_state: &Option<Arc<SharedHandlerState>>,
         pointer_shape_sent: &Arc<AtomicBool>,
     ) -> Result<(), InputError> {
         let mut mouse = mouse_handler.lock().await;
@@ -1308,34 +1379,23 @@ impl Clone for LamcoInputHandler {
             pointer_update_tx: self.pointer_update_tx.clone(),
             gfx_handler_state: self.gfx_handler_state.clone(),
             pointer_shape_sent: Arc::clone(&self.pointer_shape_sent),
-            cjk_paste_enabled: self.cjk_paste_enabled,
-            clipboard_provider: self.clipboard_provider.clone(),
-            cjk_paste_paused: self.cjk_paste_paused.clone(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CjkPasteBuffer;
-    use super::LamcoInputHandler;
-    use super::unicode_to_keysym;
+    use super::{CjkPasteBuffer, LamcoInputHandler};
 
     #[test]
-    fn unicode_to_keysym_maps_bmp_cjk_to_xkb_unicode_keysym() {
-        assert_eq!(unicode_to_keysym('中' as u16), Some(0x0100_4E2D));
-        assert_eq!(unicode_to_keysym('文' as u16), Some(0x0100_6587));
-    }
+    fn cjk_paste_buffer_decodes_bmp_and_surrogate_pair() {
+        let mut buffer = CjkPasteBuffer::default();
 
-    #[test]
-    fn unicode_to_keysym_keeps_latin1_keysyms_direct() {
-        assert_eq!(unicode_to_keysym('é' as u16), Some(0x00E9));
-    }
-
-    #[test]
-    fn unicode_to_keysym_rejects_surrogate_code_units() {
-        assert_eq!(unicode_to_keysym(0xD83D), None);
-        assert_eq!(unicode_to_keysym(0xDE00), None);
+        assert!(buffer.push_utf16_unit(0x4E2D)); // 中
+        assert!(!buffer.push_utf16_unit(0xD83D)); // emoji high surrogate
+        assert!(buffer.push_utf16_unit(0xDE00)); // emoji low surrogate
+        assert_eq!(buffer.take_text().as_deref(), Some("中😀"));
+        assert!(buffer.is_empty());
     }
 
     #[test]

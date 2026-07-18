@@ -735,6 +735,102 @@ impl EgfxFrameSender {
         self.frame_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Send a Planar-encoded frame through EGFX.
+    ///
+    /// Planar codec (0x0a) is the compatible fallback for the Microsoft Android
+    /// RDP client when it advertises EGFX with AVC_DISABLED. Once that client
+    /// opens the EGFX channel it does not reliably accept FastPath RemoteFX or
+    /// EGFX Uncompressed frames.
+    pub async fn send_planar_frame(
+        &self,
+        planar_encoder: &mut ironrdp_graphics::rdp6::BitmapStreamEncoder,
+        bitmap: &ironrdp_server::BitmapUpdate,
+        display_width: u16,
+        display_height: u16,
+        timestamp_ms: u32,
+    ) -> SendResult<u32> {
+        use std::sync::atomic::Ordering::Acquire;
+
+        if !self.handler_state.is_ready.load(Acquire) {
+            return Err(SendError::NotReady);
+        }
+
+        let surface_id = if self.handler_state.has_surface.load(Acquire) {
+            self.handler_state.primary_surface_id.load(Acquire)
+        } else {
+            return Err(SendError::NoSurface);
+        };
+
+        // Rebuild from the real frame dimensions. A stale row width makes the
+        // Planar delta/RLE encoder split rows at the wrong offset and produces
+        // the horizontal scan-line corruption seen on Android.
+        let width = bitmap.width.get() as usize;
+        let height = bitmap.height.get() as usize;
+        *planar_encoder = ironrdp_graphics::rdp6::BitmapStreamEncoder::new(width, height);
+        let mut encoded = vec![0u8; width * height * 4 + 1024];
+
+        // PipeWire supplies top-down rows and Android EGFX Planar consumes the
+        // bitmap stream in that same visual order. Reversing the rows here
+        // makes the entire desktop appear upside down.
+        let row_len = width * 4;
+        let pixels = bitmap
+            .data
+            .chunks(bitmap.stride.get())
+            .take(height)
+            .map(|row| &row[..row_len])
+            .flat_map(|row| row.chunks(4));
+        let encoded_len = planar_encoder
+            .encode_pixels_stream::<_, ironrdp_graphics::rdp6::BgrAChannels>(
+                pixels,
+                &mut encoded,
+                true,
+            )
+            .map_err(|e| SendError::EncodingFailed(format!("Planar encode: {e}")))?;
+
+        let (frame_id, dvc_messages, channel_id) = {
+            let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
+            let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
+            let frame_id = server
+                .send_planar_frame(
+                    surface_id,
+                    &encoded[..encoded_len],
+                    width as u16,
+                    height as u16,
+                    timestamp_ms,
+                )
+                .ok_or(SendError::Backpressure)?;
+            (frame_id, server.drain_output(), channel_id)
+        };
+
+        if !dvc_messages.is_empty() {
+            let svc_messages =
+                encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                    .map_err(|e| SendError::EncodingFailed(e.to_string()))?;
+            self.event_tx
+                .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                    messages: svc_messages,
+                }))
+                .map_err(|_| SendError::ChannelClosed)?;
+        }
+
+        let count = self
+            .frame_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count == 0 || count.is_multiple_of(30) {
+            debug!(
+                "EGFX Planar: sent frame {} (id={}, {}x{}, raw={}B encoded={}B)",
+                count,
+                frame_id,
+                display_width,
+                display_height,
+                bitmap.data.len(),
+                encoded_len
+            );
+        }
+
+        Ok(frame_id)
+    }
+
     /// Send an uncompressed bitmap frame through EGFX for V8 clients
     ///
     /// Used when the client supports EGFX but not H.264 (AVC420/AVC444).

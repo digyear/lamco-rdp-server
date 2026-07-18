@@ -134,6 +134,8 @@ use_libei = true
 keyboard_layout = "auto"
 # Enable touch input support
 enable_touch = false
+# Paste Android IME/CJK Unicode input through the local clipboard.
+cjk_paste_fallback = true
 
 # =============================================================================
 # Clipboard Configuration

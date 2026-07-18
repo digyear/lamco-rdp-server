@@ -832,6 +832,17 @@ impl LamcoDisplayHandler {
         }
     }
 
+    /// Check whether the negotiated client explicitly requires the RDP6
+    /// Planar fallback. Generic non-AVC EGFX clients continue to use
+    /// Uncompressed WireToSurface1 frames.
+    pub async fn is_planar_required(&self) -> bool {
+        self.gfx_handler_state.as_ref().is_some_and(|state| {
+            state
+                .client_requires_planar
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+
     /// Get a descriptive reason for why EGFX is not ready
     ///
     /// Returns a human-readable string explaining the current wait state.
@@ -873,6 +884,7 @@ impl LamcoDisplayHandler {
         frame_height: u32,
         aligned_width: u16,
         aligned_height: u16,
+        planar: bool,
     ) -> Option<EgfxFrameSender> {
         let gfx_handle = self.gfx_server_handle.read().await.clone()?;
         let event_tx = self.server_event_tx.read().await.clone()?;
@@ -881,10 +893,17 @@ impl LamcoDisplayHandler {
         // Must be done BEFORE sending any frames
         // MS-RDPEGFX REQUIRES 16-pixel alignment!
         {
-            info!(
-                "Aligning surface: {}x{} -> {}x{} (16-pixel boundary)",
-                frame_width, frame_height, aligned_width, aligned_height
-            );
+            if planar {
+                info!(
+                    "Creating EGFX Planar surface: {}x{} (no AVC alignment)",
+                    frame_width, frame_height
+                );
+            } else {
+                info!(
+                    "Aligning surface: {}x{} -> {}x{} (16-pixel boundary)",
+                    frame_width, frame_height, aligned_width, aligned_height
+                );
+            }
 
             #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             let mut server = gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
@@ -897,6 +916,23 @@ impl LamcoDisplayHandler {
                 "EGFX desktop dimensions set: {}x{} (actual)",
                 frame_width, frame_height
             );
+
+            if planar {
+                // Android requires ResetGraphics to carry at least one monitor
+                // definition. RDPGFX_MONITOR_DEF right/bottom are inclusive.
+                use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+                server.resize_with_monitors(
+                    frame_width as u16,
+                    frame_height as u16,
+                    vec![Monitor {
+                        left: 0,
+                        top: 0,
+                        right: frame_width as i32 - 1,
+                        bottom: frame_height as i32 - 1,
+                        flags: MonitorFlags::PRIMARY,
+                    }],
+                );
+            }
 
             // Create surface with ALIGNED dimensions
             // create_surface() will auto-send ResetGraphics using output_dimensions
@@ -997,9 +1033,9 @@ impl LamcoDisplayHandler {
         Arc::clone(&self.update_sender)
     }
 
-    /// Get shared EGFX capability state for Android-only client quirk gating.
-    pub fn get_gfx_handler_state(&self) -> Arc<RwLock<Option<HandlerState>>> {
-        Arc::clone(&self.gfx_handler_state)
+    /// Shared negotiated capability state for Android pointer compatibility.
+    pub fn get_gfx_handler_state(&self) -> Option<Arc<SharedHandlerState>> {
+        self.gfx_handler_state.clone()
     }
 
     /// Shutdown PipeWire thread explicitly
@@ -1189,7 +1225,6 @@ impl LamcoDisplayHandler {
             // NOTE: These are reset when egfx_needs_init transitions from true to false
             let mut video_encoder: Option<VideoEncoder> = None;
             let mut egfx_sender: Option<EgfxFrameSender> = None;
-            // IronRDP Planar encoder for EGFX Planar path (used when AVC is disabled and RFX unsupported)
             let mut planar_encoder: Option<ironrdp_graphics::rdp6::BitmapStreamEncoder> = None;
             // AVC444 vs AVC420 determined by VideoEncoder enum variant match, not a flag
 
@@ -1504,6 +1539,7 @@ impl LamcoDisplayHandler {
                                     // from the new stream triggers full re-init
                                     video_encoder = None;
                                     egfx_sender = None;
+                                    planar_encoder = None;
                                     force_first_frame = false;
 
                                     if let Some(ref mut detector) = damage_detector_opt {
@@ -1674,12 +1710,7 @@ impl LamcoDisplayHandler {
                             video_encoder = None;
                             egfx_sender = None;
                             planar_encoder = None;
-                            // Clear cached frame from previous session. The old frame
-                            // was captured for a different client (possibly different
-                            // codec/size). Replaying it into the new EGFX surface
-                            // before proper init causes garbled display on cross-client
-                            // reconnection (e.g. Windows→Android).
-                            cached_frame = None;
+                            // New client needs fresh EGFX surface setup
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1779,10 +1810,6 @@ impl LamcoDisplayHandler {
                             video_encoder = None;
                             egfx_sender = None;
                             planar_encoder = None;
-                            // Clear cached frame from previous session (same reason
-                            // as the Some-arm: avoid replaying stale frames across
-                            // different clients/codecs).
-                            cached_frame = None;
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1803,7 +1830,10 @@ impl LamcoDisplayHandler {
                         let should_replay_for_egfx =
                             client_waiting && needs_init && handler.is_egfx_ready().await;
 
-                        if should_replay_for_egfx {
+                        // Replay the cached frame once EGFX is ready. AVC clients use
+                        // H.264; Android clients advertising AVC_DISABLED must still
+                        // get here so the Planar path can initialize on a static desktop.
+                        if client_waiting && needs_init && handler.is_egfx_ready().await {
                             if let Some(ref cached) = cached_frame {
                                 info!(
                                     "📦 Replaying cached frame for EGFX init ({}x{}, frame {})",
@@ -2336,6 +2366,7 @@ impl LamcoDisplayHandler {
                         // (Previous client's state is stale)
                         video_encoder = None;
                         egfx_sender = None;
+                        planar_encoder = None;
 
                         // Invalidate damage detector to clear previous frame buffer
                         // This ensures first frame comparison returns 100% damage
@@ -2521,132 +2552,18 @@ impl LamcoDisplayHandler {
                         // With an encoder: AVC420/AVC444 codec. Without: Uncompressed.
                         // Per MS-RDPEGFX spec, clients in EGFX mode ignore FastPath bitmaps.
                         if video_encoder.is_none() {
-                            info!(
-                                "No H.264 encoder available, using RemoteFX bitmap path (no EGFX surface)"
-                            );
-                        } else if let (Some(gfx_handle), Some(event_tx)) = (
-                            handler.gfx_server_handle.read().await.clone(),
-                            handler.server_event_tx.read().await.clone(),
-                        ) {
-                            // Create primary surface for EGFX rendering.
-                            // Must be done BEFORE sending any frames. For AVC,
-                            // keep the RDP desktop/monitor at the visible size but
-                            // create a 16-aligned surface for the encoded frame;
-                            // the AVC region clips presentation to display_width/height.
-                            {
-                                info!(
-                                    "📐 Creating EGFX AVC surface: display {}×{}, encoded surface {}×{}",
-                                    display_width, display_height, encoded_width, encoded_height
-                                );
-
-                                let mut server =
-                                    gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
-
-                                // CRITICAL: Set desktop size BEFORE creating surface.
-                                // ResetGraphics advertises the visible desktop; CreateSurface
-                                // may be larger for H.264 macroblock compatibility.
-                                server.set_output_dimensions(display_width, display_height);
-                                info!(
-                                    "✅ EGFX desktop dimensions set: {}×{} (visible)",
-                                    display_width, display_height
-                                );
-
-                                // Send ResetGraphics with 1 monitor entry before CreateSurface.
-                                // MS-RDPEGFX §2.2.2.15: nMonitors=0 causes black screen on
-                                // Windows mstsc and corruption on Android. right/bottom are
-                                // INCLUSIVE (last pixel): right = width-1, bottom = height-1.
-                                {
-                                    use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
-                                    server.resize_with_monitors(
-                                        display_width,
-                                        display_height,
-                                        vec![Monitor {
-                                            left: 0,
-                                            top: 0,
-                                            right: display_width as i32 - 1,
-                                            bottom: display_height as i32 - 1,
-                                            flags: MonitorFlags::PRIMARY,
-                                        }],
-                                    );
-                                }
-
-                                // Create the AVC surface at encoded dimensions. Windows mstsc
-                                // requires H.264/AVC surfaces and bitstreams to stay 16-aligned;
-                                // Planar clients use the separate actual-size path above.
-                                if let Some(surface_id) =
-                                    server.create_surface(encoded_width, encoded_height)
-                                {
-                                    info!(
-                                        "✅ EGFX AVC surface {} created (encoded {}×{}, visible {}×{})",
-                                        surface_id,
-                                        encoded_width,
-                                        encoded_height,
-                                        display_width,
-                                        display_height
-                                    );
-                                    // Map surface to output at origin (0,0)
-                                    if server.map_surface_to_output(surface_id, 0, 0) {
-                                        info!("✅ EGFX surface {} mapped to output", surface_id);
-                                    } else {
-                                        warn!("Failed to map EGFX surface to output");
-                                    }
-
-                                    // Send the CreateSurface and MapSurfaceToOutput PDUs to client
-                                    let channel_id = server.channel_id();
-                                    let dvc_messages = server.drain_output();
-                                    if !dvc_messages.is_empty() {
-                                        info!(
-                                            "EGFX: drain_output returned {} DVC messages for surface setup",
-                                            dvc_messages.len()
-                                        );
-                                        // Log the size of each DVC message (GfxPdu)
-                                        for (i, msg) in dvc_messages.iter().enumerate() {
-                                            info!("  DVC msg {}: {} bytes", i, msg.size());
-                                        }
-
-                                        if let Some(ch_id) = channel_id {
-                                            use ironrdp_dvc::encode_dvc_messages;
-                                            use ironrdp_server::EgfxServerMessage;
-                                            use ironrdp_svc::ChannelFlags;
-
-                                            match encode_dvc_messages(
-                                                ch_id,
-                                                dvc_messages,
-                                                ChannelFlags::SHOW_PROTOCOL,
-                                            ) {
-                                                Ok(svc_messages) => {
-                                                    info!(
-                                                        "EGFX: Encoded {} SVC messages for DVC channel {}",
-                                                        svc_messages.len(),
-                                                        ch_id
-                                                    );
-                                                    let msg = EgfxServerMessage::SendMessages {
-                                                        messages: svc_messages,
-                                                    };
-                                                    let _ = event_tx.send(ServerEvent::Egfx(msg));
-                                                    info!("✅ EGFX surface PDUs sent to client");
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        "EGFX: Failed to encode DVC messages: {:?}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    warn!(
-                                        "Failed to create EGFX surface - server may not be ready"
-                                    );
-                                }
-                            }
-
-                            let sender = EgfxFrameSender::new(
-                                gfx_handle,
-                                handler.gfx_handler_state.clone(),
-                                event_tx,
-                            );
+                            info!("No H.264 encoder available, using EGFX uncompressed path");
+                        }
+                        if let Some(sender) = handler
+                            .setup_egfx_surface(
+                                frame.width,
+                                frame.height,
+                                aligned_width,
+                                aligned_height,
+                                false,
+                            )
+                            .await
+                        {
                             egfx_sender = Some(sender);
                             handler
                                 .egfx_needs_init
@@ -3115,10 +3032,140 @@ impl LamcoDisplayHandler {
                         }
                         continue;
                     }
+                } else if !egfx_gate_bypassed
+                    && handler.is_egfx_ready().await
+                    && handler.is_planar_required().await
+                {
+                    // Microsoft Android RD Client advertises EGFX with AVC_DISABLED.
+                    // It does not reliably accept RemoteFX or EGFX Uncompressed after
+                    // opening the graphics DVC, so use RDP6 Planar (codec 0x0a).
+                    if needs_init {
+                        video_encoder = None;
+                        egfx_sender = None;
+                        planar_encoder = None;
+                        if let Some(ref mut detector) = damage_detector_opt {
+                            detector.invalidate();
+                        }
+
+                        let surface_width = frame.width as u16;
+                        let surface_height = frame.height as u16;
+                        if let Some(sender) = handler
+                            .setup_egfx_surface(
+                                frame.width,
+                                frame.height,
+                                surface_width,
+                                surface_height,
+                                true,
+                            )
+                            .await
+                        {
+                            planar_encoder =
+                                Some(ironrdp_graphics::rdp6::BitmapStreamEncoder::new(
+                                    frame.width as usize,
+                                    frame.height as usize,
+                                ));
+                            egfx_sender = Some(sender);
+                            handler
+                                .egfx_needs_init
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                            force_first_frame = true;
+                            info!(
+                                "EGFX Planar surface setup complete (AVC disabled, codec_id=0x0a)"
+                            );
+                        }
+                    }
+
+                    if let (Some(planar), Some(sender)) = (&mut planar_encoder, &egfx_sender) {
+                        let pixel_bytes = match &frame.buffer {
+                            lamco_pipewire::FrameBuffer::Memory(data) => data,
+                            lamco_pipewire::FrameBuffer::DmaBuf(_) => {
+                                trace!("Skipping DMA-BUF frame in Planar path");
+                                frames_dropped += 1;
+                                continue;
+                            }
+                        };
+
+                        let row_bytes = frame.width as usize * 4;
+                        let height = frame.height as usize;
+                        let stride = frame.stride as usize;
+                        let required = stride.saturating_mul(height);
+                        if stride < row_bytes || pixel_bytes.len() < required {
+                            warn!(
+                                "Planar frame invalid: len={} stride={} row={} height={}",
+                                pixel_bytes.len(),
+                                stride,
+                                row_bytes,
+                                height
+                            );
+                            frames_dropped += 1;
+                            continue;
+                        }
+
+                        // Strip PipeWire row padding. BitmapStreamEncoder expects exactly
+                        // width pixels per row; retaining padding causes scan-line artifacts.
+                        let compact = if stride == row_bytes {
+                            Bytes::copy_from_slice(&pixel_bytes[..row_bytes * height])
+                        } else {
+                            let mut compact = Vec::with_capacity(row_bytes * height);
+                            for row in 0..height {
+                                let start = row * stride;
+                                compact.extend_from_slice(&pixel_bytes[start..start + row_bytes]);
+                            }
+                            Bytes::from(compact)
+                        };
+
+                        let bitmap = IronBitmapUpdate {
+                            x: 0,
+                            y: 0,
+                            width: NonZeroU16::new(frame.width as u16)
+                                .expect("captured frame width is non-zero"),
+                            height: NonZeroU16::new(frame.height as u16)
+                                .expect("captured frame height is non-zero"),
+                            format: IronPixelFormat::BgrX32,
+                            data: compact,
+                            stride: NonZeroUsize::new(row_bytes)
+                                .expect("captured frame stride is non-zero"),
+                        };
+
+                        let timestamp_ms = pipeline_decisions::compute_timestamp_ms(
+                            frame.pts,
+                            frames_sent,
+                            self.config.video.target_fps,
+                        );
+                        match sender
+                            .send_planar_frame(
+                                planar,
+                                &bitmap,
+                                frame.width as u16,
+                                frame.height as u16,
+                                timestamp_ms as u32,
+                            )
+                            .await
+                        {
+                            Ok(frame_id) => {
+                                egfx_frames_sent += 1;
+                                last_frame_time = std::time::Instant::now();
+                                if !first_frame_received {
+                                    first_frame_received = true;
+                                    session_start = std::time::Instant::now();
+                                }
+                                if egfx_frames_sent <= 3 || egfx_frames_sent.is_multiple_of(30) {
+                                    info!(
+                                        "EGFX Planar: sent frame {} ({}x{})",
+                                        frame_id, frame.width, frame.height
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("EGFX Planar send failed: {}", e);
+                                frames_dropped += 1;
+                            }
+                        }
+                        continue;
+                    }
                 } else if !egfx_gate_bypassed && handler.is_egfx_ready().await {
-                    // Non-AVC EGFX client (V8 only): setup surface and send uncompressed.
-                    // This path handles clients that negotiate EGFX but don't advertise
-                    // AVC420 support (e.g., rdpdo, ironrdp-web, minimal clients).
+                    // Generic non-AVC EGFX clients do not imply Planar support.
+                    // Preserve the upstream WireToSurface1 Uncompressed fallback.
                     if needs_init {
                         use crate::egfx::align_to_16;
                         let aligned_width = align_to_16(frame.width) as u16;
@@ -3129,6 +3176,7 @@ impl LamcoDisplayHandler {
                                 frame.height,
                                 aligned_width,
                                 aligned_height,
+                                false,
                             )
                             .await
                         {
@@ -3151,7 +3199,6 @@ impl LamcoDisplayHandler {
                             }
                         };
 
-                        // PipeWire BGRx = RDP XRGB_8888 on little-endian. No conversion needed.
                         let timestamp_ms = (frame.pts / 1_000_000) as u32;
                         match sender
                             .send_uncompressed_frame(

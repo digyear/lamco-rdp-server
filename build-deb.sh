@@ -10,12 +10,14 @@ cd "$SCRIPT_DIR"
 DOCKER_IMAGE="lamco-rdp-builder:reuse"
 CONTAINER_NAME="rdp-build"
 OUT_DIR="$SCRIPT_DIR/dist"
+BUILD_ONLINE="${LAMCO_BUILD_ONLINE:-0}"
 
 echo "=== lamco-rdp-server deb builder ==="
 echo "Working dir: $SCRIPT_DIR"
 echo "Docker image: $DOCKER_IMAGE"
 echo "Mount: $SCRIPT_DIR -> /src"
 echo "Output dir: $OUT_DIR"
+echo "Dependency fetch: $([ "$BUILD_ONLINE" = "1" ] && echo online || echo cached/offline)"
 echo ""
 
 if ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
@@ -34,9 +36,14 @@ fi
 echo "Starting builder container with current project bind mount..."
 # Network is not needed because dpkg/cargo run with local source and Cargo.lock.
 # --network none also avoids host Docker bridge/veth failures.
+NETWORK_ARGS=(--network none)
+if [ "$BUILD_ONLINE" = "1" ]; then
+    NETWORK_ARGS=()
+fi
+
 docker run -d \
     --name "$CONTAINER_NAME" \
-    --network none \
+    "${NETWORK_ARGS[@]}" \
     -v "$SCRIPT_DIR":/src:rw \
     "$DOCKER_IMAGE" \
     sleep infinity >/dev/null
@@ -52,6 +59,17 @@ trap cleanup EXIT
 
 # Verify source mount points at the project root, not the workspace parent.
 docker exec "$CONTAINER_NAME" test -f /src/Cargo.toml
+
+if [ "$BUILD_ONLINE" = "1" ]; then
+    echo ""
+    echo "=== Fetching locked dependencies ==="
+    docker exec "$CONTAINER_NAME" bash -c '
+        set -euo pipefail
+        export PATH=/usr/local/cargo/bin:$PATH
+        cd /src
+        cargo fetch --locked
+    '
+fi
 
 echo ""
 echo "=== Preparing debian/ directory from packaging/debian/ ==="

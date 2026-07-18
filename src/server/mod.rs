@@ -166,6 +166,9 @@ pub struct LamcoRdpServer {
 
     /// Prevents double cleanup (run() path + Drop safety net)
     cleanup_done: bool,
+
+    /// Listening sockets inherited from systemd socket activation.
+    activated_fds: crate::transport::ActivatedFds,
 }
 
 impl LamcoRdpServer {
@@ -963,6 +966,21 @@ impl LamcoRdpServer {
                     })
                     .collect();
 
+                let (cjk_clipboard_provider, cjk_paste_pause_flag) =
+                    if config.input.cjk_paste_fallback {
+                        if let Some(manager) = &wlr_clipboard_manager {
+                            let manager = manager.lock().await;
+                            (
+                                manager.clipboard_provider().await,
+                                Some(manager.cjk_paste_pause_flag()),
+                            )
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+
                 let (input_tx, input_rx) = tokio::sync::mpsc::channel(256);
                 #[cfg(feature = "wl-clipboard")]
                 let cjk_clipboard: Option<
@@ -988,12 +1006,12 @@ impl LamcoRdpServer {
                     primary_stream_id,
                     input_tx,
                     Some(display_handler.get_update_sender()),
-                    Some(display_handler.get_gfx_handler_state()),
+                    display_handler.get_gfx_handler_state(),
                     input_rx,
                     shutdown_broadcast.subscribe(),
                     config.input.cjk_paste_fallback,
-                    cjk_clipboard,
-                    cjk_paste_paused_flag,
+                    cjk_clipboard_provider,
+                    cjk_paste_pause_flag,
                 )
                 .context("Failed to create wlr-direct input handler")?;
 
@@ -1086,6 +1104,7 @@ impl LamcoRdpServer {
                 metrics,
                 snapshot_collector,
                 cleanup_done: false,
+                activated_fds: crate::transport::ActivatedFds::default(),
             });
         }
 
@@ -1331,8 +1350,6 @@ impl LamcoRdpServer {
             };
         #[cfg(not(feature = "wl-clipboard"))]
         let cjk_clipboard: Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> = None;
-        // Create the CJK paste pause flag here so both the input handler and the
-        // ClipboardOrchestrator (created below) share the same Arc<AtomicBool>.
         let cjk_paste_paused_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let input_handler = LamcoInputHandler::new(
             portal_input_handle, // Use Portal session for input (works on all DEs)
@@ -1340,7 +1357,7 @@ impl LamcoRdpServer {
             primary_stream_id,
             input_tx.clone(), // Multiplexer input queue sender (for handler callbacks)
             Some(display_handler.get_update_sender()),
-            Some(display_handler.get_gfx_handler_state()),
+            display_handler.get_gfx_handler_state(),
             input_rx, // Multiplexer input queue receiver (for batching task)
             shutdown_broadcast.subscribe(), // Shutdown signal for batching task
             config.input.cjk_paste_fallback,
@@ -1409,6 +1426,8 @@ impl LamcoRdpServer {
             let mut clipboard_mgr = ClipboardOrchestrator::new(clipboard_config)
                 .await
                 .context("Failed to create clipboard manager")?;
+
+            clipboard_mgr.set_cjk_paste_pause_flag(Arc::clone(&cjk_paste_paused_flag));
 
             clipboard_mgr.set_health_reporter(health_reporter.clone());
 
@@ -1701,7 +1720,14 @@ impl LamcoRdpServer {
             metrics,
             snapshot_collector,
             cleanup_done: false,
+            activated_fds: crate::transport::ActivatedFds::default(),
         })
+    }
+
+    /// Attach sockets consumed from systemd's LISTEN_FDS environment.
+    pub fn with_activated_fds(mut self, activated_fds: crate::transport::ActivatedFds) -> Self {
+        self.activated_fds = activated_fds;
+        self
     }
 
     /// Get the performance snapshot collector for monitoring consumers.
@@ -1850,12 +1876,27 @@ impl LamcoRdpServer {
             .parse()
             .context("Invalid listen address")?;
 
-        let (listener, socket_activated) =
-            if let Some(listener) = systemd_activated_listener(listen_addr)? {
-                (listener, true)
-            } else {
-                // Pre-bind check: detect if the port is already in use and identify the holder
-                check_port_available(&listen_addr);
+        // Phase 1 of the unified transport accept layer, retrofit 2026-05-16
+        // to use the AcceptDeployment trait pattern.
+        //
+        // WlrDirectDeployment encapsulates the per-binary differences (TOML
+        // transports config, mpsc D-Bus event sink, PAM validator, broadcast
+        // shutdown, Portal-validity closure). AcceptDispatcher consumes the
+        // trait and stays binary-agnostic.
+        //
+        // See:
+        // - docs/design/transport/TRANSPORT-PHASE-1-SDS-2026-05-16.md
+        // - docs/design/transport/TRANSPORT-PHASE-1-RETROFIT-SDS-2026-05-16.md
+        let deployment = deployment::WlrDirectDeployment::new(
+            self.config.clone(),
+            self.display_handler.clone(),
+            self.health_subscriber.clone(),
+            self.event_tx.clone(),
+            pam_validator.clone(),
+            self.shutdown_broadcast.clone(),
+            Arc::clone(&self.session_handle),
+            std::mem::take(&mut self.activated_fds),
+        );
 
                 let socket = create_tcp_socket_for_addr(listen_addr)
                     .context("Failed to create TCP socket")?;

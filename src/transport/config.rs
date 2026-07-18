@@ -283,12 +283,32 @@ impl ResolvedTransports {
     /// deployment's concern. This method binds only the listeners that need
     /// no extra context.
     pub async fn build_listeners(&self) -> Result<Vec<Box<dyn Listener>>> {
+        self.build_listeners_with_tcp_fd(None).await
+    }
+
+    /// Build configured listeners, preferring a systemd-activated TCP socket
+    /// over a programmatic TCP bind when one was supplied.
+    pub async fn build_listeners_with_tcp_fd(
+        &self,
+        activated_tcp_fd: Option<std::os::fd::OwnedFd>,
+    ) -> Result<Vec<Box<dyn Listener>>> {
         let mut out: Vec<Box<dyn Listener>> = Vec::new();
         if let Some(tcp) = &self.tcp {
-            let l = TcpListenerImpl::bind(tcp.listen_addr)
-                .await
-                .with_context(|| format!("failed to bind TCP listener on {}", tcp.listen_addr))?;
+            let l = if let Some(fd) = activated_tcp_fd {
+                TcpListenerImpl::from_owned_fd(fd)
+                    .context("failed to wrap systemd-activated TCP listener")?
+            } else {
+                TcpListenerImpl::bind(tcp.listen_addr)
+                    .await
+                    .with_context(|| {
+                        format!("failed to bind TCP listener on {}", tcp.listen_addr)
+                    })?
+            };
             out.push(Box::new(l));
+        } else if activated_tcp_fd.is_some() {
+            warn!(
+                "systemd supplied a TCP socket but TCP transport is disabled; ignoring inherited fd"
+            );
         }
         #[cfg(feature = "vsock")]
         if let Some(vsock) = &self.vsock {

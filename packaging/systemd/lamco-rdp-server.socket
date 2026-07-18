@@ -11,6 +11,7 @@ Documentation=https://github.com/lamco-admin/lamco-rdp-server
 
 [Socket]
 ListenStream=3389
+FileDescriptorName=tcp
 NoDelay=true
 Backlog=128
 

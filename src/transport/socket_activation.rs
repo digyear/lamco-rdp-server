@@ -32,7 +32,7 @@ const SD_LISTEN_FDS_START: i32 = 3;
 ///
 /// `OwnedFd` enforces single-consumer transfer: once a name is taken via
 /// `take()`, it cannot be taken again.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ActivatedFds {
     fds: HashMap<String, OwnedFd>,
 }
@@ -194,6 +194,15 @@ impl ActivatedFds {
             .keys()
             .find(|k| k.starts_with("unknown."))
             .cloned()?;
+        self.fds.remove(&key)
+    }
+
+    /// Take any one fd regardless of its systemd-provided name.
+    ///
+    /// This supports older single-socket desktop units where systemd uses the
+    /// socket unit name when `FileDescriptorName=` was not configured.
+    pub fn take_first(&mut self) -> Option<OwnedFd> {
+        let key = self.fds.keys().next().cloned()?;
         self.fds.remove(&key)
     }
 

@@ -281,6 +281,10 @@ pub struct ClipboardOrchestrator {
     /// Clipboard provider (trait-abstracted backend).
     clipboard_provider: Arc<RwLock<Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>>>>,
 
+    /// Suppress clipboard synchronization while CJK input temporarily writes
+    /// and restores the local clipboard around a synthetic Ctrl+V.
+    cjk_paste_paused: Arc<AtomicBool>,
+
     /// Current RDP format list from Windows (for format ID lookup)
     /// Windows registered format IDs (like FileGroupDescriptorW) vary per session,
     /// so we store the actual list to look up the correct ID when requesting data.
@@ -525,6 +529,7 @@ impl ClipboardOrchestrator {
             pending_portal_requests: Arc::new(RwLock::new(std::collections::VecDeque::new())),
             server_event_sender: Arc::new(RwLock::new(None)), // Set by WrdCliprdrFactory
             clipboard_provider: Arc::new(RwLock::new(None)),
+            cjk_paste_paused: Arc::new(AtomicBool::new(false)),
             current_rdp_formats: Arc::new(RwLock::new(Vec::new())),
             local_advertised_formats: Arc::new(RwLock::new(Vec::new())),
             klipper_info,
@@ -550,6 +555,23 @@ impl ClipboardOrchestrator {
 
     pub fn event_sender(&self) -> mpsc::Sender<ClipboardEvent> {
         self.event_tx.clone()
+    }
+
+    /// Provider used by the input handler's CJK clipboard-paste fallback.
+    pub async fn clipboard_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> {
+        self.clipboard_provider.read().await.clone()
+    }
+
+    /// Shared pause latch for CJK clipboard-paste fallback.
+    pub fn cjk_paste_pause_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cjk_paste_paused)
+    }
+
+    /// Reuse a pause latch created before the orchestrator (Portal startup path).
+    pub fn set_cjk_paste_pause_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.cjk_paste_paused = flag;
     }
 
     /// Initialize clipboard strategy and cooperation mode
@@ -609,6 +631,7 @@ impl ClipboardOrchestrator {
         let server_event_sender = Arc::clone(&self.server_event_sender);
         let sync_manager = Arc::clone(&self.sync_manager);
         let cooperation_content_cache = Arc::clone(&self.cooperation_content_cache);
+        let cjk_paste_paused = Arc::clone(&self.cjk_paste_paused);
 
         let mut shutdown_rx = self.shutdown_broadcast.subscribe();
 
@@ -623,6 +646,10 @@ impl ClipboardOrchestrator {
                         content,
                         timestamp_ms,
                     } => {
+                        if cjk_paste_paused.load(Ordering::Acquire) {
+                            debug!("CJK paste: suppressing Klipper cooperation update");
+                            continue;
+                        }
                         debug!("📨 Cooperation: Klipper content updated ({}ms)", timestamp_ms);
 
                         // Klipper's D-Bus API only provides text
@@ -762,6 +789,7 @@ impl ClipboardOrchestrator {
         let pending_requests = Arc::clone(&self.pending_portal_requests);
         let mut shutdown_rx = self.shutdown_broadcast.subscribe();
         let health_reporter = self.health_reporter.clone();
+        let cjk_paste_paused = Arc::clone(&self.cjk_paste_paused);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -772,6 +800,10 @@ impl ClipboardOrchestrator {
                                 mime_types,
                                 force,
                             } => {
+                                if cjk_paste_paused.load(Ordering::Acquire) {
+                                    debug!("CJK paste: suppressing provider selection update");
+                                    continue;
+                                }
                                 if let Err(e) = event_tx
                                     .send(ClipboardEvent::PortalFormatsAvailable(mime_types, force))
                                     .await

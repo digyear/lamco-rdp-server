@@ -77,6 +77,11 @@ pub struct LamcoGraphicsHandler {
     /// Whether a primary surface exists (local fast access)
     has_surface: AtomicBool,
 
+    /// Any capability set explicitly disabled AVC. Android commonly sends a
+    /// V10 AVC_DISABLED set alongside a higher V10.4 set; selecting only the
+    /// highest version would incorrectly enable H.264.
+    advertised_avc_disabled: AtomicBool,
+
     /// Current primary surface ID (local fast access)
     /// Only valid when has_surface is true
     primary_surface_id: AtomicU16,
@@ -128,6 +133,7 @@ impl LamcoGraphicsHandler {
             needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
+            advertised_avc_disabled: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
             negotiated_caps: std::sync::RwLock::new(None),
             shared_state: None,
@@ -148,6 +154,7 @@ impl LamcoGraphicsHandler {
             needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
+            advertised_avc_disabled: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
             negotiated_caps: std::sync::RwLock::new(None),
             shared_state: None,
@@ -168,6 +175,7 @@ impl LamcoGraphicsHandler {
             needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
+            advertised_avc_disabled: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
             force_avc420_only: false,
             negotiated_caps: std::sync::RwLock::new(None),
@@ -210,6 +218,7 @@ impl LamcoGraphicsHandler {
             needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
+            advertised_avc_disabled: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
             force_avc420_only,
             negotiated_caps: std::sync::RwLock::new(None),
@@ -231,42 +240,28 @@ impl LamcoGraphicsHandler {
     /// short readiness checks.
     fn sync_shared_state(&self) {
         if let Some(ref shared) = self.shared_state {
-            for attempt in 0..100 {
-                match shared.try_write() {
-                    Ok(mut guard) => {
-                        // Preserve existing channel_id if we had one.
-                        // NOTE: channel_id is stored in GraphicsPipelineServer (set by DvcProcessor::start),
-                        // and EgfxFrameSender queries it directly via server.channel_id() when sending frames.
-                        // We preserve it here for diagnostic purposes only - it's not used for frame sending.
-                        let existing_channel_id: u32 = guard
-                            .as_ref()
-                            .map_or(0, |s: &HandlerState| s.dvc_channel_id);
-
-                        let state = HandlerState {
-                            is_ready: self.ready.load(Ordering::Acquire),
-                            is_avc420_enabled: self.avc420_enabled.load(Ordering::Acquire),
-                            is_avc444_enabled: self.avc444_enabled.load(Ordering::Acquire),
-                            needs_android_pointer_updates: self
-                                .needs_android_pointer_updates
-                                .load(Ordering::Acquire),
-                            // Convert has_surface + surface_id to Option<u16>
-                            // Surface ID 0 is valid in EGFX, so we use Option instead of sentinel
-                            primary_surface_id: if self.has_surface.load(Ordering::Acquire) {
-                                Some(self.primary_surface_id.load(Ordering::Acquire))
-                            } else {
-                                None
-                            },
-                            dvc_channel_id: existing_channel_id,
-                        };
-                        *guard = Some(state);
-                        return;
-                    }
-                    Err(_) if attempt < 10 => std::thread::yield_now(),
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
-                }
-            }
-
-            warn!("Failed to sync EGFX handler state after retries (lock contention)");
+            shared
+                .is_ready
+                .store(self.ready.load(Ordering::Acquire), Ordering::Release);
+            shared.client_supports_avc420.store(
+                self.avc420_enabled.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            shared.client_requires_planar.store(
+                self.advertised_avc_disabled.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            shared.is_avc444_enabled.store(
+                self.avc444_enabled.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            shared
+                .has_surface
+                .store(self.has_surface.load(Ordering::Acquire), Ordering::Release);
+            shared.primary_surface_id.store(
+                self.primary_surface_id.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
     }
 
@@ -294,6 +289,33 @@ impl LamcoGraphicsHandler {
 
 impl GraphicsPipelineHandler for LamcoGraphicsHandler {
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu) {
+        let avc_disabled = pdu
+            .0
+            .iter()
+            .filter_map(|raw| raw.parsed().ok().flatten())
+            .any(|cap| match cap {
+                CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
+                    flags.contains(CapabilitiesV10Flags::AVC_DISABLED)
+                }
+                CapabilitySet::V10_3 { flags } => {
+                    flags.contains(CapabilitiesV103Flags::AVC_DISABLED)
+                }
+                CapabilitySet::V10_4 { flags }
+                | CapabilitySet::V10_5 { flags }
+                | CapabilitySet::V10_6 { flags } => {
+                    flags.contains(CapabilitiesV104Flags::AVC_DISABLED)
+                }
+                CapabilitySet::V10_7 { flags } => {
+                    flags.contains(CapabilitiesV107Flags::AVC_DISABLED)
+                }
+                _ => false,
+            });
+        self.advertised_avc_disabled
+            .store(avc_disabled, Ordering::Release);
+        if avc_disabled {
+            info!("EGFX: AVC_DISABLED present in advertised capability sets; forcing Planar codec");
+        }
+
         let already_ready = self.ready.load(Ordering::Acquire);
         if already_ready {
             // mstsc has re-emitted RDPGFX_CAPSADVERTISE mid-session. This is
@@ -355,22 +377,7 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         // - V10+ with AVC420_ENABLED → AVC420 AND AVC444v2 (4:4:4 chroma via dual-stream)
         //
         // AVC444v2 provides superior text/UI rendering through full chroma resolution.
-        let needs_android_pointer_updates = match negotiated {
-            CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
-                flags.contains(CapabilitiesV10Flags::AVC_DISABLED)
-            }
-            CapabilitySet::V10_3 { flags } => flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
-            CapabilitySet::V10_4 { flags }
-            | CapabilitySet::V10_5 { flags }
-            | CapabilitySet::V10_6 { flags }
-            | CapabilitySet::V10_6Err { flags } => {
-                flags.contains(CapabilitiesV104Flags::AVC_DISABLED)
-            }
-            CapabilitySet::V10_7 { flags } => flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-            _ => false,
-        };
-
-        let (avc420, avc444) = match negotiated {
+        let (mut avc420, mut avc444) = match negotiated {
             CapabilitySet::V8_1 { flags, .. } => {
                 // V8.1: AVC420 only, no AVC444 support
                 let has_avc420 = flags.contains(CapabilitiesV81Flags::AVC420_ENABLED);
@@ -420,6 +427,15 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
             // V8 and earlier / Unknown don't support AVC
             _ => (false, false),
         };
+
+        // Some Android clients advertise V10 AVC_DISABLED together with a
+        // higher capability version lacking that bit. The explicit disable
+        // applies to the whole advertised set and must override selection of
+        // the highest version.
+        if self.advertised_avc_disabled.load(Ordering::Acquire) {
+            avc420 = false;
+            avc444 = false;
+        }
 
         // Platform quirk: force AVC420 when ForceAvc420 is active.
         // AVC444 works on most platforms but has known issues on some
@@ -478,7 +494,7 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
                 info!("EGFX: AVC420 (H.264 4:2:0) encoding enabled");
             }
             (false, _) => {
-                info!("EGFX: AVC not supported by client, will use RemoteFX fallback");
+                info!("EGFX: AVC disabled/not supported by client, will use Planar fallback");
             }
         }
     }
@@ -611,29 +627,61 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
     }
 
     fn preferred_capabilities(&self) -> Vec<CapabilitySet> {
-        // Prefer highest V10.x version for best features (all V10+ support AVC420)
-        // Fall back to V8.1 for older clients that explicitly enable AVC420
+        use ironrdp_egfx::pdu::{
+            CapabilitiesV10Flags, CapabilitiesV103Flags, CapabilitiesV104Flags,
+            CapabilitiesV107Flags,
+        };
+
+        // AVC_DISABLED is a client-side negative constraint. IronRDP intersects
+        // matching capability flags when constructing CapsConfirm, so the
+        // server preference must carry this bit too; otherwise the intersection
+        // silently clears it and the client sees "AVC enabled" while we send
+        // Planar frames.
+        let preserve_avc_disabled = self.advertised_avc_disabled.load(Ordering::Acquire);
+        let v10_disabled = if preserve_avc_disabled {
+            CapabilitiesV10Flags::AVC_DISABLED
+        } else {
+            CapabilitiesV10Flags::empty()
+        };
+        let v103_disabled = if preserve_avc_disabled {
+            CapabilitiesV103Flags::AVC_DISABLED
+        } else {
+            CapabilitiesV103Flags::empty()
+        };
+        let v104_disabled = if preserve_avc_disabled {
+            CapabilitiesV104Flags::AVC_DISABLED
+        } else {
+            CapabilitiesV104Flags::empty()
+        };
+        let v107_disabled = if preserve_avc_disabled {
+            CapabilitiesV107Flags::AVC_DISABLED
+        } else {
+            CapabilitiesV107Flags::empty()
+        };
+
+        // Prefer highest V10.x version for best features. Preserve the
+        // client's AVC_DISABLED constraint across every matching V10 variant.
         vec![
             CapabilitySet::V10_7 {
-                flags: CapabilitiesV107Flags::SMALL_CACHE,
+                flags: CapabilitiesV107Flags::SMALL_CACHE | v107_disabled,
             },
             CapabilitySet::V10_6 {
-                flags: CapabilitiesV104Flags::SMALL_CACHE,
+                flags: CapabilitiesV104Flags::SMALL_CACHE | v104_disabled,
             },
             CapabilitySet::V10_5 {
-                flags: CapabilitiesV104Flags::SMALL_CACHE,
+                flags: CapabilitiesV104Flags::SMALL_CACHE | v104_disabled,
             },
             CapabilitySet::V10_4 {
-                flags: CapabilitiesV104Flags::SMALL_CACHE,
+                flags: CapabilitiesV104Flags::SMALL_CACHE | v104_disabled,
             },
             CapabilitySet::V10_3 {
-                flags: CapabilitiesV103Flags::AVC_THIN_CLIENT,
+                flags: CapabilitiesV103Flags::AVC_THIN_CLIENT | v103_disabled,
             },
             CapabilitySet::V10_2 {
-                flags: CapabilitiesV10Flags::SMALL_CACHE,
+                flags: CapabilitiesV10Flags::SMALL_CACHE | v10_disabled,
             },
             CapabilitySet::V10 {
-                flags: CapabilitiesV10Flags::SMALL_CACHE,
+                flags: CapabilitiesV10Flags::SMALL_CACHE | v10_disabled,
             },
             CapabilitySet::V8_1 {
                 flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
@@ -674,5 +722,77 @@ impl SharedGraphicsHandler {
 
     pub fn client_supports_avc420(&self) -> bool {
         self.inner.read().is_ok_and(|h| h.client_supports_avc420())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferred_v10_4_capability_preserves_advertised_avc_disabled() {
+        let mut handler = LamcoGraphicsHandler::new(1280, 720);
+        let advertised = CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V10_4 {
+            flags: CapabilitiesV104Flags::AVC_DISABLED | CapabilitiesV104Flags::SMALL_CACHE,
+        }]);
+
+        handler.capabilities_advertise(&advertised);
+        let preferred = handler.preferred_capabilities();
+        let v10_4 = preferred
+            .iter()
+            .find_map(|cap| match cap {
+                CapabilitySet::V10_4 { flags } => Some(*flags),
+                _ => None,
+            })
+            .expect("V10.4 must remain a preferred capability");
+
+        assert!(
+            v10_4.contains(CapabilitiesV104Flags::AVC_DISABLED),
+            "server preference must preserve the client's negative AVC constraint in CapsConfirm"
+        );
+    }
+
+    #[test]
+    fn advertised_avc_disabled_overrides_higher_negotiated_capability() {
+        let shared = Arc::new(SharedHandlerState::new());
+        let mut handler =
+            LamcoGraphicsHandler::with_config(1280, 720, Arc::clone(&shared), false, 3);
+        let advertised = CapabilitiesAdvertisePdu::from_typed(&[
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::AVC_DISABLED,
+            },
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::SMALL_CACHE,
+            },
+        ]);
+
+        handler.capabilities_advertise(&advertised);
+        handler.on_ready(&CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::SMALL_CACHE,
+        });
+
+        assert!(shared.is_ready.load(Ordering::Acquire));
+        assert!(!shared.client_supports_avc420.load(Ordering::Acquire));
+        assert!(!shared.is_avc444_enabled.load(Ordering::Acquire));
+        assert!(shared.client_requires_planar.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn v8_without_avc_does_not_require_planar() {
+        let shared = Arc::new(SharedHandlerState::new());
+        let mut handler =
+            LamcoGraphicsHandler::with_config(1280, 720, Arc::clone(&shared), false, 3);
+        let advertised = CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        }]);
+
+        handler.capabilities_advertise(&advertised);
+        handler.on_ready(&CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        });
+
+        assert!(shared.is_ready.load(Ordering::Acquire));
+        assert!(!shared.client_supports_avc420.load(Ordering::Acquire));
+        assert!(!shared.client_requires_planar.load(Ordering::Acquire));
     }
 }

@@ -256,18 +256,20 @@ pub struct InputConfig {
     /// Enable touch input support
     pub enable_touch: bool,
 
-    /// Fall back to clipboard-paste (Ctrl+V) for CJK/non-ASCII Unicode characters
-    /// that cannot be injected via evdev keycodes or XKB keysyms.
+    /// Paste non-ASCII RDP Unicode input through the local clipboard.
     ///
-    /// When true (default), consecutive non-ASCII Unicode input units are buffered
-    /// and flushed to the system clipboard, then a synthetic Ctrl+V is injected.
-    /// This handles CJK text from mobile IMEs on KDE where keysym injection fails.
-    #[serde(default = "default_true")]
+    /// KDE's RemoteDesktop portal cannot inject many CJK Unicode keysyms,
+    /// while Android RDP clients send committed IME text as Unicode events.
+    #[serde(default = "default_cjk_paste_fallback")]
     pub cjk_paste_fallback: bool,
 }
 
 fn default_input_protocol() -> String {
     "auto".to_string()
+}
+
+const fn default_cjk_paste_fallback() -> bool {
+    true
 }
 
 impl InputConfig {

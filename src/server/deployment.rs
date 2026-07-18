@@ -20,7 +20,7 @@ use crate::{
     security::auth::PamValidator,
     session::strategy::{PipeWireAccess, SessionHandle, SessionLifecyclePolicy},
     transport::{
-        AcceptDeployment, LamcoConnectionHandler, Listener,
+        AcceptDeployment, ActivatedFds, LamcoConnectionHandler, Listener,
         handler::{OnConnectFn, OnDisconnectFn},
     },
 };
@@ -35,6 +35,7 @@ pub(crate) struct WlrDirectDeployment {
     /// Session handle whose lifecycle policy drives per-connect establishment
     /// and per-disconnect release (see `build_handler`).
     session_handle: Arc<dyn SessionHandle>,
+    activated_fds: ActivatedFds,
 }
 
 impl WlrDirectDeployment {
@@ -46,6 +47,7 @@ impl WlrDirectDeployment {
         pam_validator: Option<Arc<PamValidator>>,
         shutdown_broadcast: Arc<broadcast::Sender<()>>,
         session_handle: Arc<dyn SessionHandle>,
+        activated_fds: ActivatedFds,
     ) -> Self {
         Self {
             config,
@@ -55,6 +57,7 @@ impl WlrDirectDeployment {
             pam_validator,
             shutdown_broadcast,
             session_handle,
+            activated_fds,
         }
     }
 }
@@ -72,14 +75,30 @@ impl AcceptDeployment for WlrDirectDeployment {
             .transports
             .resolve(&self.config.server.listen_addr)
             .context("Failed to resolve transport configuration")?;
+        let activated_tcp_fd = self.activated_fds.take("tcp").or_else(|| {
+            // Compatibility with installed units lacking FileDescriptorName:
+            // systemd commonly names the sole fd after the .socket unit.
+            if self.activated_fds.len() == 1 {
+                self.activated_fds.take_first()
+            } else {
+                None
+            }
+        });
         #[cfg_attr(
             not(feature = "websocket"),
             expect(unused_mut, reason = "websocket cfg appends to listeners below")
         )]
         let mut listeners = transports
-            .build_listeners()
+            .build_listeners_with_tcp_fd(activated_tcp_fd)
             .await
             .context("Failed to bind one or more transport listeners")?;
+
+        if !self.activated_fds.is_empty() {
+            tracing::warn!(
+                names = ?self.activated_fds.remaining_names(),
+                "Ignoring unrecognized systemd-activated socket fds"
+            );
+        }
 
         // WebSocket listener (Phase 3b) needs TLS context, so it's built here
         // (in the deployment) rather than inside ResolvedTransports::build_listeners.
