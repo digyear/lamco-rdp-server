@@ -17,7 +17,7 @@ use std::{
 
 use ironrdp_server::{ConnectionHandler, PostConnectionAction};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::listener::PeerAddr;
@@ -140,9 +140,12 @@ impl LamcoConnectionHandler {
 
     /// Called by the `AcceptDispatcher` after `RdpServer::run_connection` returns.
     ///
-    /// Returns `PostConnectionAction::Stop` if the Portal session has been
-    /// destroyed by the compositor (we cannot accept further clients without
-    /// user interaction). Returns `Continue` otherwise.
+    /// Returns `PostConnectionAction::Stop` whenever an accepted connection
+    /// ends, or if the Portal session has been destroyed by the compositor.
+    /// Every socket-activated instance owns compositor resources and must exit
+    /// when it becomes idle; systemd keeps the listening socket open and starts
+    /// a fresh instance for a follow-up connection. This also covers a trailing
+    /// handshake probe arriving just after a real client disconnects.
     pub async fn on_disconnected_async(
         &mut self,
         peer: &PeerAddr,
@@ -226,7 +229,22 @@ impl LamcoConnectionHandler {
             return PostConnectionAction::Stop;
         }
 
-        PostConnectionAction::Continue
+        let message = if served {
+            "Client disconnected"
+        } else {
+            "Client probe ended"
+        };
+        let _ = self.event_tx.send(ServerEvent::StatusChanged {
+            old: "running".into(),
+            new: "stopped".into(),
+            message: message.into(),
+        });
+        info!(
+            served,
+            "Connection ended — shutting down socket-activated service; the next client will start a fresh instance"
+        );
+        let _ = self.shutdown_tx.send(());
+        PostConnectionAction::Stop
     }
 }
 
@@ -306,15 +324,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_disconnected_emits_event_and_continues_when_session_alive() {
+    async fn served_disconnect_emits_events_and_requests_shutdown() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut handler = LamcoConnectionHandler::new(
-            tx,
-            None,
-            None,
-            always_alive_callback(),
-            Arc::new(tokio::sync::broadcast::channel::<()>(1).0),
-        );
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let shutdown_tx = Arc::new(shutdown_tx);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let mut handler =
+            LamcoConnectionHandler::new(tx, None, None, always_alive_callback(), shutdown_tx);
         let peer = test_peer();
 
         let _ = handler.on_accept_async(&peer).await;
@@ -323,10 +339,22 @@ mod tests {
         let action = handler
             .on_disconnected_async(&peer, Duration::from_secs(2), None)
             .await;
-        assert_eq!(action, PostConnectionAction::Continue);
+        assert_eq!(action, PostConnectionAction::Stop);
 
-        let event = rx.recv().await.expect("expected ClientDisconnected event");
-        assert!(matches!(event, ServerEvent::ClientDisconnected { .. }));
+        tokio::time::timeout(Duration::from_millis(100), shutdown_rx.recv())
+            .await
+            .expect("served disconnect should request full shutdown")
+            .expect("shutdown sender should remain alive");
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(ServerEvent::ClientDisconnected { .. })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(ServerEvent::StatusChanged { new, message, .. })
+                if new == "stopped" && message == "Client disconnected"
+        ));
     }
 
     #[tokio::test]
@@ -365,18 +393,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_disconnected_classifies_short_lived_reset_as_probe() {
+    async fn short_lived_probe_requests_idle_shutdown() {
         // This test exercises the warn! path; we can't easily capture tracing
-        // output here, but we can at least confirm the call doesn't panic and
-        // the action is Continue (probe is not a fatal error).
+        // output here, but we can confirm a trailing probe cannot leave a
+        // socket-activated process and its PipeWire streams running forever.
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut handler = LamcoConnectionHandler::new(
-            tx,
-            None,
-            None,
-            always_alive_callback(),
-            Arc::new(tokio::sync::broadcast::channel::<()>(1).0),
-        );
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let shutdown_tx = Arc::new(shutdown_tx);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let mut handler =
+            LamcoConnectionHandler::new(tx, None, None, always_alive_callback(), shutdown_tx);
         let peer = test_peer();
 
         let _ = handler.on_accept_async(&peer).await;
@@ -384,7 +410,11 @@ mod tests {
         let action = handler
             .on_disconnected_async(&peer, Duration::from_millis(50), Some(&err))
             .await;
-        assert_eq!(action, PostConnectionAction::Continue);
+        assert_eq!(action, PostConnectionAction::Stop);
+        tokio::time::timeout(Duration::from_millis(100), shutdown_rx.recv())
+            .await
+            .expect("probe disconnect should request idle shutdown")
+            .expect("shutdown sender should remain alive");
     }
 
     #[tokio::test]

@@ -73,6 +73,27 @@ pub trait AcceptDeployment: Send {
 /// WebSocket+RDCleanPath — all without changing this entry point.
 pub struct AcceptDispatcher;
 
+/// Run one connection until it completes or the deployment begins shutting down.
+///
+/// IronRDP also receives a `ServerEvent::Quit`, but that event is consumed by the
+/// active connection's event dispatcher. If the client stops reading and the
+/// network writer stalls, the dispatcher can be blocked behind the writer mutex
+/// and never observe `Quit`. Racing the whole connection future against the
+/// deployment shutdown signal makes shutdown independent of connection health;
+/// dropping the losing future closes its transport and releases its state.
+async fn run_until_shutdown<F, T>(
+    connection: F,
+    shutdown: &mut Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        result = connection => Some(result),
+        () = shutdown.as_mut() => None,
+    }
+}
+
 impl AcceptDispatcher {
     /// Build everything from the deployment and run the accept loop.
     ///
@@ -146,20 +167,32 @@ impl AcceptDispatcher {
                     let start = Instant::now();
                     let conn_result = match mode {
                         crate::transport::listener::AcceptorMode::Standard => {
-                            rdp_server.run_connection(stream).await
+                            run_until_shutdown(rdp_server.run_connection(stream), &mut shutdown)
+                                .await
                         }
                         crate::transport::listener::AcceptorMode::PreAuthenticated => {
                             // Stream is already TLS-terminated (typically WSS); skip the
                             // IronRDP-managed TLS upgrade. Upstream PR #1281 reshaped this
                             // from a dedicated run_connection_pre_authenticated method into
                             // run_connection_with + TransportTls::AlreadyDone.
-                            rdp_server
-                                .run_connection_with(
+                            run_until_shutdown(
+                                rdp_server.run_connection_with(
                                     stream,
                                     ironrdp_server::TransportTls::AlreadyDone,
-                                )
-                                .await
+                                ),
+                                &mut shutdown,
+                            )
+                            .await
                         }
+                    };
+
+                    let Some(conn_result) = conn_result else {
+                        info!(
+                            deployment = dep_name,
+                            peer = %peer.to_display(),
+                            "Shutdown signal received: cancelling active connection"
+                        );
+                        return Ok(());
                     };
                     let duration = start.elapsed();
 
@@ -198,7 +231,13 @@ pub use ironrdp_server::PostConnectionAction as UpstreamPostConnectionAction;
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
 
     use tokio::sync::{Mutex, oneshot};
 
@@ -207,6 +246,52 @@ mod tests {
         handler::OnDisconnectFn,
         listener::{AcceptedConnection, AsyncRdpStream, PeerAddr, TransportError},
     };
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn active_connection_is_cancelled_when_shutdown_fires() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let (started_tx, started_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut shutdown: Pin<Box<dyn Future<Output = ()> + Send + 'static>> =
+            Box::pin(async move {
+                let _ = shutdown_rx.await;
+            });
+
+        let connection = async move {
+            let _probe = probe;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        };
+
+        let task = tokio::spawn(async move { run_until_shutdown(connection, &mut shutdown).await });
+        tokio::time::timeout(Duration::from_millis(100), started_rx)
+            .await
+            .expect("connection future should start")
+            .expect("connection future should report startup");
+
+        shutdown_tx
+            .send(())
+            .expect("shutdown receiver should be alive");
+        let result = tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("shutdown should cancel the active connection")
+            .expect("connection task should not panic");
+
+        assert!(result.is_none(), "shutdown should win the race");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "cancelling the connection future should drop its transport state"
+        );
+    }
 
     /// Mock listener that yields one prepared connection then closes. Useful
     /// for driving the dispatcher in tests without sockets.
