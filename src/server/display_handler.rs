@@ -1047,6 +1047,7 @@ impl LamcoDisplayHandler {
                     .expect("gfx_handler_state must be Some when EGFX is initialized"),
             ),
             event_tx,
+            self.config.egfx.frame_ack_timeout,
         );
         info!("EGFX frame sender initialized");
 
@@ -2931,6 +2932,30 @@ impl LamcoDisplayHandler {
                     }
 
                     if let (Some(planar), Some(sender)) = (&mut planar_encoder, &egfx_sender) {
+                        // Android Planar frames are expensive full-screen software encodes.
+                        // Check flow control before copying/compacting the PipeWire buffer;
+                        // otherwise a slow FrameAcknowledge cadence burns a CPU core encoding
+                        // frames that GraphicsPipelineServer will immediately reject.
+                        if sender.is_backpressured() {
+                            let recovered = sender.recover_stale_planar_acknowledgements();
+                            if recovered == 0 {
+                                frames_dropped += 1;
+                                trace!(
+                                    "EGFX Planar transport backpressure - skipping frame before copy/encode"
+                                );
+                                continue;
+                            }
+
+                            warn!(
+                                recovered,
+                                "EGFX Planar FrameAcknowledge timed out; releasing stale backpressure and forcing full refresh"
+                            );
+                            if let Some(detector) = damage_detector_opt.as_mut() {
+                                detector.invalidate();
+                            }
+                            force_first_frame = true;
+                        }
+
                         let pixel_bytes = match &frame.buffer {
                             lamco_pipewire::FrameBuffer::Memory(data) => data,
                             lamco_pipewire::FrameBuffer::DmaBuf(_) => {
@@ -2956,30 +2981,83 @@ impl LamcoDisplayHandler {
                             continue;
                         }
 
-                        // Strip PipeWire row padding. BitmapStreamEncoder expects exactly
-                        // width pixels per row; retaining padding causes scan-line artifacts.
-                        let compact = if stride == row_bytes {
-                            Bytes::copy_from_slice(&pixel_bytes[..row_bytes * height])
+                        // DamageDetector compares against the last frame that reached this
+                        // point. Because the early backpressure check is above, changes from
+                        // skipped capture frames accumulate and are included in the next sent
+                        // update instead of being lost.
+                        let tight_pixels = if stride == row_bytes {
+                            std::borrow::Cow::Borrowed(&pixel_bytes[..row_bytes * height])
                         } else {
                             let mut compact = Vec::with_capacity(row_bytes * height);
                             for row in 0..height {
                                 let start = row * stride;
                                 compact.extend_from_slice(&pixel_bytes[start..start + row_bytes]);
                             }
-                            Bytes::from(compact)
+                            std::borrow::Cow::Owned(compact)
+                        };
+
+                        let damage_regions = if let Some(ref mut detector) = damage_detector_opt {
+                            detector.detect(&tight_pixels, frame.width, frame.height)
+                        } else if !frame.damage_regions.is_empty() {
+                            frame
+                                .damage_regions
+                                .iter()
+                                .map(|region| DamageRegion::from(*region))
+                                .collect()
+                        } else {
+                            // Without a stateful detector, compositor hints cannot account for
+                            // changes accumulated while transport backpressure skipped frames.
+                            vec![DamageRegion::full_frame(frame.width, frame.height)]
+                        };
+                        force_first_frame = false;
+
+                        let Some(damage) =
+                            bounding_damage_region(&damage_regions, frame.width, frame.height)
+                        else {
+                            frames_skipped_damage += 1;
+                            continue;
+                        };
+
+                        let Some(compact) = compact_bgra_region(&tight_pixels, row_bytes, damage)
+                        else {
+                            warn!(
+                                ?damage,
+                                "Planar damage region is outside the validated frame"
+                            );
+                            frames_dropped += 1;
+                            continue;
+                        };
+                        let damage_row_bytes = damage.width as usize * 4;
+                        let (Ok(damage_x), Ok(damage_y), Ok(damage_width), Ok(damage_height)) = (
+                            u16::try_from(damage.x),
+                            u16::try_from(damage.y),
+                            u16::try_from(damage.width),
+                            u16::try_from(damage.height),
+                        ) else {
+                            warn!(
+                                ?damage,
+                                "Planar damage region exceeds EGFX coordinate limits"
+                            );
+                            frames_dropped += 1;
+                            continue;
+                        };
+                        let (Some(damage_width), Some(damage_height), Some(damage_stride)) = (
+                            NonZeroU16::new(damage_width),
+                            NonZeroU16::new(damage_height),
+                            NonZeroUsize::new(damage_row_bytes),
+                        ) else {
+                            frames_dropped += 1;
+                            continue;
                         };
 
                         let bitmap = IronBitmapUpdate {
-                            x: 0,
-                            y: 0,
-                            width: NonZeroU16::new(frame.width as u16)
-                                .expect("captured frame width is non-zero"),
-                            height: NonZeroU16::new(frame.height as u16)
-                                .expect("captured frame height is non-zero"),
+                            x: damage_x,
+                            y: damage_y,
+                            width: damage_width,
+                            height: damage_height,
                             format: IronPixelFormat::BgrX32,
                             data: compact,
-                            stride: NonZeroUsize::new(row_bytes)
-                                .expect("captured frame stride is non-zero"),
+                            stride: damage_stride,
                         };
 
                         let timestamp_ms = pipeline_decisions::compute_timestamp_ms(
@@ -2988,13 +3066,7 @@ impl LamcoDisplayHandler {
                             self.config.video.target_fps,
                         );
                         match sender
-                            .send_planar_frame(
-                                planar,
-                                &bitmap,
-                                frame.width as u16,
-                                frame.height as u16,
-                                timestamp_ms as u32,
-                            )
+                            .send_planar_frame(planar, &bitmap, timestamp_ms as u32)
                             .await
                         {
                             Ok(frame_id) => {
@@ -3006,13 +3078,31 @@ impl LamcoDisplayHandler {
                                 }
                                 if egfx_frames_sent <= 3 || egfx_frames_sent.is_multiple_of(30) {
                                     info!(
-                                        "EGFX Planar: sent frame {} ({}x{})",
-                                        frame_id, frame.width, frame.height
+                                        "EGFX Planar: sent frame {} region=({},{} {}x{}) frame={}x{}",
+                                        frame_id,
+                                        damage.x,
+                                        damage.y,
+                                        damage.width,
+                                        damage.height,
+                                        frame.width,
+                                        frame.height
                                     );
                                 }
                             }
                             Err(e) => {
-                                warn!("EGFX Planar send failed: {}", e);
+                                // DamageDetector advances its reference during detect(). If the
+                                // encoded update did not reach the transport, invalidate it so
+                                // the next accepted frame repairs the complete client surface.
+                                if let Some(ref mut detector) = damage_detector_opt {
+                                    detector.invalidate();
+                                }
+                                // A race can engage backpressure between the early check and
+                                // queueing. It is expected flow control, not a session warning.
+                                if matches!(&e, super::egfx_sender::SendError::Backpressure) {
+                                    trace!("EGFX Planar frame skipped: {}", e);
+                                } else {
+                                    warn!("EGFX Planar send failed: {}", e);
+                                }
                                 frames_dropped += 1;
                             }
                         }
@@ -3704,10 +3794,92 @@ fn transpose(data: &[u8], width: u32, height: u32, stride: u32, bpp: u32) -> (Ve
     (out, new_stride as u32)
 }
 
+/// Return one clipped rectangle covering every changed region.
+///
+/// EGFX Planar can carry a destination rectangle, but the current sender emits
+/// one bitmap PDU per frame. Coalescing here preserves every changed pixel while
+/// avoiding a full-screen payload for localized desktop activity.
+fn bounding_damage_region(
+    regions: &[DamageRegion],
+    frame_width: u32,
+    frame_height: u32,
+) -> Option<DamageRegion> {
+    regions
+        .iter()
+        .filter_map(|region| {
+            let left = region.x.min(frame_width);
+            let top = region.y.min(frame_height);
+            let right = region.x.saturating_add(region.width).min(frame_width);
+            let bottom = region.y.saturating_add(region.height).min(frame_height);
+            (left < right && top < bottom)
+                .then(|| DamageRegion::new(left, top, right - left, bottom - top))
+        })
+        .reduce(|acc, region| acc.union(&region))
+}
+
+/// Copy a tightly-packed BGRX rectangle from a tightly-packed full frame.
+fn compact_bgra_region(frame: &[u8], frame_stride: usize, region: DamageRegion) -> Option<Bytes> {
+    const BYTES_PER_PIXEL: usize = 4;
+
+    let x = usize::try_from(region.x).ok()?;
+    let y = usize::try_from(region.y).ok()?;
+    let width = usize::try_from(region.width).ok()?;
+    let height = usize::try_from(region.height).ok()?;
+    let row_bytes = width.checked_mul(BYTES_PER_PIXEL)?;
+    let x_offset = x.checked_mul(BYTES_PER_PIXEL)?;
+    let last_row = y.checked_add(height.checked_sub(1)?)?;
+    let required = last_row
+        .checked_mul(frame_stride)?
+        .checked_add(x_offset)?
+        .checked_add(row_bytes)?;
+    if required > frame.len() || x_offset.checked_add(row_bytes)? > frame_stride {
+        return None;
+    }
+
+    let mut compact = Vec::with_capacity(row_bytes.checked_mul(height)?);
+    for row in y..y.checked_add(height)? {
+        let start = row.checked_mul(frame_stride)?.checked_add(x_offset)?;
+        compact.extend_from_slice(&frame[start..start + row_bytes]);
+    }
+    Some(Bytes::from(compact))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::video::{BitmapData, Rectangle};
+
+    #[test]
+    fn planar_damage_bounds_are_clipped_and_coalesced() {
+        let regions = [
+            DamageRegion::new(10, 20, 30, 40),
+            DamageRegion::new(35, 50, 100, 100),
+            DamageRegion::new(500, 500, 20, 20),
+        ];
+
+        assert_eq!(
+            bounding_damage_region(&regions, 100, 80),
+            Some(DamageRegion::new(10, 20, 90, 60))
+        );
+        assert_eq!(bounding_damage_region(&regions[2..], 100, 80), None);
+    }
+
+    #[test]
+    fn planar_region_copy_preserves_rows_and_excludes_surrounding_pixels() {
+        // Four 4-byte pixels per row; each pixel's first byte identifies it.
+        let frame: Vec<u8> = (0u8..12)
+            .flat_map(|pixel| [pixel, pixel, pixel, pixel])
+            .collect();
+
+        let compact = compact_bgra_region(&frame, 4 * 4, DamageRegion::new(1, 1, 2, 2))
+            .expect("valid region");
+
+        let expected: Vec<u8> = [5u8, 6, 9, 10]
+            .into_iter()
+            .flat_map(|pixel| [pixel, pixel, pixel, pixel])
+            .collect();
+        assert_eq!(&compact[..], &expected);
+    }
 
     #[tokio::test]
     async fn test_pixel_format_conversion() {

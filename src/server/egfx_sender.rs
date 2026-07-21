@@ -123,6 +123,10 @@ pub struct EgfxFrameSender {
     /// Frame counter for debugging
     frame_count: std::sync::atomic::AtomicU64,
 
+    /// Maximum time to wait for a client FrameAcknowledge before recovering
+    /// Planar flow control.
+    frame_ack_timeout: std::time::Duration,
+
     /// Current QP for encoding (set by EncodingAdaptation, default 22)
     current_qp: std::sync::atomic::AtomicU32,
 }
@@ -132,12 +136,14 @@ impl EgfxFrameSender {
         gfx_server: GfxServerHandle,
         handler_state: Arc<SharedHandlerState>,
         event_tx: mpsc::UnboundedSender<ServerEvent>,
+        frame_ack_timeout_ms: u64,
     ) -> Self {
         Self {
             gfx_server,
             handler_state,
             event_tx,
             frame_count: std::sync::atomic::AtomicU64::new(0),
+            frame_ack_timeout: std::time::Duration::from_millis(frame_ack_timeout_ms),
             current_qp: std::sync::atomic::AtomicU32::new(22),
         }
     }
@@ -159,6 +165,17 @@ impl EgfxFrameSender {
             .lock()
             .map(|server| server.should_backpressure())
             .unwrap_or(true)
+    }
+
+    /// Release stale Planar backpressure after the configured ACK timeout.
+    ///
+    /// A non-zero return means the caller must force a full refresh because
+    /// the client's decode state is unknown.
+    pub fn recover_stale_planar_acknowledgements(&self) -> u32 {
+        self.gfx_server
+            .lock()
+            .map(|mut server| server.recover_stale_frame_acknowledgements(self.frame_ack_timeout))
+            .unwrap_or(0)
     }
 
     /// Check if EGFX is ready and AVC420 is supported
@@ -563,8 +580,6 @@ impl EgfxFrameSender {
         &self,
         planar_encoder: &mut ironrdp_graphics::rdp6::BitmapStreamEncoder,
         bitmap: &ironrdp_server::BitmapUpdate,
-        display_width: u16,
-        display_height: u16,
         timestamp_ms: u32,
     ) -> SendResult<u32> {
         use std::sync::atomic::Ordering::Acquire;
@@ -579,9 +594,16 @@ impl EgfxFrameSender {
             return Err(SendError::NoSurface);
         };
 
+        // Re-check here as well as in the display handler. Backpressure may
+        // engage after the caller's check; it must still be detected before
+        // allocating and running the full-screen Planar software encoder.
+        if self.is_backpressured() {
+            return Err(SendError::Backpressure);
+        }
+
         // Rebuild from the real frame dimensions. A stale row width makes the
-        // Planar delta/RLE encoder split rows at the wrong offset and produces
-        // the horizontal scan-line corruption seen on Android.
+        // Planar RLE encoder split rows at the wrong offset and produces the
+        // horizontal scan-line corruption seen on Android.
         let width = bitmap.width.get() as usize;
         let height = bitmap.height.get() as usize;
         *planar_encoder = ironrdp_graphics::rdp6::BitmapStreamEncoder::new(width, height);
@@ -605,15 +627,24 @@ impl EgfxFrameSender {
             )
             .map_err(|e| SendError::EncodingFailed(format!("Planar encode: {e}")))?;
 
+        let right = bitmap.x.checked_add(bitmap.width.get()).ok_or_else(|| {
+            SendError::EncodingFailed("Planar destination right edge overflow".into())
+        })?;
+        let bottom = bitmap.y.checked_add(bitmap.height.get()).ok_or_else(|| {
+            SendError::EncodingFailed("Planar destination bottom edge overflow".into())
+        })?;
+
         let (frame_id, dvc_messages, channel_id) = {
             let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
             let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
             let frame_id = server
-                .send_planar_frame(
+                .send_planar_frame_region(
                     surface_id,
                     &encoded[..encoded_len],
-                    width as u16,
-                    height as u16,
+                    bitmap.x,
+                    bitmap.y,
+                    right,
+                    bottom,
                     timestamp_ms,
                 )
                 .ok_or(SendError::Backpressure)?;
@@ -636,11 +667,13 @@ impl EgfxFrameSender {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count == 0 || count.is_multiple_of(30) {
             debug!(
-                "EGFX Planar: sent frame {} (id={}, {}x{}, raw={}B encoded={}B)",
+                "EGFX Planar: sent frame {} (id={}, region=({},{} {}x{}), raw={}B encoded={}B)",
                 count,
                 frame_id,
-                display_width,
-                display_height,
+                bitmap.x,
+                bitmap.y,
+                bitmap.width,
+                bitmap.height,
                 bitmap.data.len(),
                 encoded_len
             );
