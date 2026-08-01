@@ -23,6 +23,99 @@ use crate::clipboard::{
     sync::SyncManager,
 };
 
+/// Decode text returned by an RDP client into the UTF-8 representation expected
+/// by Linux clipboard providers.
+///
+/// `CF_UNICODETEXT` is UTF-16LE, while registered `HTML Format` (CF_HTML) is
+/// UTF-8 with an ASCII offset header. Some clients send raw UTF-8 or add a BOM,
+/// so the protocol format selects the primary decoder and byte-level detection
+/// provides a compatibility fallback.
+fn decode_rdp_text_payload(data: &[u8], requested_mime: &str) -> String {
+    fn trim_text_terminator(text: &str) -> &str {
+        text.trim_start_matches('\u{feff}').trim_end_matches('\0')
+    }
+
+    fn decode_utf16(data: &[u8], big_endian: bool) -> String {
+        let units = data
+            .chunks_exact(2)
+            .map(|pair| {
+                if big_endian {
+                    u16::from_be_bytes([pair[0], pair[1]])
+                } else {
+                    u16::from_le_bytes([pair[0], pair[1]])
+                }
+            })
+            .skip_while(|unit| *unit == 0xfeff || *unit == 0xfffe)
+            .take_while(|unit| *unit != 0)
+            .collect::<Vec<_>>();
+        String::from_utf16_lossy(&units)
+    }
+
+    fn cf_html_fragment(data: &[u8]) -> Option<&str> {
+        let text = std::str::from_utf8(data).ok()?;
+
+        let offset = |name: &str| {
+            text.lines().find_map(|line| {
+                let (key, value) = line.trim_end_matches('\r').split_once(':')?;
+                (key == name)
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+        };
+
+        if let (Some(start), Some(end)) = (offset("StartFragment"), offset("EndFragment"))
+            && start < end
+            && end <= data.len()
+        {
+            return std::str::from_utf8(&data[start..end]).ok();
+        }
+
+        const START: &str = "<!--StartFragment-->";
+        const END: &str = "<!--EndFragment-->";
+        let start = text.find(START)? + START.len();
+        let end = text[start..].find(END)? + start;
+        Some(&text[start..end])
+    }
+
+    if requested_mime.starts_with("text/html") {
+        if let Some(fragment) = cf_html_fragment(data) {
+            return trim_text_terminator(fragment).to_owned();
+        }
+        if data.starts_with(&[0xff, 0xfe]) {
+            return decode_utf16(&data[2..], false);
+        }
+        if data.starts_with(&[0xfe, 0xff]) {
+            return decode_utf16(&data[2..], true);
+        }
+        if let Ok(text) =
+            std::str::from_utf8(data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(data))
+        {
+            return trim_text_terminator(text).to_owned();
+        }
+    }
+
+    if data.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return trim_text_terminator(&String::from_utf8_lossy(&data[3..])).to_string();
+    }
+    if data.starts_with(&[0xff, 0xfe]) {
+        return decode_utf16(&data[2..], false);
+    }
+    if data.starts_with(&[0xfe, 0xff]) {
+        return decode_utf16(&data[2..], true);
+    }
+
+    // A valid UTF-8 payload without embedded NULs is an explicit compatibility
+    // case. Ignore only trailing terminators; an internal NUL remains a strong
+    // UTF-16 signal for CF_UNICODETEXT.
+    let utf8_candidate = data.strip_suffix(&[0]).unwrap_or(data);
+    if !utf8_candidate.contains(&0)
+        && let Ok(text) = std::str::from_utf8(utf8_candidate)
+    {
+        return trim_text_terminator(text).to_owned();
+    }
+    decode_utf16(data, false)
+}
+
 impl ClipboardOrchestrator {
     /// Handle RDP format list announcement
     #[expect(
@@ -1043,26 +1136,18 @@ impl ClipboardOrchestrator {
             || requested_mime.starts_with("text/html"))
             && data.len() >= 2
         {
-            // text/plain and text/html from Windows are UTF-16LE (CF_UNICODETEXT)
-            // MIME may have charset suffix like "text/plain;charset=utf-8"
-            // Convert UTF-16LE to UTF-8 with line ending conversion
-            let utf16_data: Vec<u16> = data
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                .take_while(|&c| c != 0) // Stop at null terminator
-                .collect();
-
-            // Use lossy conversion to handle malformed UTF-16
-            // This handles invalid surrogates and replaces them with U+FFFD
-            let text = String::from_utf16_lossy(&utf16_data);
+            // CF_UNICODETEXT is UTF-16LE; CF_HTML is UTF-8 with an offset
+            // header. Decode according to the requested format, with BOM and
+            // raw UTF-8 fallbacks for non-conforming clients.
+            let text = decode_rdp_text_payload(&data, &requested_mime);
 
             // Sanitize for Linux: CRLF → LF, remove null bytes
             let sanitized = sanitize_text_for_linux(&text);
             let utf8_bytes = sanitized.as_bytes().to_vec();
 
             debug!(
-                "Converted UTF-16 to UTF-8: {} UTF-16 chars ({} bytes) → {} UTF-8 bytes with LF line endings",
-                utf16_data.len(),
+                "Decoded RDP text payload for {}: {} bytes → {} UTF-8 bytes with LF line endings",
+                requested_mime,
                 data.len(),
                 utf8_bytes.len()
             );
@@ -1100,24 +1185,9 @@ impl ClipboardOrchestrator {
                     .await
                     .insert(requested_mime.clone(), portal_data);
 
-                // Cancel unfulfilled requests (apps send multiple MIME requests per paste)
-                let mut pending = pending_portal_requests.write().await;
-                let unfulfilled: Vec<(u32, String)> = pending
-                    .iter()
-                    .filter(|(s, _, _)| *s != serial)
-                    .map(|(s, m, _)| (*s, m.clone()))
-                    .collect();
-                pending.clear();
-                drop(pending);
-
-                for (unfulfilled_serial, mime) in &unfulfilled {
-                    if let Err(e) = provider
-                        .complete_transfer(*unfulfilled_serial, mime, vec![], false)
-                        .await
-                    {
-                        warn!("Failed to cancel serial {}: {}", unfulfilled_serial, e);
-                    }
-                }
+                // Keep other MIME requests pending. Rich clipboard owners often
+                // ask for HTML and plain text together; each subsequent CLIPRDR
+                // response must complete its own provider serial.
             }
             Err(e) => {
                 error!("Failed to deliver clipboard data via provider: {:#}", e);
@@ -1174,5 +1244,71 @@ impl ClipboardOrchestrator {
 
         pending_portal_requests.write().await.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod clipboard_text_decode_tests {
+    use super::decode_rdp_text_payload;
+
+    fn cf_html(fragment: &str) -> Vec<u8> {
+        const PLACEHOLDER: &str = "0000000000";
+        let mut payload = format!(
+            "Version:1.0\r\nStartHTML:{PLACEHOLDER}\r\nEndHTML:{PLACEHOLDER}\r\nStartFragment:{PLACEHOLDER}\r\nEndFragment:{PLACEHOLDER}\r\n"
+        );
+        let start_html = payload.len();
+        payload.push_str("<html><body><!--StartFragment-->");
+        let start_fragment = payload.len();
+        payload.push_str(fragment);
+        let end_fragment = payload.len();
+        payload.push_str("<!--EndFragment--></body></html>");
+        let end_html = payload.len();
+
+        for (key, value) in [
+            ("StartHTML:", start_html),
+            ("EndHTML:", end_html),
+            ("StartFragment:", start_fragment),
+            ("EndFragment:", end_fragment),
+        ] {
+            let Some(begin) = payload.find(key).map(|position| position + key.len()) else {
+                panic!("CF_HTML fixture header must contain {key}");
+            };
+            payload.replace_range(begin..begin + PLACEHOLDER.len(), &format!("{value:010}"));
+        }
+        payload.into_bytes()
+    }
+
+    #[test]
+    fn decodes_cf_html_as_utf8_fragment_not_utf16_mojibake() {
+        let payload = cf_html("<p>浏览器复制：中文正常</p>");
+        let decoded = decode_rdp_text_payload(&payload, "text/html");
+        assert_eq!(decoded, "<p>浏览器复制：中文正常</p>");
+        assert!(!decoded.contains('敖'));
+    }
+
+    #[test]
+    fn decodes_cf_unicode_text_as_utf16le() {
+        let expected = "客户端纯文本：中文正常\r\n第二行";
+        let payload: Vec<u8> = expected
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            decode_rdp_text_payload(&payload, "text/plain;charset=utf-8"),
+            expected
+        );
+    }
+
+    #[test]
+    fn tolerates_utf8_and_bom_text_payloads() {
+        assert_eq!(
+            decode_rdp_text_payload("直接 UTF-8 中文\0".as_bytes(), "text/plain"),
+            "直接 UTF-8 中文"
+        );
+        assert_eq!(
+            decode_rdp_text_payload(b"\xEF\xBB\xBF<p>UTF-8 HTML</p>\0", "text/html"),
+            "<p>UTF-8 HTML</p>"
+        );
     }
 }
